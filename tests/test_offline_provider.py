@@ -28,7 +28,7 @@ from wta.ai.offline_provider import (
     use_offline_provider,
 )
 from wta.ai.tools import INTERNAL_TOOL_SCHEMAS, LOCAL_TOOL_SCHEMAS, InternalTools, ToolDeps, truncate
-from wta.config import Config, Settings, apply_changes
+from wta.config import Config, Settings, apply_changes, canonical_json
 from wta.features.engine import FeatureSnapshot
 from wta.models import MarketPlan
 from wta.strategies.s2_usdtalloc import rule_regime
@@ -283,8 +283,12 @@ def _big_payload(per: dict[str, dict[str, Any]], t0: float) -> dict[str, Any]:
 
 def test_truncated_features_are_salvaged_then_candle_stats_requested(provider: OfflineRulesProvider,
                                                                      t0: float) -> None:
-    cut = truncate(_big_payload(calm(), t0), 4096)
-    assert cut.get("truncated") is True  # same shape the real InternalTools produce
+    big = _big_payload(calm(), t0)
+    assert truncate(big, 4096).get("truncated") is True  # the real cap does truncate this payload
+    # Salvage logic is tested on a prefix cut in the middle of the first symbol object (BTCUSDT), in
+    # the same {"truncated", "json_prefix"} shape truncate() produces (its exact cut depends on escaping).
+    text = canonical_json(big).decode()
+    cut = {"truncated": True, "json_prefix": text[: text.index('"BTCUSDT":{') + 30]}
     assert '"dollar":{' in cut["json_prefix"] and '"BTCUSDT":{' in cut["json_prefix"]
     msgs =with_tool_results({"get_features": cut, "get_pnl_summary": {"drawdown_pct": "0.001"}})
     resp = provider.respond(msgs, TOOLS)
