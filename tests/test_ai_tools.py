@@ -539,3 +539,21 @@ def test_local_tools_mirror_read_only_wallex_tools() -> None:
         assert s["name"].endswith("_local")
         assert s["name"].removesuffix("_local") in READ_ONLY_ALLOWLIST
     assert not any(s["name"].endswith("_local") for s in INTERNAL_TOOL_SCHEMAS)
+
+
+def test_candle_stats_during_warmup_returns_error_not_indexerror() -> None:
+    """Fewer than 15 one-minute candles -> no completed 15m bar: a clear error, never an exception."""
+    from decimal import Decimal as _D
+
+    from wta.ai.tools import InternalTools, ToolDeps
+    from wta.config import load_config
+    from wta.models import Candle
+
+    now = 1_761_127_200.0 + 600  # 10 minutes into a 15-minute bar
+    one = [Candle(symbol="BTCUSDT", resolution="1", ts=int(1_761_127_200 + 60 * i), o=_D("1"), h=_D("1"),
+                  l=_D("1"), c=_D("1"), v=_D("1")) for i in range(10)]
+    deps = ToolDeps(cfg=load_config(env={}), now=lambda: now, features=lambda: None, books=lambda: {},
+                    candles_1m=lambda s, a, b: one, trades=lambda s, a, b: [], pnl_summary=lambda: {},
+                    recent_decisions=lambda n: [], health=lambda: {})
+    out = InternalTools(deps).call("get_candle_stats", {"symbol": "BTCUSDT", "resolution": "15"})
+    assert out["bars"] == 0 and "no completed 15-minute bar" in out["error"]

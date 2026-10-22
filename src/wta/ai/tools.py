@@ -407,6 +407,9 @@ class InternalTools:
         minutes = int(resolution)
         bars = one if minutes == 1 else resample(one, minutes, now=now)
         bars = bars[-max(5, min(int(n), 200)):]
+        if not bars:  # warm-up: 1-minute candles exist but no completed bar of this resolution yet
+            return {"symbol": symbol, "resolution": resolution, "bars": 0,
+                    "error": f"no completed {resolution}-minute bar yet ({len(one)} one-minute candles)"}
         closes = [b.c for b in bars]
 
         def r(k: int) -> str | None:
