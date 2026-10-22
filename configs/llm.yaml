@@ -1,0 +1,25 @@
+# LLM providers/models. Keys come from .env; model names may be overridden by env
+# (OPENROUTER_MODEL_FAST / OPENROUTER_MODEL_STRONG / GEMINI_MODEL).
+openrouter:
+  base_url: https://openrouter.ai/api/v1
+analyst:
+  provider: openrouter
+  model: "${OPENROUTER_MODEL_FAST}"
+  max_tokens: 1500
+reviewer:
+  provider: openrouter
+  model: "${OPENROUTER_MODEL_STRONG}"
+  max_tokens: 2000
+  # Reviewer may only edit these paths, within these bounds. Risk params are never editable.
+  editable:
+    strategies.s1_crossbook.margin_min_pct: [0.0008, 0.005]
+    strategies.s1_crossbook.leg1_taker: [true, false]
+    strategies.s2_usdtalloc.rebalance_threshold_pp: [0.10, 0.25]
+    strategies.s3_momentum.min_regime_confidence: [0.5, 0.9]
+    engine.slow_loop_interval_s: [180, 900]
+  max_changes_per_review: 2
+  cooldown_s: 3600
+fallback:
+  provider: gemini
+  model: "${GEMINI_MODEL}"
+  base_url: https://generativelanguage.googleapis.com/v1beta
