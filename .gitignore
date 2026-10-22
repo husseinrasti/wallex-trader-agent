@@ -1,8 +1,8 @@
 .env
 .venv/
-data/
-logs/
-run/
+/data/
+/logs/
+/run/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -13,4 +13,4 @@ configs/runtime/
 KILL
 !deliverables/
 !deliverables/**
-video/
+/video/

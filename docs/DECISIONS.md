@@ -14,3 +14,10 @@ One line each: date — decision — why.
 - 2026-10-22 — Stdlib `sqlite3` (WAL) with batched writes instead of `aiosqlite` — fewer dependencies; writes are small and batched every 1 s.
 - 2026-10-22 — The assistant does not place exchange orders itself (not even the far-from-market `--probe-order`) — operator safety policy; the script is ready and the user runs it.
 - 2026-10-22 — `video/` is gitignored — the pre-existing 53 MB video.mp4 exceeds GitHub's 50 MB warning size; the demo video link goes into deliverables/VIDEO.md instead.
+- 2026-10-22 — S3 target is a software target (PositionManager) instead of a resting target LIMIT — a resting STOP_LIMIT SELL most likely locks the coins, so a second SELL for the same qty would be rejected for balance; one SELL resting at a time also keeps self-cross checks trivial.
+- 2026-10-22 — Live guard lives in `wta/safety.py` and runs in the CLI, `run_engine` and `Engine.run`; `WTA_LIVE=1` must be in the process environment (a `.env` value does not arm live); the clean-tree check counts untracked files — live can only start deliberately from a committed tree.
+- 2026-10-22 — WS close code >= 3500 stops the WebSocket feed for the life of the process (Centrifugo "do not retry"); REST polling covers the data.
+- 2026-10-22 — With a sub-account configured, balances come from `/v1/account/balances-detail` only; the main-wallet fallback is used only on 404/405 — never silently value the wrong wallet.
+- 2026-10-22 — One-shot CLI commands and `check_account.py` use `max_retries=0` and short timeouts — an outage fails in seconds instead of minutes of backoff.
+- 2026-10-22 — MCP client is read-only by construction: default allowlist = the 8 read-only tools; state-changing names are refused even if allowlisted.
+- 2026-10-22 — `check_account.py --probe-order` refuses to run when routing warnings exist (sub-account id missing) unless `--probe-main-wallet`; STOP_LIMIT probe limit price sits on the non-filling side.
