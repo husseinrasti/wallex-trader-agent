@@ -481,12 +481,12 @@ async def test_from_snapshot_needs_no_api(clock: SimClock) -> None:
 
 
 def test_spread_sources(markets: dict[str, MarketInfo], clock: SimClock) -> None:
-    extra = MarketInfo(symbol="ADATMN", base="ADA", quote="TMN", tick_decimals=0, step_decimals=1)
-    ex = BacktestExchange({**markets, "ADATMN": extra}, clock, spreads={"BTCUSDT": D("0.0009")})
+    extra = MarketInfo(symbol="ZZZTMN", base="ZZZ", quote="TMN", tick_decimals=0, step_decimals=1)
+    ex = BacktestExchange({**markets, "ZZZTMN": extra}, clock, spreads={"BTCUSDT": D("0.0009")})
     assert (ex.spread_source("BTCUSDT"), ex.spread_for("BTCUSDT")) == ("observed", D("0.0009"))
     ref = snapshot_reference()["spreads"]
     assert (ex.spread_source("BTCTMN"), ex.spread_for("BTCTMN")) == ("reference", ref["BTCTMN"])
-    assert (ex.spread_source("ADATMN"), ex.spread_for("ADATMN")) == ("default", DEFAULT_SPREAD_PCT)
+    assert (ex.spread_source("ZZZTMN"), ex.spread_for("ZZZTMN")) == ("default", DEFAULT_SPREAD_PCT)
     ex.set_bar("BTCUSDT", flat(0, "82000"), spread_pct=D("0.002"))
     assert (ex.spread_source("BTCUSDT"), ex.spread_for("BTCUSDT")) == ("bar", D("0.002"))
     with pytest.raises(ValueError):

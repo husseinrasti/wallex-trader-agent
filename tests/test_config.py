@@ -56,7 +56,7 @@ def test_default_yaml_is_loaded(cfg: Config) -> None:
 def test_markets_yaml_is_loaded(cfg: Config) -> None:
     assert cfg.markets.quote_assets == ["TMN", "USDT"]
     assert cfg.markets.watchlist[:3] == ["USDTTMN", "BTCTMN", "BTCUSDT"]
-    assert len(cfg.markets.watchlist) == 11
+    assert len(cfg.markets.watchlist) == 21  # 21 x 3 WS channels = 63 <= the 64-channel cap
 
 
 def test_llm_yaml_is_loaded(cfg: Config) -> None:

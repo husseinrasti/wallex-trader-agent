@@ -71,7 +71,7 @@ def test_same_seed_same_books(snap_markets: dict[str, MarketInfo]) -> None:
     b, _, seen_b = _feed(snap_markets, SyntheticParams(seed=11))
     _simulate(a, 50)
     _simulate(b, 50)
-    assert len(seen_a) == 50 * 11  # one book per watchlist symbol per tick
+    assert len(seen_a) == 50 * len(snap_markets)  # one book per watchlist symbol per tick
     assert seen_a == seen_b
     c, _, seen_c = _feed(snap_markets, SyntheticParams(seed=12))
     _simulate(c, 50)
@@ -80,7 +80,7 @@ def test_same_seed_same_books(snap_markets: dict[str, MarketInfo]) -> None:
 
 def test_symbols_are_published_in_sorted_order(snap_markets: dict[str, MarketInfo]) -> None:
     feed, bus, seen = _feed(snap_markets)
-    assert feed.publish(T0) == 11
+    assert feed.publish(T0) == len(snap_markets)
     assert [b.symbol for b in seen] == sorted(snap_markets)
     assert bus.snapshot() == {b.symbol: b for b in seen}
     assert bus.source_ok("synthetic", T0, 30)
@@ -164,7 +164,7 @@ def test_dislocation_rate(snap_markets: dict[str, MarketInfo]) -> None:
             if abs(lag - before[coin]) > 0.002:
                 jumps += 1
             max_abs_lag = max(max_abs_lag, abs(lag))
-    expected = rate * hours * len(COINS)  # 100
+    expected = rate * hours * len(feed._lag)  # one jump process per coin with a USDT book
     assert 0.6 * expected <= jumps <= 1.4 * expected
     assert max_abs_lag > 0.003  # dislocations big enough to beat S1's 0.43 % lock-in cost appear
 

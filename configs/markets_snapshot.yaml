@@ -1,5 +1,6 @@
 # Offline fallback for /v1/markets (used only when the API is unreachable, e.g. backtests on a
 # machine without access, or synthetic-feed shadow runs). Live runs ALWAYS use /v1/markets.
+# ADA/TRX/LTC/LINK/AVAX rows and their reference mids are rough estimates (unverified, synthetic use only).
 # Sources: Overview §2.1 (BTCUSDT tickSize 2, TMN pairs 0 price decimals, minNotional TMN 50,000 /
 # USDT 1, SOLTMN isMarketTypeEnable false). Other decimals are best estimates — marked unverified;
 # scripts/check_account.py prints the real values once the API is reachable.
@@ -16,6 +17,16 @@ markets:
   XRPUSDT: {base: XRP,  quote: USDT, tick_decimals: 4, step_decimals: 1, min_qty: "0.1", min_notional: "1", market_orders_enabled: true}
   DOGETMN: {base: DOGE, quote: TMN, tick_decimals: 0, step_decimals: 0, min_qty: "1", min_notional: "50000", market_orders_enabled: true}
   DOGEUSDT: {base: DOGE, quote: USDT, tick_decimals: 5, step_decimals: 0, min_qty: "1", min_notional: "1", market_orders_enabled: true}
+  ADATMN: {base: ADA, quote: TMN, tick_decimals: 0, step_decimals: 1, min_qty: "0.1", min_notional: "50000", market_orders_enabled: true}
+  ADAUSDT: {base: ADA, quote: USDT, tick_decimals: 4, step_decimals: 1, min_qty: "0.1", min_notional: "1", market_orders_enabled: true}
+  TRXTMN: {base: TRX, quote: TMN, tick_decimals: 0, step_decimals: 0, min_qty: "1", min_notional: "50000", market_orders_enabled: true}
+  TRXUSDT: {base: TRX, quote: USDT, tick_decimals: 5, step_decimals: 0, min_qty: "1", min_notional: "1", market_orders_enabled: true}
+  LTCTMN: {base: LTC, quote: TMN, tick_decimals: 0, step_decimals: 3, min_qty: "0.001", min_notional: "50000", market_orders_enabled: true}
+  LTCUSDT: {base: LTC, quote: USDT, tick_decimals: 2, step_decimals: 3, min_qty: "0.001", min_notional: "1", market_orders_enabled: true}
+  LINKTMN: {base: LINK, quote: TMN, tick_decimals: 0, step_decimals: 2, min_qty: "0.01", min_notional: "50000", market_orders_enabled: true}
+  LINKUSDT: {base: LINK, quote: USDT, tick_decimals: 3, step_decimals: 2, min_qty: "0.01", min_notional: "1", market_orders_enabled: true}
+  AVAXTMN: {base: AVAX, quote: TMN, tick_decimals: 0, step_decimals: 2, min_qty: "0.01", min_notional: "50000", market_orders_enabled: true}
+  AVAXUSDT: {base: AVAX, quote: USDT, tick_decimals: 2, step_decimals: 2, min_qty: "0.01", min_notional: "1", market_orders_enabled: true}
 # Reference mids for the synthetic feed (Overview §2.1 snapshot, 2026-10-22).
 reference_mids:
   USDTTMN: "266739"
@@ -24,6 +35,11 @@ reference_mids:
   SOLUSDT: "105.2"
   XRPUSDT: "0.5520"
   DOGEUSDT: "0.18020"
+  ADAUSDT: "0.6200"
+  TRXUSDT: "0.31000"
+  LTCUSDT: "93.00"
+  LINKUSDT: "17.500"
+  AVAXUSDT: "24.00"
 reference_spreads_pct:
   USDTTMN: "0.00014"
   BTCTMN: "0.00138"
@@ -36,3 +52,13 @@ reference_spreads_pct:
   XRPUSDT: "0.0008"
   DOGETMN: "0.0015"
   DOGEUSDT: "0.0008"
+  ADATMN: "0.0025"
+  ADAUSDT: "0.0010"
+  TRXTMN: "0.0025"
+  TRXUSDT: "0.0010"
+  LTCTMN: "0.0025"
+  LTCUSDT: "0.0010"
+  LINKTMN: "0.0025"
+  LINKUSDT: "0.0010"
+  AVAXTMN: "0.0025"
+  AVAXUSDT: "0.0010"

@@ -29,13 +29,14 @@ from wta.models import MarketInfo
 WATCHLIST = {
     "USDTTMN", "BTCTMN", "BTCUSDT", "ETHTMN", "ETHUSDT", "SOLTMN", "SOLUSDT",
     "XRPTMN", "XRPUSDT", "DOGETMN", "DOGEUSDT",
+    "ADATMN", "ADAUSDT", "TRXTMN", "TRXUSDT", "LTCTMN", "LTCUSDT", "LINKTMN", "LINKUSDT", "AVAXTMN", "AVAXUSDT",
 }
 
 
 # ---------------------------------------------------------------- snapshot
 
 
-def test_snapshot_has_the_eleven_watchlist_markets(cfg: Config) -> None:
+def test_snapshot_has_every_watchlist_market(cfg: Config) -> None:
     markets = load_markets_snapshot()
     assert set(markets) == WATCHLIST == set(cfg.markets.watchlist)
     assert list(markets) == sorted(markets)  # deterministic iteration

@@ -94,7 +94,7 @@ def test_config_show_masks_secrets_and_prints_the_hash(use_settings, capsys) -> 
     assert FAKE_KEY not in out
     assert "wallex_api_key: <set>" in out and "openrouter_api_key: <empty>" in out
     assert f"config_hash: {load_config([]).config_hash}" in out
-    assert "symbols; --full lists them>" in out and "ATMN" not in out
+    assert "symbols; --full lists them>" in out and "- ATMN\n" not in out
     assert cli.main(["config", "show", "--full"]) == 0
     assert "- ATMN" in capsys.readouterr().out
 

@@ -1,7 +1,7 @@
 # Watchlist + verbatim organizer ban list ("/" removed, A/TMN -> ATMN).
 # The engine refuses any symbol in `banned`; `wta markets` exits non-zero if a watchlist symbol is banned.
 quote_assets: [TMN, USDT]
-watchlist:            # symbols the fast loop keeps fresh (recorder records these)
+watchlist:            # symbols the fast loop keeps fresh (recorder records these); 21 x 3 WS channels <= 64
   - USDTTMN
   - BTCTMN
   - BTCUSDT
@@ -13,6 +13,16 @@ watchlist:            # symbols the fast loop keeps fresh (recorder records thes
   - XRPUSDT
   - DOGETMN
   - DOGEUSDT
+  - ADATMN
+  - ADAUSDT
+  - TRXTMN
+  - TRXUSDT
+  - LTCTMN
+  - LTCUSDT
+  - LINKTMN
+  - LINKUSDT
+  - AVAXTMN
+  - AVAXUSDT
 banned:               # verbatim from organizer (345 symbols); engine refuses these
   - "ATMN"
   - "GTMN"
