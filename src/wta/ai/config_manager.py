@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
 from wta.config import CONFIG_DIR, Config, apply_changes, config_hash, get_path
 
@@ -48,6 +49,8 @@ def _within(value: Any, bounds: list[Any]) -> tuple[bool, Any, str]:
             v = Decimal(str(value))
         except (InvalidOperation, ValueError):
             return False, value, "not a number"
+        if not v.is_finite():  # NaN would raise InvalidOperation on the comparison below
+            return False, value, "not a finite number"
         lo, hi = Decimal(str(bounds[0])), Decimal(str(bounds[1]))
         if not lo <= v <= hi:
             return False, value, f"outside bounds [{lo}, {hi}]"
@@ -55,6 +58,16 @@ def _within(value: Any, bounds: list[Any]) -> tuple[bool, Any, str]:
     if value in bounds:
         return True, value, ""
     return False, value, f"not one of {bounds}"
+
+
+def _same(old: Any, new: Any) -> bool:
+    """True when ``new`` would not change ``old`` (numbers compare by value: 300 == 300.0)."""
+    if isinstance(new, Decimal):
+        try:
+            return Decimal(str(old)) == new
+        except InvalidOperation:
+            return False
+    return str(old) == str(new)
 
 
 class ConfigManager:
@@ -72,6 +85,7 @@ class ConfigManager:
             res.new_hash = res.old_hash
             return res
         changes: dict[str, Any] = {}
+        new_cfg: Config | None = None
         tree = self.cfg.model_dump(mode="json")
         for s in suggestions:
             path = str(s.get("path", ""))
@@ -81,24 +95,34 @@ class ConfigManager:
             if path.startswith(FORBIDDEN_PREFIXES) or path not in rc.editable:
                 res.rejected.append({**s, "why": "path not editable"})
                 continue
+            if path in changes:
+                res.rejected.append({**s, "why": "duplicate path in this review"})
+                continue
             ok, val, why = _within(s.get("value"), rc.editable[path])
             if not ok:
                 res.rejected.append({**s, "why": why})
                 continue
             try:
                 old = get_path(tree, path)
-            except KeyError:
+            except (KeyError, TypeError):
                 res.rejected.append({**s, "why": "unknown path"})
                 continue
-            if str(old) == str(val):
+            if _same(old, val):
                 res.rejected.append({**s, "why": "no change"})
                 continue
-            changes[path] = float(val) if isinstance(val, Decimal) else val
+            new_value = float(val) if isinstance(val, Decimal) else val
+            try:  # the field's own type still applies (e.g. 5.5 for an int field)
+                trial = apply_changes(self.cfg, {**changes, path: new_value})
+            except ValueError as exc:  # pydantic ValidationError is a ValueError
+                msg = exc.errors()[0]["msg"] if isinstance(exc, ValidationError) else str(exc)
+                res.rejected.append({**s, "why": f"invalid value: {msg}"})
+                continue
+            changes[path] = new_value
+            new_cfg = trial
             res.accepted.append({"path": path, "old": old, "new": str(val), "rationale": s.get("rationale", "")})
-        if not changes:
+        if new_cfg is None:
             res.new_hash = res.old_hash
             return res
-        new_cfg = apply_changes(self.cfg, changes)
         res.config = new_cfg
         res.new_hash = config_hash(new_cfg)
         for k, v in changes.items():

@@ -305,6 +305,7 @@ class LLMClient:
                    role: str = "analyst", temperature: float = 0.0, max_tokens: int = 1500,
                    json_mode: bool = True, timeout: float = 40, route: Route | None = None) -> LLMResponse | None:
         routes = [route or self.primary] + ([self.fallback] if self.fallback and route is None else [])
+        miss: CacheMissError | None = None
         for i, r in enumerate(routes):
             try:
                 resp = await self._call_route(r, messages, tools, temperature, max_tokens, json_mode, timeout, role)
@@ -313,11 +314,14 @@ class LLMClient:
                     self.on_call({"role": role, "provider": resp.provider, "model": resp.model, "cached": resp.cached,
                                   "latency_ms": resp.latency_ms, "usage": resp.usage, "fallback": i > 0})
                 return resp
-            except CacheMissError:
-                raise
+            except CacheMissError as exc:
+                # replay: if the recorded run failed over, the answer is cached under the fallback route
+                miss = miss or exc
             except (ProviderError, TimeoutError, httpx.HTTPError, ValueError) as exc:
                 self.last_error = f"{r.provider}: {type(exc).__name__}: {str(exc)[:200]}"
                 log.warning("LLM call failed (%s)", self.last_error)
+        if miss is not None:
+            raise miss
         self.consecutive_failures += 1
         return None
 
