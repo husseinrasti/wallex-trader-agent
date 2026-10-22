@@ -6,6 +6,18 @@ equity, plans, events) are buffered and written in batches (every ``flush_interv
 ``flush_rows`` rows). Engine state that must survive a crash (orders, fills, positions, kv) is
 written through immediately — it is rare, so batching would buy nothing.
 
+``transaction()`` groups writes into one commit: inside it nothing is committed (immediate writes
+and size/timer flushes wait), rows are executed lazily (before a read, so reads see them) and
+everything is committed once at the end. The engine wraps each fast tick in one, so orders, fills,
+positions and the kv state (portfolio, flags, orders, paper exchange) always move together: a crash
+restores the state as of the end of a tick, never a mix. ``checkpoint()`` commits now, also inside a
+transaction (the OrderManager's write-ahead record before an order is sent). A failed commit keeps
+every row of the transaction pending (rolled back, retried by the next flush).
+
+Replay inputs (PRD-05): ``engine_books`` holds every order book the engine actually used in a fast
+tick (all levels, deduplicated by ``(symbol, ts)``) and ``ticks`` one row per fast tick with the
+book timestamps it saw, both tagged with the engine ``mode``. Replay feeds them back tick by tick.
+
 Every price/quantity/money value is stored as TEXT (``str(Decimal)``) and comes back as an exact
 ``Decimal``. Books are compact JSON: ``[["price", "qty"], ...]`` limited to ``depth_levels``.
 Time bounds on readers are inclusive (``from_ts <= ts <= to_ts``).
@@ -18,6 +30,7 @@ import json
 import logging
 import sqlite3
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from decimal import Decimal
 from itertools import groupby
 from pathlib import Path
@@ -46,18 +59,38 @@ CREATE TABLE IF NOT EXISTS positions(id TEXT PRIMARY KEY, json TEXT, open INTEGE
 CREATE TABLE IF NOT EXISTS plans(ts REAL, json TEXT, prompt_hash TEXT);
 CREATE TABLE IF NOT EXISTS events(ts REAL, kind TEXT, json TEXT);
 CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, json TEXT, updated_ts REAL);
+CREATE TABLE IF NOT EXISTS engine_books(
+    ts REAL, mode TEXT, symbol TEXT, source TEXT, bids_json TEXT, asks_json TEXT
+);
+CREATE TABLE IF NOT EXISTS ticks(ts REAL, mode TEXT, json TEXT);
 CREATE INDEX IF NOT EXISTS idx_books_symbol_ts ON books(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trades(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_candles_symbol_ts ON candles(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity(ts);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_plans_ts ON plans(ts);
+CREATE INDEX IF NOT EXISTS idx_engine_books_mode_ts ON engine_books(mode, ts);
+CREATE INDEX IF NOT EXISTS idx_ticks_mode_ts ON ticks(mode, ts);
 """
 
-TABLES = ("books", "trades", "candles", "balances", "equity", "orders", "fills", "positions", "plans", "events", "kv")
+TABLES = (
+    "books",
+    "trades",
+    "candles",
+    "balances",
+    "equity",
+    "orders",
+    "fills",
+    "positions",
+    "plans",
+    "events",
+    "kv",
+    "engine_books",
+    "ticks",
+)
 # the time column of each table (for time_range) and which tables have a symbol column
 _TS_COLUMN = {t: "ts" for t in TABLES} | {"orders": "updated_ts", "positions": "updated_ts", "kv": "updated_ts"}
-_SYMBOL_TABLES = frozenset({"books", "trades", "candles"})
+_SYMBOL_TABLES = frozenset({"books", "trades", "candles", "engine_books"})
 
 _SQL_BOOK = "INSERT INTO books(ts, symbol, source, bids_json, asks_json) VALUES (?, ?, ?, ?, ?)"
 _SQL_TRADE = "INSERT INTO trades(ts, symbol, price, qty, side) VALUES (?, ?, ?, ?, ?)"
@@ -75,6 +108,10 @@ _SQL_POSITION = "INSERT OR REPLACE INTO positions(id, json, open, updated_ts) VA
 _SQL_PLAN = "INSERT INTO plans(ts, json, prompt_hash) VALUES (?, ?, ?)"
 _SQL_EVENT = "INSERT INTO events(ts, kind, json) VALUES (?, ?, ?)"
 _SQL_KV = "INSERT OR REPLACE INTO kv(key, json, updated_ts) VALUES (?, ?, ?)"
+_SQL_ENGINE_BOOK = (
+    "INSERT INTO engine_books(ts, mode, symbol, source, bids_json, asks_json) VALUES (?, ?, ?, ?, ?, ?)"
+)
+_SQL_TICK = "INSERT INTO ticks(ts, mode, json) VALUES (?, ?, ?)"
 
 # If the disk keeps failing, keep at most this many unwritten rows in memory (oldest dropped).
 MAX_PENDING_ROWS = 100_000
@@ -142,6 +179,8 @@ class Store:
         self.depth_levels = depth_levels
         self.rows_written: dict[str, int] = dict.fromkeys(TABLES, 0)  # committed rows since open
         self._pending: list[tuple[str, str, tuple[Any, ...]]] = []  # (table, sql, params)
+        self._tx_depth = 0  # > 0 inside transaction(): nothing is committed
+        self._tx_rows: list[tuple[str, str, tuple[Any, ...]]] = []  # executed, not committed yet
         self._last_flush_ts = 0.0
         self._closed = False
         self._conn = self._connect()
@@ -173,46 +212,94 @@ class Store:
     def pending_rows(self) -> int:
         return len(self._pending)
 
+    @property
+    def in_transaction(self) -> bool:
+        return self._tx_depth > 0
+
     def _enqueue(self, table: str, sql: str, params: tuple[Any, ...], immediate: bool = False) -> None:
         if self.readonly:
             raise RuntimeError("store is read-only")
         self._pending.append((table, sql, params))
-        if immediate or len(self._pending) >= self.flush_rows:
+        if self._tx_depth == 0 and (immediate or len(self._pending) >= self.flush_rows):
             self.flush()
 
     def maybe_flush(self, now: float) -> int:
-        """Flush if ``flush_interval_s`` passed since the last timed flush or the buffer is full."""
+        """Flush if ``flush_interval_s`` passed since the last timed flush or the buffer is full.
+
+        Inside a transaction nothing happens: the transaction commits at its end.
+        """
+        if self._tx_depth > 0:
+            return 0
         if len(self._pending) >= self.flush_rows or now - self._last_flush_ts >= self.flush_interval_s:
             self._last_flush_ts = now
             return self.flush()
         return 0
 
+    @contextmanager
+    def transaction(self, raise_errors: bool = True) -> Iterator[Store]:
+        """Group every write in the block into one commit (nested blocks join the outer one).
+
+        With ``raise_errors=False`` a failed final commit is logged instead of raised; its rows stay
+        pending and the next flush retries them.
+        """
+        if self.readonly:
+            raise RuntimeError("store is read-only")
+        self._tx_depth += 1
+        failed = True
+        try:
+            yield self
+            failed = False
+        finally:
+            self._tx_depth -= 1
+            if self._tx_depth == 0:
+                try:
+                    self.flush()
+                except sqlite3.Error:
+                    if raise_errors and not failed:
+                        raise
+                    log.exception("store: commit at the end of a transaction failed; rows kept pending")
+
+    def checkpoint(self) -> int:
+        """Commit everything written so far, also inside a transaction. Returns rows written."""
+        depth, self._tx_depth = self._tx_depth, 0
+        try:
+            return self.flush()
+        finally:
+            self._tx_depth = depth
+
     def flush(self) -> int:
         """Write every pending row in one transaction. Returns the number of rows written.
 
-        On a database error the rows stay pending (retried on the next flush) and the error is raised.
+        Inside ``transaction()`` the rows are executed (so this connection's reads see them) but
+        not committed. On a database error everything not committed yet (this batch and the rows
+        executed earlier in the transaction) is rolled back and stays pending (retried on the next
+        flush), and the error is raised.
         """
-        if not self._pending or self.readonly:
+        if self.readonly:
+            return 0
+        if not self._pending and (self._tx_depth > 0 or not self._tx_rows):
             return 0
         batch, self._pending = self._pending, []
-        written: dict[str, int] = {}
         try:
             # consecutive rows with the same statement go through one executemany; order is kept
-            for (table, sql), group in groupby(batch, key=lambda row: (row[0], row[1])):
-                params = [row[2] for row in group]
-                self._conn.executemany(sql, params)
-                written[table] = written.get(table, 0) + len(params)
+            for (_table, sql), group in groupby(batch, key=lambda row: (row[0], row[1])):
+                self._conn.executemany(sql, [row[2] for row in group])
+            if self._tx_depth > 0:
+                self._tx_rows.extend(batch)
+                return len(batch)
             self._conn.commit()
         except sqlite3.Error:
             self._conn.rollback()
-            self._pending = batch + self._pending
+            self._pending = self._tx_rows + batch + self._pending
+            self._tx_rows = []
             if len(self._pending) > MAX_PENDING_ROWS:
                 dropped = len(self._pending) - MAX_PENDING_ROWS
                 del self._pending[:dropped]
                 log.error("store: dropped %d unwritten rows (database keeps failing)", dropped)
             raise
-        for table, n in written.items():
-            self.rows_written[table] += n
+        committed, self._tx_rows = self._tx_rows + batch, []
+        for table, _sql, _params in committed:
+            self.rows_written[table] += 1
         return len(batch)
 
     def _before_read(self) -> None:
@@ -222,6 +309,7 @@ class Store:
     def close(self) -> None:
         if self._closed:
             return
+        self._tx_depth = 0  # closing commits whatever a transaction left behind
         try:
             self.flush()
         except sqlite3.Error:
@@ -303,6 +391,18 @@ class Store:
         text = json.dumps(_tag_decimals(value), separators=(",", ":"))
         self._enqueue("kv", _SQL_KV, (key, text, ts), immediate=True)
 
+    def add_engine_book(self, book: BookSnapshot, mode: str) -> None:
+        """A book the engine used in a fast tick (replay input). All levels are kept, not only
+        ``depth_levels``: the paper exchange may have walked deeper than the recorder stores."""
+        bids = _levels_json(book.bids, len(book.bids))
+        asks = _levels_json(book.asks, len(book.asks))
+        params = (book.ts, mode, book.symbol, book.source, bids, asks)
+        self._enqueue("engine_books", _SQL_ENGINE_BOOK, params)
+
+    def add_tick(self, ts: float, mode: str, data: dict[str, Any]) -> None:
+        """One fast tick of the engine (replay input), e.g. ``{"ts": ..., "book_ts": {symbol: ts}}``."""
+        self._enqueue("ticks", _SQL_TICK, (ts, mode, _log_json(data)))
+
     def kv_get(self, key: str, default: Any = None) -> Any:
         self._before_read()
         row = self._conn.execute("SELECT json FROM kv WHERE key = ?", (key,)).fetchone()
@@ -358,6 +458,30 @@ class Store:
             (symbol,),
         ).fetchone()
         return None if row is None else self._row_to_book(row)
+
+    def iter_engine_books(
+        self, mode: str, from_ts: float | None = None, to_ts: float | None = None
+    ) -> Iterator[BookSnapshot]:
+        """Books the engine used in ``mode`` (all symbols), in the order they were stored."""
+        self._before_read()
+        where, params = self._time_filter(from_ts, to_ts)
+        cur = self._conn.execute(
+            "SELECT ts, symbol, source, bids_json, asks_json FROM engine_books"
+            f" WHERE mode = ?{where} ORDER BY ts, rowid",
+            [mode, *params],
+        )
+        return (self._row_to_book(row) for row in cur)
+
+    def iter_ticks(
+        self, mode: str, from_ts: float | None = None, to_ts: float | None = None
+    ) -> Iterator[dict[str, Any]]:
+        """The engine's fast-tick rows of ``mode`` in time order (the dicts given to ``add_tick``)."""
+        self._before_read()
+        where, params = self._time_filter(from_ts, to_ts)
+        cur = self._conn.execute(
+            f"SELECT json FROM ticks WHERE mode = ?{where} ORDER BY ts, rowid", [mode, *params]
+        )
+        return (json.loads(text) for (text,) in cur)
 
     def iter_trades(
         self, symbol: str, from_ts: float | None = None, to_ts: float | None = None

@@ -19,7 +19,8 @@ engine:
   exception_storm_count: 3             # >= N engine-loop crashes ...
   exception_storm_window_s: 600        # ... within this window -> kill
 data:
-  sqlite_path: data/wta.sqlite
+  sqlite_path: data/wta.sqlite                 # market data written by the recorder
+  state_sqlite_path: data/state_{mode}.sqlite   # engine state (kv, positions, orders, equity) per mode
   depth_levels_stored: 10
   rest_poll_interval_s: 2
   rest_poll_use_depth_all: true        # one /depth/all call per poll instead of one call per symbol

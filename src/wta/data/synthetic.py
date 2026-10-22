@@ -11,6 +11,10 @@ strategy performance — just a realistic-looking stream that exercises the full
   opportunities (S1) appear at a plausible, tunable rate.
 * Ten levels per side with the reference spreads from ``configs/markets_snapshot.yaml``.
 * 1-minute candles are aggregated from the mids and handed to ``on_candle`` (e.g. Store.upsert).
+* Optional stress test: ``shock_at_s`` / ``shock_pct`` multiply the dollar (USDTTMN) mid and every
+  coin's USDT mid by ``1 + shock_pct`` once, ``shock_at_s`` seconds after the first publish. A
+  coin's TMN book is USDT mid x dollar, so it moves by ``(1 + shock_pct)^2 - 1`` (about twice as
+  far): a dollar crash and a coin crash at the same time. Used to exercise the kill-switch.
 """
 
 from __future__ import annotations
@@ -42,6 +46,8 @@ class SyntheticParams:
     jump_rate_per_hour: float = 1.0  # dislocation episodes per coin per hour
     jump_size_pct: float = 0.006
     level_notional_tmn: tuple[float, float] = (2e6, 2e7)
+    shock_at_s: float | None = None  # seconds after the first publish; None = no shock
+    shock_pct: float = 0.0  # fraction, e.g. -0.08 for -8 %
 
 
 @dataclass
@@ -80,6 +86,8 @@ class SyntheticFeed:
             self._lag[base] = 0.0
         self._candles: dict[str, _CandleAcc] = {}
         self.ticks = 0
+        self._first_publish_ts: float | None = None
+        self.shocked_ts: float | None = None  # when the one-off shock was applied
 
     # ------------------------------------------------------------ simulation
 
@@ -97,6 +105,20 @@ class SyntheticFeed:
             if self.rng.random() < p.jump_rate_per_hour * dt / 3600:
                 lag += self.rng.choice((-1, 1)) * p.jump_size_pct * (0.6 + 0.8 * self.rng.random())
             self._lag[base] = lag
+
+    def maybe_shock(self, now: float) -> bool:
+        """Apply the one-off shock when it is due (see the module docstring). True when applied now."""
+        p = self.params
+        if p.shock_at_s is None or self.shocked_ts is not None or self._first_publish_ts is None:
+            return False
+        if now - self._first_publish_ts < p.shock_at_s:
+            return False
+        factor = 1 + p.shock_pct
+        self._usdt_mid *= factor
+        for base in sorted(self._coin_usdt):
+            self._coin_usdt[base] *= factor
+        self.shocked_ts = now
+        return True
 
     def mid(self, symbol: str) -> float | None:
         m = self.markets.get(symbol)
@@ -155,7 +177,13 @@ class SyntheticFeed:
         return closed
 
     def publish(self, now: float) -> int:
-        """Publish one snapshot per symbol (+ a synthetic trade and candle update). Returns count."""
+        """Publish one snapshot per symbol (+ a synthetic trade and candle update). Returns count.
+
+        A due shock (``params.shock_at_s``) is applied first, so this snapshot already shows it.
+        """
+        if self._first_publish_ts is None:
+            self._first_publish_ts = now
+        self.maybe_shock(now)
         n = 0
         candles: list[Candle] = []
         for sym in self.symbols:
@@ -177,10 +205,17 @@ class SyntheticFeed:
         return n
 
     async def run(self, stop_event: asyncio.Event | None = None, sleep: Callable = asyncio.sleep) -> None:
+        """Publish now, then every ``step_s`` until ``stop_event`` is set.
+
+        The event is checked again after each sleep, so nothing is published (and ``on_candle`` is
+        not called, e.g. into a store being closed) once shutdown has been requested.
+        """
         last = self.clock.now()
         self.publish(last)
         while not (stop_event and stop_event.is_set()):
             await sleep(self.params.step_s)
+            if stop_event and stop_event.is_set():
+                break
             now = self.clock.now()
             self.step(max(now - last, 0.0))
             last = now

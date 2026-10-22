@@ -269,8 +269,12 @@ def test_wta_live_from_dotenv_settings_does_not_count(use_settings, engine_calls
     assert engine_calls == []
 
 
+FUTURE_END = "2099-01-01T00:00:00Z"
+
+
 def test_run_live_refuses_a_dirty_tree_unless_allowed(use_settings, engine_calls, monkeypatch, capsys) -> None:
     monkeypatch.setenv("WTA_LIVE", "1")
+    monkeypatch.setenv("CHALLENGE_END_UTC", FUTURE_END)
     monkeypatch.setattr(safety, "tree_is_dirty", lambda root=None: True)
     assert cli.main(["run", "--mode", "live", "--i-understand-live"]) == 2
     assert "dirty" in capsys.readouterr().err and engine_calls == []
@@ -289,11 +293,24 @@ def test_run_live_needs_an_api_key(use_settings, engine_calls, monkeypatch, caps
 
 def test_run_live_starts_when_every_guard_passes(use_settings, engine_calls, monkeypatch) -> None:
     monkeypatch.setenv("WTA_LIVE", "1")
+    monkeypatch.setenv("CHALLENGE_END_UTC", FUTURE_END)
     monkeypatch.setattr(safety, "tree_is_dirty", lambda root=None: False)
     assert cli.main(["run", "--mode", "live", "--i-understand-live", "--seconds", "1"]) == 0
     assert engine_calls == [
         {"mode": "live", "seconds": 1.0, "log_dir": "logs", "i_understand_live": True, "allow_dirty": False}
     ]
+
+
+def test_run_live_refuses_without_a_future_challenge_end(use_settings, engine_calls, monkeypatch, capsys) -> None:
+    """Without CHALLENGE_END_UTC the deadline phases (and the flatten to 100 % TMN) never run."""
+    monkeypatch.setenv("WTA_LIVE", "1")
+    monkeypatch.setenv("CHALLENGE_END_UTC", "")  # empty wins over a value in .env
+    monkeypatch.setattr(safety, "tree_is_dirty", lambda root=None: False)
+    assert cli.main(["run", "--mode", "live", "--i-understand-live"]) == 2
+    assert "CHALLENGE_END_UTC" in capsys.readouterr().err
+    monkeypatch.setenv("CHALLENGE_END_UTC", "2001-01-01T00:00:00Z")
+    assert cli.main(["run", "--mode", "live", "--i-understand-live"]) == 2
+    assert "the challenge ended" in capsys.readouterr().err and engine_calls == []
 
 
 def test_live_flags_cannot_be_abbreviated(use_settings, engine_calls, monkeypatch, capsys) -> None:

@@ -71,3 +71,14 @@ def test_guard_order_and_messages(monkeypatch: pytest.MonkeyPatch) -> None:
         check_live_guard(True, False, settings, live_env)
     monkeypatch.setattr(safety, "tree_is_dirty", lambda root=None: False)
     check_live_guard(True, False, settings, live_env)  # every guard passes: no exception
+
+
+def test_deadline_guard_needs_a_future_challenge_end() -> None:
+    from wta.safety import deadline_guard_reason
+
+    now = 1_792_663_200.0  # 2026-10-22T10:00:00Z
+    assert "CHALLENGE_END_UTC" in (deadline_guard_reason(None, now) or "")
+    assert "CHALLENGE_END_UTC" in (deadline_guard_reason("", now) or "")
+    assert "not an ISO-8601" in (deadline_guard_reason("next friday", now) or "")
+    assert "the challenge ended" in (deadline_guard_reason("2026-10-22T09:00:00Z", now) or "")
+    assert deadline_guard_reason("2026-10-25T12:00:00Z", now) is None

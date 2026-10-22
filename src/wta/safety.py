@@ -10,6 +10,11 @@ Live trading starts only when every check passes, in this order:
 
 ``live_guard_reason`` returns why live mode must not start (or None); ``check_live_guard`` raises
 ``LiveGuardError`` with that reason. Callers run it before any task starts.
+
+Live *trading* (not ``flatten_now``, which sells everything at once) also needs the challenge end:
+``deadline_guard_reason`` refuses a missing or past ``engine.challenge_end_utc``
+(``CHALLENGE_END_UTC``). Without it the deadline phases never run — no stop to new entries at
+T-2h, no flatten to 100 % TMN before the end — and the final valuation counts TMN only.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from pathlib import Path
 
 from wta.config import Settings
 from wta.utils import gitinfo
+from wta.utils.timeutil import iso, parse_iso
 
 
 class LiveGuardError(RuntimeError):
@@ -70,6 +76,22 @@ def live_guard_reason(
             f"the git working tree is dirty or has untracked files (HEAD {commit}); "
             "commit and tag first, or pass --allow-dirty (dev only)"
         )
+    return None
+
+
+def deadline_guard_reason(challenge_end_utc: str | None, now: float) -> str | None:
+    """Why live trading must not start for this challenge end (or None when it may)."""
+    try:
+        end = parse_iso(challenge_end_utc)
+    except ValueError:
+        return f"engine.challenge_end_utc {challenge_end_utc!r} is not an ISO-8601 time"
+    if end is None:
+        return (
+            "engine.challenge_end_utc (CHALLENGE_END_UTC) is not set: the flatten to 100 % TMN "
+            "before the end would never run"
+        )
+    if now >= end:
+        return f"the challenge ended at {iso(end)} (engine.challenge_end_utc)"
     return None
 
 

@@ -1,0 +1,9 @@
+# Half-size overlay for the first 6 h of live trading (PRD-03 §9, PRD-06 §6 step 6).
+# Use:  WTA_LIVE=1 python -m wta run --mode live --i-understand-live --overlay configs/live_halfsize.yaml
+# (equivalent --set flags: risk.max_order_pct_equity=0.125 strategies.s1_crossbook.size_pct_equity=0.10)
+# After 6 h without incidents restart without the overlay (the config_hash change is logged in events).
+risk:
+  max_order_pct_equity: 0.125
+strategies:
+  s1_crossbook:
+    size_pct_equity: 0.10

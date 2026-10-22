@@ -4,7 +4,7 @@ PY     := $(VENV)/bin/python
 FROM   ?= 2026-09-22
 TO     ?= 2026-10-22
 
-.PHONY: install test lint record survey shadow live backtest replay report flatten status tui ps docker
+.PHONY: install test lint record survey shadow shadow-synth live backtest replay report flatten flatten-live status tui ps docker
 
 install:
 	$(PYTHON) -m venv $(VENV) && $(VENV)/bin/pip install -U pip && $(VENV)/bin/pip install -e ".[dev]"
@@ -22,7 +22,10 @@ survey:
 	$(PY) scripts/survey.py --since 24h
 
 shadow:
-	$(PY) -m wta run --mode shadow
+	$(PY) -m wta run --mode shadow --log-dir logs/shadow
+
+shadow-synth:       # offline exercise on the synthetic feed (never evidence of performance)
+	$(PY) -m wta run --mode shadow --feed synthetic --log-dir logs/shadow_synth --set data.sqlite_path=data/shadow_synth.sqlite
 
 live:
 	WTA_LIVE=1 $(PY) -m wta run --mode live --i-understand-live
@@ -36,8 +39,11 @@ replay:
 report:
 	$(PY) -m wta report --out docs/REPORTS
 
-flatten:
-	$(PY) scripts/flatten_now.py --i-understand-live
+flatten:            # paper by default (uses the shadow paper state)
+	$(PY) scripts/flatten_now.py
+
+flatten-live:       # LIVE account: operator only, needs WTA_LIVE=1 in the environment
+	WTA_LIVE=1 $(PY) scripts/flatten_now.py --i-understand-live
 
 status:
 	$(PY) -m wta status

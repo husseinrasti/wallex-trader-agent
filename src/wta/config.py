@@ -105,7 +105,8 @@ class EngineCfg(_Cfg):
 
 
 class DataCfg(_Cfg):
-    sqlite_path: str = "data/wta.sqlite"
+    sqlite_path: str = "data/wta.sqlite"  # market data (recorder)
+    state_sqlite_path: str = "data/state_{mode}.sqlite"  # engine state per mode (shadow/live never mix)
     depth_levels_stored: int = 10
     rest_poll_interval_s: float = 2
     rest_poll_use_depth_all: bool = True

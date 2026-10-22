@@ -9,9 +9,14 @@ Commands::
     backfill                  historical candles from /v1/udf/history into SQLite
     account                   balances and fees (needs WALLEX_API_KEY)
     run --mode shadow|live    the engine; live needs --i-understand-live, WTA_LIVE=1 and a clean tree
+        --feed live|synthetic     market data: Wallex REST/WS (default) or the offline synthetic feed
+        --inject-intents FILE     JSONL intents sent through risk -> orders (shadow acceptance tests)
+        --paper-balances JSON     starting paper account, e.g. '{"TMN": 3000000, "USDT": 10}'
+        --synthetic-shock-at S --synthetic-shock-pct P    one-off synthetic crash (P = -0.08 is -8 %)
+    reset-kill --reason TEXT  clear the kill-switch by hand (writes a reset_kill event)
     logs check                validate logs/*.jsonl against their schemas
     db vacuum                 compact the SQLite database
-    backtest, replay, report, tui, status, reset-kill, export     later PRDs (exit 3)
+    backtest, replay, report, tui, status, export     later PRDs (exit 3)
 
 Options such as ``--set key=value`` go after the command: ``wta run --mode shadow --set a.b=1``.
 
@@ -40,15 +45,23 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from wta import engine as engine_mod
 from wta.config import Config, Settings, load_config, load_settings, mask_secrets
 from wta.data.collector import RestPoller, default_ws_factory, recordable_symbols, run_recorder
 from wta.data.store import Store
-from wta.engine import run_engine
+from wta.engine import (
+    EngineLockError,
+    load_injected_intents,
+    parse_paper_balances,
+    request_kill_reset,
+    run_engine,
+)
 from wta.exchange.base import MarketDataBus, WallexAPIError
 from wta.exchange.wallex_rest import WallexREST
 from wta.logging_.checker import check_logs, scan_for_secrets
+from wta.logging_.decision_log import EventsLog
 from wta.models import BookSnapshot, MarketInfo
-from wta.safety import LiveGuardError, live_guard_reason
+from wta.safety import LiveGuardError, deadline_guard_reason, live_guard_reason
 from wta.utils.timeutil import SystemClock, iso
 
 EXIT_OK, EXIT_FAILED, EXIT_CANNOT_RUN, EXIT_NOT_IMPLEMENTED = 0, 1, 2, 3
@@ -60,7 +73,6 @@ PLACEHOLDERS: dict[str, tuple[str, str]] = {
     "report": ("PRD-05", "backtest and shadow reports"),
     "tui": ("PRD-06", "terminal dashboard"),
     "status": ("PRD-06", "one-screen summary of the latest heartbeat"),
-    "reset-kill": ("PRD-02", "clear the drawdown kill-switch"),
     "export": ("PRD-06", "copy logs and reports into deliverables/"),
 }
 
@@ -397,13 +409,56 @@ def cmd_backfill(args: argparse.Namespace, cfg: Config, settings: Settings) -> i
 # ---------------------------------------------------------------- run
 
 
+def _run_options(args: argparse.Namespace) -> dict[str, Any] | str:
+    """The Phase-2 ``run`` options as ``run_engine`` keyword arguments, or an error message.
+
+    Only options that differ from their defaults are returned, so a plain ``wta run`` calls the
+    engine exactly as before.
+    """
+    shock = (args.synthetic_shock_at, args.synthetic_shock_pct)
+    if args.mode == "live":
+        if args.feed != "live":
+            return "live mode trades on the live feed only (drop --feed synthetic)"
+        if args.inject_intents or args.paper_balances:
+            return "--inject-intents and --paper-balances are for shadow mode only"
+    if any(v is not None for v in shock):
+        if None in shock:
+            return "give both --synthetic-shock-at and --synthetic-shock-pct"
+        if args.feed != "synthetic":
+            return "a synthetic shock needs --feed synthetic"
+        if not -1 < args.synthetic_shock_pct < 1:
+            return "--synthetic-shock-pct is a fraction between -1 and 1 (e.g. -0.08 for -8 %)"
+    options: dict[str, Any] = {}
+    if args.feed != "live":
+        options["feed"] = args.feed
+    if args.inject_intents:
+        try:
+            options["injected"] = load_injected_intents(args.inject_intents)
+        except (OSError, ValueError) as exc:
+            return f"--inject-intents {args.inject_intents}: {exc}"
+    if args.paper_balances:
+        try:
+            options["paper_balances"] = parse_paper_balances(args.paper_balances)
+        except (OSError, ValueError) as exc:
+            return f"--paper-balances: {exc}"
+    if shock[0] is not None:
+        options["synthetic_shock"] = (float(shock[0]), float(shock[1]))
+    return options
+
+
 def cmd_run(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
     """The guards (``wta.safety``) are checked here for a friendly message, and again by the engine."""
     if args.mode == "live":
         reason = live_guard_reason(args.i_understand_live, args.allow_dirty, settings)
+        if reason is None:
+            reason = deadline_guard_reason(cfg.engine.challenge_end_utc, SystemClock().now())
         if reason is not None:
             _err(f"refusing to start live mode: {reason}")
             return EXIT_CANNOT_RUN
+    options = _run_options(args)
+    if isinstance(options, str):
+        _err(options)
+        return EXIT_CANNOT_RUN
     try:
         return asyncio.run(
             run_engine(
@@ -414,11 +469,46 @@ def cmd_run(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
                 log_dir=args.log_dir,
                 i_understand_live=args.i_understand_live,
                 allow_dirty=args.allow_dirty,
+                **options,
             )
         )
-    except LiveGuardError as exc:
+    except (LiveGuardError, EngineLockError) as exc:
         _err(str(exc))
         return EXIT_CANNOT_RUN
+
+
+def cmd_reset_kill(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
+    """Manual kill-switch reset (PRD-02 §6). A running engine picks it up on its next tick."""
+    reason = args.reason.strip()
+    if not reason:
+        _err("--reason must say why the kill-switch is reset (it is logged for the judges)")
+        return EXIT_CANNOT_RUN
+    kill_file = engine_mod.KILL_FILE
+    if kill_file.exists():
+        _err(f"the kill file {kill_file} is present: remove it first, or the engine kills again at once")
+        return EXIT_FAILED
+    path = Path(cfg.data.sqlite_path)
+    if not path.exists():
+        _err(f"no database at {path} (nothing was ever killed there)")
+        return EXIT_FAILED
+    clock = SystemClock()
+    events = EventsLog(Path(args.log_dir), clock, settings.secret_values())
+    store = Store(path)
+    try:
+        record = request_kill_reset(store, events, reason, clock.now())
+    finally:
+        store.close()
+        events.close()
+    if record is None:
+        print("kill-switch is not active (engine_flags.killed is false): nothing to reset")
+        return EXIT_OK
+    peak = record["peak_equity_tmn"] or "unchanged (no equity row yet)"
+    print(f"kill-switch reset: {reason}")
+    print(f"  previous kill reason: {record['previous_kill_reason'] or '-'}")
+    print(f"  peak equity moved to the latest equity: {peak}")
+    print(f"  reset_kill event written to {Path(args.log_dir) / 'events.jsonl'} and {path}")
+    print("  a running engine applies it on its next tick; otherwise the next start does")
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------- logs / db / placeholders
@@ -537,6 +627,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-dirty", action="store_true", help="allow live mode on a dirty git tree (dev only)")
     p.add_argument("--seconds", type=float, default=None, help="stop after this many seconds")
     p.add_argument("--log-dir", default="logs", help="JSONL log directory (default logs)")
+    p.add_argument(
+        "--feed",
+        choices=("live", "synthetic"),
+        default="live",
+        help="market data: Wallex REST/WS (default) or the offline synthetic feed (never evidence)",
+    )
+    p.add_argument(
+        "--inject-intents", metavar="FILE", help="JSONL intents for acceptance tests (shadow only)"
+    )
+    p.add_argument(
+        "--paper-balances",
+        metavar="JSON",
+        help='starting paper account (inline JSON or a file), e.g. \'{"TMN": 3000000, "USDT": 10}\'',
+    )
+    p.add_argument(
+        "--synthetic-shock-at", type=float, default=None, metavar="S", help="apply the synthetic shock S s after start"
+    )
+    p.add_argument(
+        "--synthetic-shock-pct",
+        type=float,
+        default=None,
+        metavar="P",
+        help="synthetic shock size as a fraction (-0.08 = -8 %%) of USDTTMN and every coin mid",
+    )
+
+    p = add("reset-kill", cmd_reset_kill, "clear the kill-switch by hand (writes a reset_kill event)")
+    p.add_argument("--reason", required=True, help="why the kill-switch is reset (logged)")
+    p.add_argument("--log-dir", default="logs", help="JSONL log directory of the engine (default logs)")
 
     p = add("logs", None, "log tools")
     logs_sub = p.add_subparsers(dest="logs_command", required=True, metavar="check")

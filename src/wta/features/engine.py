@@ -282,8 +282,13 @@ class FeatureEngine:
         self._candle_cache: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
 
     def _candle_features_cached(self, sym: str, candles: list[Candle], now: float) -> dict[str, Any]:
+        """Candle features, recomputed only when the candles or the current 15-minute bar change.
+
+        The key holds the whole last candle (not just its close): a late update of the last minute
+        can change its high/low/volume — and so a just-completed 15-minute bar — with the same close.
+        """
         last = candles[-1] if candles else None
-        key = (len(candles), last.ts if last else None, last.c if last else None, int(now // 900))
+        key = (len(candles), last, int(now // 900))
         hit = self._candle_cache.get(sym)
         if hit is not None and hit[0] == key:
             return hit[1]

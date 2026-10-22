@@ -308,3 +308,83 @@ def test_open_readonly_missing_file_fails(tmp_path: Path) -> None:
     with pytest.raises(sqlite3.OperationalError):
         Store.open_readonly(tmp_path / "nope.sqlite")
     assert not (tmp_path / "nope.sqlite").exists()
+
+
+# ---------------------------------------------------------------- transactions (one commit per tick)
+
+
+def test_transaction_commits_once_and_reads_inside_see_the_writes(tmp_path) -> None:
+    path = tmp_path / "tx.sqlite"
+    store = Store(path)
+    other = Store.open_readonly(path)
+    with store.transaction():
+        store.kv_set("a", {"x": 1}, 1.0)  # an "immediate" write waits for the end of the block
+        assert store.kv_get("a") == {"x": 1}  # this connection sees it ...
+        assert other.kv_get("a") is None  # ... other readers only after the commit
+        with store.transaction():  # nested blocks join the outer one
+            store.kv_set("b", {"y": 2}, 1.0)
+        assert other.kv_get("b") is None
+        assert store.maybe_flush(10_000.0) == 0  # timed flushes wait too
+    assert other.kv_get("a") == {"x": 1} and other.kv_get("b") == {"y": 2}
+    assert store.rows_written["kv"] == 2
+    other.close()
+    store.close()
+
+
+def test_checkpoint_commits_inside_a_transaction(tmp_path) -> None:
+    path = tmp_path / "cp.sqlite"
+    store = Store(path)
+    other = Store.open_readonly(path)
+    with store.transaction():
+        store.kv_set("before_send", {"ok": True}, 1.0)
+        store.checkpoint()  # e.g. the write-ahead record right before an order is sent
+        assert other.kv_get("before_send") == {"ok": True}
+        store.kv_set("after", {"ok": True}, 2.0)
+        assert other.kv_get("after") is None
+    assert other.kv_get("after") == {"ok": True}
+    other.close()
+    store.close()
+
+
+def test_a_crash_inside_a_transaction_leaves_the_previous_commit(tmp_path) -> None:
+    """Nothing of an unfinished tick reaches the disk: a restart sees the last committed tick."""
+    path = tmp_path / "crash.sqlite"
+    store = Store(path)
+    store.kv_set("portfolio_state", {"fees": "1"}, 1.0)
+    store._tx_depth += 1  # inside a tick's transaction ...
+    store.kv_set("portfolio_state", {"fees": "2"}, 2.0)
+    store.kv_set("paper_state", {"tick": 2}, 2.0)
+    store.kv_get("paper_state")  # (a read executes the rows, still uncommitted)
+    store._conn.close()  # ... the process dies here
+    reopened = Store(path)
+    assert reopened.kv_get("portfolio_state") == {"fees": "1"}
+    assert reopened.kv_get("paper_state") is None
+    reopened.close()
+
+
+def test_a_failed_commit_keeps_every_row_of_the_transaction_pending(tmp_path) -> None:
+    store = Store(tmp_path / "fail.sqlite")
+    real_commit = store._conn.commit
+    calls = {"n": 0}
+
+    class Conn:  # sqlite3.Connection attributes are read-only: wrap it
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def commit(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            real_commit()
+
+    store._conn = Conn(store._conn)
+    with store.transaction(raise_errors=False):
+        store.kv_set("k", {"v": 1}, 1.0)
+        store.kv_get("k")  # executed inside the transaction
+    assert store.pending_rows == 1  # rolled back, kept for the next flush
+    assert store.flush() == 1
+    assert store.kv_get("k") == {"v": 1}
+    store.close()
