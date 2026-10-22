@@ -4,8 +4,9 @@ One ``run`` = one plan (or ``None``):
 
 1. System prompt = ``prompts/analyst.md`` rendered with the current config values (only known
    ``{name}`` keys are replaced, so literal JSON braces survive) + the exact output schema.
-2. User message = canonical JSON (sorted keys) of a compact state: watchlist features, PnL summary,
-   health, the last plan, recent events and the trigger reason. Same state + same clock => the same
+2. User message = canonical JSON (sorted keys) of a compact state: watchlist features (the curated
+   ``tools.feature_view`` with its key legend), PnL summary, health, the last plan, recent events
+   and the trigger reason. Same state + same clock => the same
    bytes => the same cache key.
 3. Hand-written tool loop, at most ``ai.analyst_max_tool_rounds`` rounds. Tools offered = internal
    tools + the Wallex MCP read-only tools (when an MCP client is set and ``initialize`` worked), else
@@ -26,6 +27,12 @@ Replay with MCP: in shadow/live every MCP tool list and MCP result the model saw
 small tape next to the LLM cache (``<cache_dir>/mcp_tape``). When the LLM client runs in ``replay``
 mode the analyst never touches the MCP server: it reads the same schemas and results from the tape,
 so a trajectory that used Wallex MCP tools replays byte-identically with zero network.
+
+The same tape holds every internal tool result (``tool-call-*``: the engine state changes between
+cycles, so a replay without the engine reads the recorded answers; when there is none, e.g. a full
+engine replay that rebuilds the state, the tool runs) and, per plan, the cycle's input
+(``analyst-cycle-<prompt_hash>``: ``now``, ``reason``, the JSON state passed to ``run`` and the
+``config_hash``), so ``replay_cycle`` re-runs a recorded cycle from the cache and the tape alone.
 """
 
 from __future__ import annotations
@@ -54,10 +61,20 @@ from wta.ai.plan_schema import (
     example_text,
     plan_json_schema,
 )
-from wta.ai.tools import INTERNAL_TOOL_SCHEMAS, LOCAL_TOOL_SCHEMAS, InternalTools, to_jsonable, truncate
-from wta.config import Config, canonical_json
+from wta.ai.tools import (
+    INTERNAL_TOOL_SCHEMAS,
+    LOCAL_TOOL_SCHEMAS,
+    InternalTools,
+    feature_rows,
+    feature_view,
+    is_feature_view,
+    to_jsonable,
+    truncate,
+)
+from wta.config import Config, canonical_json, mask_secrets
+from wta.features.engine import FeatureSnapshot
 from wta.models import MarketPlan
-from wta.utils.timeutil import Clock, iso, parse_iso
+from wta.utils.timeutil import Clock, iso, parse_iso, utc_day
 
 log = logging.getLogger(__name__)
 Json = dict[str, Any]
@@ -88,7 +105,9 @@ CROSS_FEATURE_KEYS: tuple[str, ...] = (
 
 FORCE_FINAL = ("Tool-call limit reached ({rounds} rounds). Do not call any more tools. "
                "Return only the final JSON plan now, based on the data above.")
-FIX_JSON = "Your JSON was invalid: {err}\nFix the JSON. Return only the corrected JSON object."
+FIX_JSON = ("Your JSON was invalid: {err}\nFix the JSON. Return only the corrected JSON object: exactly the "
+            "top-level keys {keys}; `regimes` holds only {symbols} and is closed before `enabled_strategies`.")
+PLAN_KEYS: tuple[str, ...] = tuple(PlanOutput.model_fields)
 USER_TAIL = ("Decide the plan. Use the tools for anything you need that is not above, "
              "then return only the JSON object.")
 
@@ -139,9 +158,13 @@ def _to_decimal(value: Any) -> Decimal | None:
 
 
 def feature_value(features: Any, symbol: str, key: str) -> Decimal | None:
-    """``features.symbols[symbol][key]`` from a FeatureSnapshot or its ``compact()`` dict."""
+    """``features.symbols[symbol][key]`` from a FeatureSnapshot, its ``compact()`` dict or a
+    ``feature_view`` (keys under their FeatureSnapshot names, e.g. ``ret_15m``)."""
     if features is None:
         return None
+    if is_feature_view(features):
+        row = feature_rows(features).get(symbol)
+        return _to_decimal(row.get(key)) if row else None
     rows = getattr(features, "symbols", None)
     if rows is None and isinstance(features, Mapping):
         rows = features.get("symbols", features)
@@ -241,8 +264,10 @@ def deadline_text(cfg: Config, now: float, state: Mapping[str, Any] | None = Non
 
 
 def compact_features(raw: Any) -> Any:
-    """The handful of feature numbers the model needs per symbol / cross-book coin (None dropped)."""
-    if not isinstance(raw, Mapping) or "error" in raw:
+    """The handful of feature numbers the model needs per symbol / cross-book coin (None dropped).
+
+    A ``feature_view`` (``get_features``; what the engine passes) is already curated: unchanged."""
+    if not isinstance(raw, Mapping) or "error" in raw or is_feature_view(raw):
         return raw
     out: Json = {"ts": raw.get("ts")}
     symbols = raw.get("symbols") or {}
@@ -256,6 +281,11 @@ def compact_features(raw: Any) -> Any:
         for coin, row in sorted(cross.items()) if isinstance(row, Mapping)
     }
     return out
+
+
+def cycle_tape_key(prompt_hash: str) -> str:
+    """Tape key of a recorded cycle input (``now``, ``reason``, ``state``) for the plan with this hash."""
+    return f"analyst-cycle-{prompt_hash}"
 
 
 def _tape_key(prefix: str, *parts: Any) -> str:
@@ -281,6 +311,9 @@ class _Run:
     """Mutable state of one analyst cycle."""
 
     messages: list[Json]
+    state: Json = field(default_factory=dict)
+    reason: str = ""
+    now: float = 0.0
     offered: list[Json] | None = None
     source: ToolsSource = "none"
     mcp_names: set[str] = field(default_factory=set)
@@ -311,8 +344,20 @@ class RegimeAnalyst:
         *,
         tape: LLMCache | None = None,
         prompt_template: str | None = None,
+        secrets: Iterable[str] = (),
+        daily_cycle_budget: int | None = None,
     ) -> None:
+        """``secrets`` (the engine's ``settings.secret_values()``) are masked out of every MCP result
+        before it reaches the model, the LLM cache or the tape (the MCP client masks its own key
+        already; this is the second layer). ``daily_cycle_budget``: at most that many cycles reach
+        the model per UTC day (``ai.max_analyst_calls_per_day``; None: unlimited, e.g. the offline
+        rules provider); a cycle over it returns None with ``last_error`` "daily analyst cycle
+        budget exhausted"."""
         self.cfg = cfg
+        self.secrets: list[str] = [s for s in secrets if s]
+        self.daily_cycle_budget = daily_cycle_budget
+        self._cycle_cfg: Config | None = None  # the config of the running cycle (see ``cycle_cfg``)
+        self._cycles_by_day: dict[str, int] = {}
         self.llm = llm
         self.tools = tools
         self.mcp = mcp
@@ -335,6 +380,13 @@ class RegimeAnalyst:
         self._mcp_retry_at: float | None = None
         self._stale_logged_for: float | None = None
 
+    @property
+    def cycle_cfg(self) -> Config:
+        """The config of the running cycle: ``self.cfg`` as it was when ``run`` started (the engine
+        may swap ``cfg`` while a cycle awaits the model; prompt, clamp and recorded config_hash
+        must all come from one config). Outside a cycle: ``self.cfg``."""
+        return self._cycle_cfg if self._cycle_cfg is not None else self.cfg
+
     # ------------------------------------------------------------ cadence + staleness
 
     def should_run(self, now: float, last_run_ts: float | None, features: Any,
@@ -356,15 +408,15 @@ class RegimeAnalyst:
     # ------------------------------------------------------------ prompts
 
     def prompt_values(self, now: float, state: Mapping[str, Any] | None = None) -> dict[str, str]:
-        st = self.cfg.strategies
+        st = self.cycle_cfg.strategies
         s1, s2, s3 = st.s1_crossbook, st.s2_usdtalloc, st.s3_momentum
-        enabled = configured_enabled(self.cfg)
+        enabled = configured_enabled(self.cycle_cfg)
         # the template wraps {schema} in a ```json fence; the example gets a fence of its own
-        schema = (json.dumps(plan_json_schema(self.cfg), ensure_ascii=False)
+        schema = (json.dumps(plan_json_schema(self.cycle_cfg), ensure_ascii=False)
                   + "\n```\nExample (illustrative values only; use the numbers you see):\n```json\n"
                   + example_text())
         return {
-            "time_to_deadline": deadline_text(self.cfg, now, state),
+            "time_to_deadline": deadline_text(self.cycle_cfg, now, state),
             "s1_coins": ", ".join(s1.coins),
             "s1_margin": str(s1.margin_min_pct),
             "s2_lo": str(s2.bounds[0]),
@@ -384,8 +436,8 @@ class RegimeAnalyst:
     def user_message(self, state: Mapping[str, Any] | None, reason: str, now: float) -> str:
         """Compact, canonical (sorted-key) JSON of the state: deterministic for a given state + clock."""
         state = state or {}
-        max_bytes = self.cfg.ai.tool_result_max_bytes
-        left = time_to_deadline_s(self.cfg, now, state)
+        max_bytes = self.cycle_cfg.ai.tool_result_max_bytes
+        left = time_to_deadline_s(self.cycle_cfg, now, state)
         payload: Json = {
             "reason": reason,
             "now_utc": iso(now),
@@ -410,12 +462,20 @@ class RegimeAnalyst:
         except Exception as exc:  # noqa: BLE001 - a broken state source must not abort the cycle
             return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
 
+    def first_features(self, snap: FeatureSnapshot) -> Json:
+        """The features block of the first user message: the curated ``feature_view`` of the whole
+        watchlist with every key and the key legend, within 4 x ``ai.tool_result_max_bytes`` (the
+        engine passes exactly this in ``state["features"]``, as JSON, so it is taped)."""
+        return feature_view(snap, self.watchlist, max_bytes=4 * self.cycle_cfg.ai.tool_result_max_bytes, legend=True)
+
     def _features(self, state: Mapping[str, Any]) -> Any:
         raw = state.get("features")
         if raw is None:
-            return self.tools.t_get_features(symbols=self.watchlist)
-        if hasattr(raw, "compact"):
-            return raw.compact(symbols=self.watchlist)
+            raw = self.tools.d.features()
+            if raw is None:
+                return {"error": "features not available yet"}
+        if isinstance(raw, FeatureSnapshot):
+            return self.first_features(raw)
         return raw
 
     def _last_plan_block(self, state: Mapping[str, Any], now: float) -> Any:
@@ -426,7 +486,7 @@ class RegimeAnalyst:
             try:
                 plan = MarketPlan.model_validate(plan)
             except ValidationError:
-                return truncate(dict(plan), self.cfg.ai.tool_result_max_bytes)
+                return truncate(dict(plan), self.cycle_cfg.ai.tool_result_max_bytes)
         return {
             "age_s": int(now - plan.ts),
             "regimes": {s: {"regime": c.regime, "confidence": c.confidence} for s, c in sorted(plan.regimes.items())},
@@ -460,12 +520,16 @@ class RegimeAnalyst:
         self.last_error = ""
         if reason.startswith("move:"):
             self.move_trigger_ts[reason.split(":", 1)[1]] = now
-        if not self.cfg.ai.enabled:
+        cfg = self.cfg  # one config for the whole cycle (see ``cycle_cfg``)
+        if not cfg.ai.enabled:
             self.last_error = "ai.enabled is false"
             return None
         if self.llm is None:
             self.last_error = "llm not configured"
             return None
+        if not self._take_budget(now):
+            return None
+        self._cycle_cfg = cfg
         try:
             return await self._run(dict(state or {}), reason, now)
         except CacheMissError:
@@ -474,16 +538,33 @@ class RegimeAnalyst:
             self.last_error = f"analyst failed: {type(exc).__name__}: {str(exc)[:200]}"
             log.warning("analyst: %s", self.last_error)
             return None
+        finally:
+            self._cycle_cfg = None
+
+    def _take_budget(self, now: float) -> bool:
+        """Count this cycle against the UTC day's ``daily_cycle_budget`` (never in replay: nothing
+        reaches a provider). False (``last_error`` set) when the day's budget is used up."""
+        limit = self.daily_cycle_budget
+        if limit is None or self._replaying:
+            return True
+        day = utc_day(now)
+        used = self._cycles_by_day.get(day, 0)
+        if used >= limit:
+            self.last_error = f"daily analyst cycle budget exhausted ({limit} cycles on {day} UTC)"
+            log.warning("analyst: %s", self.last_error)
+            return False
+        self._cycles_by_day = {day: used + 1}  # only today's count is kept
+        return True
 
     async def _run(self, state: Json, reason: str, now: float) -> MarketPlan | None:
         assert self.llm is not None
         run = _Run(messages=[
             {"role": "system", "content": self.system_prompt(now, state)},
             {"role": "user", "content": self.user_message(state, reason, now)},
-        ])
+        ], state=state, reason=reason, now=now)
         self.last_messages = run.messages
         await self._offer_tools(run, now)
-        max_rounds = self.cfg.ai.analyst_max_tool_rounds
+        max_rounds = self.cycle_cfg.ai.analyst_max_tool_rounds
 
         while True:
             tools_now = run.offered if run.offered and run.rounds < max_rounds else None
@@ -503,7 +584,8 @@ class RegimeAnalyst:
             run.retried = True
             run.messages.extend([
                 {"role": "assistant", "content": run.responses[-1].text},
-                {"role": "user", "content": FIX_JSON.format(err=err)},
+                {"role": "user", "content": FIX_JSON.format(err=err, keys=", ".join(PLAN_KEYS),
+                                                            symbols=", ".join(REQUIRED_SYMBOLS))},
             ])
             resp = await self._chat(run, None)
             if resp is None:
@@ -518,8 +600,8 @@ class RegimeAnalyst:
     async def _chat(self, run: _Run, tools: list[Json] | None) -> LLMResponse | None:
         assert self.llm is not None
         resp = await self.llm.chat(
-            list(run.messages), tools, role="analyst", temperature=self.cfg.ai.temperature,
-            max_tokens=self.cfg.llm.analyst.max_tokens, json_mode=True, timeout=self.cfg.ai.analyst_timeout_s,
+            list(run.messages), tools, role="analyst", temperature=self.cycle_cfg.ai.temperature,
+            max_tokens=self.cycle_cfg.llm.analyst.max_tokens, json_mode=True, timeout=self.cycle_cfg.ai.analyst_timeout_s,
         )
         if resp is None:
             self.last_error = f"llm unavailable: {self.llm.last_error or 'no provider answered'}"
@@ -529,10 +611,23 @@ class RegimeAnalyst:
 
     @staticmethod
     def _parse(text: str) -> tuple[PlanOutput | None, str]:
+        """Strict ``PlanOutput`` validation (nothing is repaired). The error text names the usual
+        structural slip — top-level keys written inside ``regimes`` — so the one retry can fix it."""
         try:
-            return PlanOutput.model_validate(extract_json(text)), ""
-        except (ValueError, ValidationError) as exc:
-            return None, str(exc)[:800]
+            data = extract_json(text)
+        except ValueError as exc:
+            return None, f"not one valid JSON object ({str(exc)[:300]}); check that every {{ is closed"
+        try:
+            return PlanOutput.model_validate(data), ""
+        except ValidationError as exc:
+            hint = ""
+            regimes = data.get("regimes")
+            if isinstance(regimes, Mapping):
+                misplaced = sorted(k for k in regimes if k in PLAN_KEYS)
+                if misplaced:
+                    hint = (f"the keys {', '.join(misplaced)} are inside `regimes`: close `regimes` after "
+                            f"{REQUIRED_SYMBOLS[-1]} and put them at the top level. ")
+            return None, (hint + str(exc))[:800]
 
     def _finish(self, run: _Run, out: PlanOutput, reason: str) -> MarketPlan:
         final = run.responses[-1]
@@ -544,7 +639,8 @@ class RegimeAnalyst:
             "tools_source": run.source,
             "latency_ms": sum(int(r.latency_ms or 0) for r in run.responses),
         }
-        plan = clamp_plan(out, self.cfg, configured_enabled(self.cfg), self.clock.now(), meta)
+        cfg = self.cycle_cfg
+        plan = clamp_plan(out, cfg, configured_enabled(cfg), self.clock.now(), meta)
         if plan.clamped:
             log.info("analyst: plan values clamped: %s", _dumps(plan.clamped))
         record: Json = {
@@ -559,11 +655,18 @@ class RegimeAnalyst:
             "reason": reason,
             "tool_rounds": run.rounds,
             "llm_calls": len(run.responses),
+            # which route answered each call (a cycle may fail over part-way): replay needs every one
+            "calls": [{"provider": r.provider, "model": r.model, "cache_key": r.cache_key} for r in run.responses],
             "json_retry": run.retried,
             "usage": _usage_total(run.responses),
+            "config_hash": cfg.config_hash,  # the cycle's config, whatever the engine holds by now
         }
         self.last_plan = plan
         self.last_record = record
+        if not self._replaying and plan.prompt_hash:
+            self._tape_put(cycle_tape_key(plan.prompt_hash),
+                           {"now": run.now, "reason": run.reason, "state": self._jsonable_state(run.state),
+                            "config_hash": cfg.config_hash, "config": cfg.model_dump(mode="json")})
         if self.on_plan is not None:
             try:
                 self.on_plan(plan, record)
@@ -571,11 +674,34 @@ class RegimeAnalyst:
                 log.exception("analyst: on_plan callback failed")
         return plan
 
+    def recorded_cycle(self, prompt_hash: str) -> Json | None:
+        """The taped input of the cycle whose plan has ``prompt_hash``: ``{now, reason, state,
+        config_hash, config}`` (``config``: the cycle's whole config, JSON; older tapes lack it;
+        None when the cycle was never recorded)."""
+        return self.tape.get(cycle_tape_key(prompt_hash)) if self.tape is not None else None
+
+    async def replay_cycle(self, prompt_hash: str) -> MarketPlan | None:
+        """Re-run the recorded cycle whose plan has ``prompt_hash``: its input (``now``, ``reason``,
+        ``state``) comes from the tape, every model answer from the cache and every tool result from
+        the tape, so with an LLM client in ``replay`` mode (strict cache, no provider needed) it
+        makes zero network calls. The clock must be settable (``SimClock``): it is set to the
+        recorded ``now``. ``CacheMissError`` when the cycle or one of its answers was never
+        recorded — e.g. because ``self.cfg`` differs from the recorded config in a value the system
+        prompt shows (compare ``recorded_cycle(...)["config_hash"]``)."""
+        entry = self.recorded_cycle(prompt_hash)
+        if entry is None:
+            raise CacheMissError(f"replay: no recorded analyst cycle for prompt_hash {prompt_hash}")
+        set_clock = getattr(self.clock, "set", None)
+        if not callable(set_clock):
+            raise TypeError("replay_cycle needs a settable clock (SimClock)")
+        set_clock(float(entry["now"]))
+        return await self.run(entry.get("state") or {}, str(entry.get("reason") or "replay"))
+
     # ------------------------------------------------------------ tools
 
     async def _offer_tools(self, run: _Run, now: float) -> None:
         """Pick the tool set: none / internal + MCP read-only / internal + ``*_local``."""
-        if not self.cfg.ai.analyst_tools_enabled or self.cfg.ai.analyst_max_tool_rounds <= 0:
+        if not self.cycle_cfg.ai.analyst_tools_enabled or self.cycle_cfg.ai.analyst_max_tool_rounds <= 0:
             return
         local = list(INTERNAL_TOOL_SCHEMAS) + list(LOCAL_TOOL_SCHEMAS)
         key = _tape_key("mcp-tools", canonical_json(run.messages[:2]))
@@ -655,7 +781,26 @@ class RegimeAnalyst:
         run.tools_used.add(tc.name)
         if tc.name in run.mcp_names:
             return await self._call_mcp(resp, tc)
-        return _dumps(self.tools.call(tc.name, dict(tc.arguments))), False
+        return self._call_internal(resp, tc), False
+
+    def _call_internal(self, resp: LLMResponse, tc: ToolCall) -> str:
+        """An internal / ``*_local`` tool: recorded on the tape (shadow/live), read back in replay."""
+        key = _tape_key("tool-call", resp.cache_key, tc.id, tc.name, canonical_json(tc.arguments))
+        if self._replaying:
+            hit = self.tape.get(key) if self.tape is not None else None
+            if hit is not None:
+                return str(hit["content"])
+        text = _dumps(self.tools.call(tc.name, dict(tc.arguments)))
+        if not self._replaying:
+            self._tape_put(key, {"tool": tc.name, "content": text})
+        return text
+
+    @staticmethod
+    def _jsonable_state(state: Mapping[str, Any]) -> Any:
+        try:
+            return to_jsonable(dict(state))
+        except TypeError:  # e.g. a FeatureSnapshot object (tests): not replayable from the tape
+            return {"unrecorded": sorted(str(k) for k in state)}
 
     async def _call_mcp(self, resp: LLMResponse, tc: ToolCall) -> tuple[str, bool]:
         key = _tape_key("mcp-call", resp.cache_key, tc.id, tc.name, canonical_json(tc.arguments))
@@ -674,14 +819,14 @@ class RegimeAnalyst:
                 payload = tool_payload(result)
                 if result.get("isError"):
                     payload = {"error": payload}
-                content = truncate_result(payload, self.cfg.ai.tool_result_max_bytes)
+                content = truncate_result(payload, self.cycle_cfg.ai.tool_result_max_bytes)
             except MCPToolNotAllowed as exc:
                 content = {"error": str(exc)}
             except Exception as exc:  # noqa: BLE001 - an MCP outage must not abort the cycle
                 failed = True
-                self.mcp_error = f"{tc.name}: {type(exc).__name__}: {str(exc)[:200]}"
+                self.mcp_error = mask_secrets(f"{tc.name}: {type(exc).__name__}: {str(exc)[:200]}", self.secrets)
                 content = {"error": f"Wallex MCP unavailable ({type(exc).__name__}); use the *_local tools instead"}
-        text = _dumps(content)
+        text = mask_secrets(_dumps(content), self.secrets)  # before the tape, the cache and the model see it
         self._tape_put(key, {"tool": tc.name, "content": text, "mcp_failed": failed})
         return text, failed
 

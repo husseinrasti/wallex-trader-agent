@@ -20,7 +20,12 @@ Inbound (optional): ``TelegramCommands``
     been seen, even when it is ignored, so nothing is processed twice. Only messages from the
     configured ``chat_id`` are accepted; any other chat is ignored, counted and gets no reply.
     A command older than ``max_age_s`` (e.g. a backlog sent while the agent was down) is not
-    executed. Supported: ``/status``, ``/pause``, ``/resume``, ``/kill`` (``/help`` and ``/start``
+    executed. A command addressed with ``@name`` runs only when ``name`` is this bot (its username
+    comes from ``getMe``; while it is unknown, every ``@``-addressed command is ignored). Telegram
+    hands each update to whichever ``getUpdates`` poller asks, so only ONE engine may poll a bot:
+    after ``CONFLICT_LIMIT`` HTTP 409 answers in a row ("terminated by other getUpdates request")
+    the poller stops and reports it in ``stopped_reason`` (the engine's heartbeat shows it).
+    Supported: ``/status``, ``/pause``, ``/resume``, ``/kill`` (``/help`` and ``/start``
     are answered locally). Each accepted command is handed to ``on_command(command, args)``; the
     text it returns is sent back as the reply, and the engine logs the action as an event with
     ``source: "telegram"``.
@@ -75,6 +80,8 @@ TELEGRAM_MAX_CHARS = 4096  # sendMessage limit, counted in UTF-16 code units
 WINDOW_S = 600.0  # the rolling rate-limit window: 10 minutes
 TRUNCATED = "\n...[truncated]"
 MASK = "***"
+CONFLICT_LIMIT = 3  # getUpdates HTTP 409 answers in a row before the poller gives the bot up
+GETME_RETRY_S = 300.0  # how often a failed getMe (bot username) is retried
 
 SendStatus = Literal["sent", "queued", "failed", "disabled", "deduped"]
 
@@ -820,6 +827,9 @@ class TelegramCommands(_BotApi):
         self.offset = 0  # next update_id to fetch; everything below it is confirmed
         self.counters = CommandStats()
         self._retry_after: float | None = None
+        self.stopped_reason = ""  # set when another poller owns the bot (HTTP 409): polling stopped
+        self._conflicts = 0
+        self._getme_at: float | None = None  # last getMe attempt while the username is unknown
 
     @classmethod
     def from_settings(
@@ -844,8 +854,9 @@ class TelegramCommands(_BotApi):
 
     async def poll_once(self) -> list[CommandResult]:
         """One ``getUpdates`` round: handle every new update, advance ``offset``. Never raises."""
-        if not self.enabled:
+        if not self.enabled or self.stopped_reason:
             return []
+        await self._resolve_username()
         self.counters.polls += 1
         res = await self._call(
             "getUpdates",
@@ -856,8 +867,16 @@ class TelegramCommands(_BotApi):
             self.counters.poll_errors += 1
             self._record_error(res.error)
             self._retry_after = res.retry_after
+            self._conflicts = self._conflicts + 1 if res.status == 409 else 0
+            if self._conflicts >= CONFLICT_LIMIT:
+                self.stopped_reason = (
+                    f"another instance polls this bot (getUpdates HTTP 409 x{self._conflicts}); "
+                    "this engine takes no Telegram commands"
+                )
+                log.error("telegram: %s", self.stopped_reason)
             return []
         self._retry_after = None
+        self._conflicts = 0
         updates = res.result if isinstance(res.result, list) else []
         out: list[CommandResult] = []
         for update in sorted((u for u in updates if isinstance(u, dict)), key=_update_id):
@@ -882,7 +901,7 @@ class TelegramCommands(_BotApi):
             return
         stop = stop or asyncio.Event()
         backoff = self.error_backoff_s
-        while not stop.is_set():
+        while not stop.is_set() and not self.stopped_reason:
             errors_before = self.counters.poll_errors
             await self.poll_once()
             if self.counters.poll_errors > errors_before:
@@ -901,6 +920,23 @@ class TelegramCommands(_BotApi):
 
     # ------------------------------------------------------------ internals
 
+    async def _resolve_username(self) -> None:
+        """Learn this bot's username (``getMe``) so ``/cmd@other_bot`` is told apart from ours.
+        Retried every ``GETME_RETRY_S`` while unknown; a failure only means @-commands stay ignored."""
+        if self.bot_username:
+            return
+        now = self.clock.now()
+        if self._getme_at is not None and now - self._getme_at < GETME_RETRY_S:
+            return
+        self._getme_at = now
+        res = await self._call("getMe", {}, 10.0)
+        name = res.result.get("username") if res.ok and isinstance(res.result, dict) else None
+        if isinstance(name, str) and name.strip():
+            self.bot_username = name.strip().lstrip("@").lower()
+        else:
+            log.info("telegram: bot username unknown (%s); commands addressed with @ are ignored",
+                     self._mask(res.error) or "getMe gave no username")
+
     async def _handle(self, update: dict[str, Any]) -> CommandResult | None:
         msg = update.get("message")
         if not isinstance(msg, dict):
@@ -918,8 +954,9 @@ class TelegramCommands(_BotApi):
             self.counters.ignored_other += 1
             return None
         command, args, mention = parsed
-        if mention and self.bot_username and mention.lower() != self.bot_username:
-            self.counters.ignored_other += 1  # addressed to another bot in the same group
+        if mention and (not self.bot_username or mention.lower() != self.bot_username):
+            # addressed to another bot in the same group (or ours is not known yet: never guess)
+            self.counters.ignored_other += 1
             return None
         sent_at = _dec(msg.get("date"))
         age = self.clock.now() - float(sent_at) if sent_at is not None else 0.0
@@ -960,7 +997,8 @@ class TelegramCommands(_BotApi):
 
     def stats(self) -> dict[str, Any]:
         """Counters for the heartbeat ``extra`` (no secrets)."""
-        return {**self.counters.as_dict(), "enabled": self.enabled, "offset": self.offset}
+        return {**self.counters.as_dict(), "enabled": self.enabled, "offset": self.offset,
+                "stopped": self.stopped_reason or None, "bot_username": self.bot_username or None}
 
     def _record_error(self, error: str) -> None:
         self.counters.last_error = self._mask(error)

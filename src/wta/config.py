@@ -237,6 +237,10 @@ class AICfg(_Cfg):
 
 class AlertsCfg(_Cfg):
     telegram_enabled: bool = False
+    # inbound /status /pause /resume /kill: exactly ONE engine per bot may poll getUpdates (Telegram
+    # gives each update to whichever poller asks), so a second engine (the optional shadow next to
+    # live, flatten_now) keeps its alerts but turns this off
+    telegram_commands_enabled: bool = True
     max_msgs_per_10min: int = 20
 
 
@@ -424,6 +428,42 @@ def _json_default(o: Any) -> Any:
 
 def config_hash(cfg: Config) -> str:
     return hashlib.sha256(canonical_json(cfg.model_dump(mode="json"))).hexdigest()[:12]
+
+
+def account_label(mode: str, feed: str = "live") -> str:
+    """The account an engine trades and learns on: ``mode`` on the live feed, ``{mode}_{feed}``
+    otherwise (``shadow`` vs ``shadow_synthetic``). The state DB, the LLM cache (next to the logs)
+    and the reviewer's runtime overlay are kept per account."""
+    return mode if feed == "live" else f"{mode}_{feed}"
+
+
+def state_db_path(cfg: Config, mode: str, feed: str = "live") -> str:
+    """The engine's state DB for ``mode`` and ``feed`` (moved here from ``wta.engine`` so the
+    read-only tools — ``wta status``, ``wta tui`` — resolve it without importing the engine).
+
+    The account label is ``mode`` on the live feed and ``{mode}_{feed}`` otherwise (``shadow`` vs
+    ``shadow_synthetic``): synthetic prices never touch the real-feed shadow account, its candles or
+    its z-score history. ``data.state_sqlite_path`` with ``{mode}`` replaced by that label; a path
+    without ``{mode}`` gets it inserted before the suffix (``x/state.sqlite`` ->
+    ``x/state.shadow.sqlite``), so shadow and live can never share a file. Left at its default while
+    ``data.sqlite_path`` is overridden, it is derived from the market DB instead:
+    ``<dir>/<stem>.state_{mode}.sqlite``. ``:memory:`` stays in memory.
+    """
+    label = account_label(mode, feed)
+    template = cfg.data.state_sqlite_path
+    default_state = str(DataCfg.model_fields["state_sqlite_path"].default)
+    default_market = str(DataCfg.model_fields["sqlite_path"].default)
+    if template == default_state and cfg.data.sqlite_path != default_market:
+        if cfg.data.sqlite_path == ":memory:":
+            return ":memory:"
+        market = Path(cfg.data.sqlite_path)
+        template = str(market.parent / f"{market.stem}.state_{{mode}}.sqlite")
+    if template == ":memory:":
+        return template
+    if "{mode}" not in template:
+        path = Path(template)
+        return str(path.with_name(f"{path.stem}.{label}{path.suffix}"))
+    return template.replace("{mode}", label)
 
 
 def load_settings() -> Settings:

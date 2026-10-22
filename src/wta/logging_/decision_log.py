@@ -12,7 +12,8 @@ injected Clock, so backtest and replay produce the same lines as the live run wo
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import logging
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,9 @@ from wta.models import DecisionKind, DecisionRecord, EventRecord, OrderLogRecord
 from wta.utils.timeutil import Clock, iso
 
 Payload = BaseModel | Mapping[str, Any] | None
+RecordListener = Callable[[dict[str, Any]], None]
+
+log = logging.getLogger(__name__)
 
 
 def _as_dict(value: Payload) -> dict[str, Any] | None:
@@ -57,6 +61,19 @@ class DecisionLog:
         self.writer = JsonlWriter(
             log_dir, base, clock, rotate_daily=rotate_daily, secrets=secrets, fsync=fsync
         )
+        # hook: called with every written line as a JSON dict (decision records and outcome
+        # updates), e.g. the engine's ring buffer of recent decisions for the AI tools
+        self.listeners: list[RecordListener] = []
+
+    def _notify(self, rec: BaseModel) -> None:
+        if not self.listeners:
+            return
+        data = rec.model_dump(mode="json")
+        for listener in list(self.listeners):
+            try:
+                listener(data)
+            except Exception:  # noqa: BLE001 - a listener must never break the decision log
+                log.exception("decision log listener failed")
 
     def set_config_hash(self, h: str) -> None:
         """Called when the Reviewer's accepted changes produce a new config version."""
@@ -77,8 +94,11 @@ class DecisionLog:
         risk: Payload = None,
         order: Payload = None,
         notes: str = "",
+        config_hash: str | None = None,
     ) -> DecisionRecord:
-        """Validate and append one decision. ``intent``/``risk``/``order`` may be models or dicts."""
+        """Validate and append one decision. ``intent``/``risk``/``order`` may be models or dicts.
+        ``config_hash`` overrides the log's current hash for a decision made under an earlier config
+        (an analyst plan whose cycle started before a reviewer reload)."""
         if kind == "outcome":
             raise ValueError("outcomes are appended with DecisionLog.outcome(), not record()")
         rec = DecisionRecord(
@@ -87,7 +107,7 @@ class DecisionLog:
             ts=iso(self.clock.now()),
             mode=self.mode,
             git_commit=self.git_commit,
-            config_hash=self.config_hash,
+            config_hash=config_hash or self.config_hash,
             strategy=strategy,
             symbol=symbol,
             features=dict(features or {}),
@@ -98,12 +118,14 @@ class DecisionLog:
             notes=notes,
         )
         self.writer.write(rec)
+        self._notify(rec)
         return rec
 
     def outcome(self, decision_id: str, outcome: Mapping[str, Any]) -> OutcomeUpdate:
         """Append an outcome update (pnl_tmn, pnl_pct, hold_s, closed_ts, exit_reason) for a decision."""
         upd = OutcomeUpdate(decision_id=decision_id, ts=iso(self.clock.now()), outcome=dict(outcome))
         self.writer.write(upd)
+        self._notify(upd)
         return upd
 
     def close(self) -> None:

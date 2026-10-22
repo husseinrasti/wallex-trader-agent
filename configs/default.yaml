@@ -125,4 +125,6 @@ ai:
   replay_strict: true
 alerts:
   telegram_enabled: false
+  # inbound /status /pause /resume /kill: only ONE engine per bot may poll them (false on a second engine)
+  telegram_commands_enabled: true
   max_msgs_per_10min: 20

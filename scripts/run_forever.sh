@@ -8,6 +8,12 @@
 # restarts within an hour stops the loop (and sends a Telegram alert when configured), because a
 # crash loop must not hammer the exchange. Each restart is logged to logs/run_forever.log; the
 # engine itself writes an events "start" record with reason "restart" when it finds prior state.
+# The alert gets the wrapped command's --set / --overlay arguments, so a Telegram enabled with
+# `--set alerts.telegram_enabled=true` reaches `wta alert` too.
+#
+# SIGTERM / SIGINT: forwarded to the child; the loop then waits until the child has really exited
+# (the engine finishes its running tick and drains its alerts) before it logs "stopped" and exits,
+# so a follow-up `make flatten` or restart never races the still-running engine.
 set -u
 cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"
@@ -18,11 +24,27 @@ mkdir -p "$(dirname "$LOG")"
 
 restarts=()
 stop=0
+child=""
 trap 'stop=1; [ -n "${child:-}" ] && kill -TERM "$child" 2>/dev/null' INT TERM
+
+# the config arguments of the wrapped command (--set K=V, --overlay FILE, also the --opt=value form)
+cfg_args=()
+want=""
+for arg in "$@"; do
+  if [ -n "$want" ]; then
+    cfg_args+=("$want" "$arg")
+    want=""
+    continue
+  fi
+  case "$arg" in
+    --set|--overlay) want="$arg" ;;
+    --set=*|--overlay=*) cfg_args+=("$arg") ;;
+  esac
+done
 
 alert() {
   echo "$(date -u +%FT%TZ) $*" >>"$LOG"
-  "$PY" -m wta alert "$*" >/dev/null 2>&1 || true
+  "$PY" -m wta alert ${cfg_args[@]+"${cfg_args[@]}"} -- "$*" >/dev/null 2>&1 || true
 }
 
 while [ "$stop" -eq 0 ]; do
@@ -31,8 +53,16 @@ while [ "$stop" -eq 0 ]; do
   child=$!
   wait "$child"
   code=$?
+  if [ "$stop" -eq 1 ]; then
+    # a trapped signal interrupts `wait` at once: wait for the child itself to finish
+    while kill -0 "$child" 2>/dev/null; do
+      wait "$child"
+      code=$?
+    done
+    child=""
+    break
+  fi
   child=""
-  [ "$stop" -eq 1 ] && break
   now=$(date +%s)
   kept=()
   for t in "${restarts[@]:-}"; do

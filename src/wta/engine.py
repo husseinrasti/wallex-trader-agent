@@ -52,9 +52,9 @@ inside step 5 of every tick, after the order poll and the balance refresh:
 
 a. ``FeatureEngine.compute(now, books, candles, watchlist)`` (every tick, so the cross-book
    deviation history behind ``dev_zscore`` is sampled evenly) and a ``PortfolioView``; together with
-   the markets, the plan (``plan``: None until the AI layer is wired, always None with
-   ``ai.enabled: false``), the config, ``engine.rng_seed`` and the flatten phase they form the
-   tick's ``StrategyContext``. One id counter per tick is shared by the PositionManager exits and
+   the markets, the plan in force (``current_plan``: the slow loop's latest plan while it is fresh,
+   taken once at the tick's start; always None with ``ai.enabled: false``), the config,
+   ``engine.rng_seed`` and the flatten phase they form the tick's ``StrategyContext``. One id counter per tick is shared by the PositionManager exits and
    every strategy intent, so decision ids never collide.
 b. Hooks, with that context, before ``on_tick``: every ``FillEvent`` of the poll goes to the
    strategy that owns the order (``on_fill(fill, position, ctx)``; ``position`` is the position
@@ -153,6 +153,28 @@ restarted) and a crashing tick never stops the loop (``safe_tick``).
 
 Synthetic data (``feed="synthetic"``) is an offline exercise of the whole engine, never evidence of
 performance: the ``start`` event and every heartbeat say so.
+
+AI layer (PRD-04 §8; ``enable_ai``, attached by ``build_engine``): the slow loop and the reviewer are
+supervised tasks of their own; the fast loop never awaits them. ``wta.ai.wiring.build_llm`` picks the
+source once — ``llm`` (OpenRouter primary, Gemini fallback, per ``configs/llm.yaml`` and the env
+models, daily call budgets) when a key is set, ``offline-rules`` (deterministic rules, NOT an LLM,
+labelled so everywhere) when none is, ``disabled`` with ``ai.enabled: false`` (no analyst, plan always
+None: the ablation). Every ``SLOW_LOOP_POLL_S`` the slow loop asks ``analyst.should_run`` (startup,
+``engine.slow_loop_interval_s``, kill/pause/flatten-start events, fast dollar/BTC moves) and runs one
+cycle with a timeout on a view captured at the cycle start (features, books, candles, trades, PnL,
+the last 50 decisions, health). A plan is persisted (``plans`` + a ``decisions.jsonl`` record
+``kind="plan"`` stamped with the cycle time) and swapped into ``plan``; the next tick uses it. A failed
+cycle keeps the last plan until it is stale, counts ``llm_consecutive_failures`` and shows
+``llm_ok=false``. Every ``engine.reviewer_interval_s`` the reviewer reads the last hour of this run's
+logs, writes ``<log_dir>/journal.md`` and may apply <= 2 bounded changes (``ConfigManager``) →
+``reload_config`` at the next tick boundary (strategy configs, router, FeatureEngine, analyst; risk
+and execution never; a running analyst cycle keeps its own config) → the decision log stamps the new
+``config_hash``. At startup ``build_engine`` re-applies the reviewer's ``latest.yaml`` of the
+account's own runtime directory (``configs/runtime/<mode>[_<feed>]``; editable paths within bounds
+only; the operator's ``--set`` / ``--overlay`` keys win and are never offered to the reviewer; not at
+all with ``ai.enabled: false``).
+Telegram (``enable_telegram``, optional) only sends alerts and takes /status /pause /resume /kill, which
+are applied at the start of the next tick and logged with ``source: "telegram"``.
 """
 
 from __future__ import annotations
@@ -166,7 +188,7 @@ import os
 import signal
 import sqlite3
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -178,7 +200,29 @@ try:  # POSIX only; without it (Windows) the one-engine-per-account lock is skip
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
-from wta.config import ROOT, Config, DataCfg, Settings, mask_secrets
+from wta.ai.analyst import MAX_CALLS_PER_ROUND, RegimeAnalyst
+from wta.ai.cache import CacheMissError
+from wta.ai.config_manager import ConfigManager
+from wta.ai.mcp_client import MCPClient
+from wta.ai.offline_provider import OFFLINE_STATUS
+from wta.ai.reviewer import PostTradeReviewer
+from wta.ai.reviewer import _compact_decision as compact_decision
+from wta.ai.tools import InternalTools, ToolDeps, feature_view, to_jsonable
+from wta.ai.wiring import (
+    AI_DISABLED,
+    AI_LLM,
+    AI_OFFLINE,
+    MCP_TIMEOUT_S,
+    RUNTIME_LATEST,
+    LLMSetup,
+    analyst_requests_per_cycle,
+    build_llm,
+    build_mcp,
+    llm_cache_dir,
+    load_runtime_overlay,
+    runtime_dir_for,
+)
+from wta.config import ROOT, Config, Settings, account_label, mask_secrets, state_db_path
 from wta.data.collector import CANDLE_CACHE_KEEP_S, CandleCache, CandleRefresher, RestPoller, make_rest
 from wta.data.store import Store
 from wta.exchange.base import Exchange, MarketDataBus, WallexAPIError
@@ -202,7 +246,8 @@ from wta.execution.reconcile import (
 )
 from wta.features.engine import FeatureEngine, FeatureSnapshot
 from wta.logging_.decision_log import DecisionLog, EventsLog, OrdersLog
-from wta.logging_.health_log import HealthLog
+from wta.logging_.health_log import HealthLog, _reverse_lines
+from wta.logging_.jsonl import family_files
 from wta.models import (
     D0,
     Balance,
@@ -215,20 +260,23 @@ from wta.models import (
     OrderType,
     Purpose,
     Side,
+    Trade,
 )
 from wta.risk.context import Deadline, EngineFlags, RecentIntent, RiskContext
 from wta.risk.flatten import FlattenManager, cancel_at_flatten_start, flatten_phase_transitions
 from wta.risk.manager import RiskEvent, RiskManager
 from wta.safety import LiveGuardError, check_live_guard, deadline_guard_reason, tree_is_dirty
+from wta.status import format_status, status_for_config
 from wta.strategies.base import PortfolioView, Strategy, StrategyContext
 from wta.strategies.router import StrategyRouter
 from wta.strategies.s1_crossbook import S1CrossBook
 from wta.strategies.s2_usdtalloc import S2USDTAlloc
 from wta.strategies.s3_momentum import S3Momentum
 from wta.utils import gitinfo
+from wta.utils import telegram as tg
 from wta.utils.decimalutil import D, pct
-from wta.utils.ids import OUR_PREFIXES, strategy_prefix
-from wta.utils.timeutil import Clock, SystemClock, iso
+from wta.utils.ids import OUR_PREFIXES, make_decision_id, strategy_prefix
+from wta.utils.timeutil import Clock, SimClock, SystemClock, iso, parse_iso
 
 log = logging.getLogger(__name__)
 
@@ -265,35 +313,95 @@ S1_COIN_KEYS = (  # S1 diagnostics per coin that a heartbeat carries
     "decision",
 )
 
+# ---- AI layer (PRD-04 §8) and alerts (PRD-06 §2)
+SLOW_LOOP_POLL_S = 5.0  # the slow loop asks ``analyst.should_run`` this often (it enforces the cadence)
+SLOW_LOOP_FIRST_WAIT_S = 60.0  # the first cycle waits this long at most for the first features
+REVIEW_POLL_S = 5.0
+REVIEW_WINDOW_S = 3600.0  # the reviewer reads the last hour (PRD-04 §7)
+REVIEW_LOG_MAX_LINES = 50_000  # per log family and review
+RECENT_DECISIONS = 50  # ring buffer behind the get_recent_decisions tool
+RECENT_EVENTS = 10  # events shown in the analyst's first message
+TRADES_KEPT = 200  # market trades per symbol kept in memory for the *_latest_trades_local tool
+AI_TRIGGER_EVENTS = frozenset({"kill", "pause", "flatten"})  # analyst.should_run decides which count
+LLM_FAILURE_ALERT = 3  # consecutive failed analyst cycles before a Telegram alert
+STALE_ALERT_S = 120.0  # Telegram: a watchlist book older than this (after warm-up)
+API_ERRORS_ALERT_1M = 10  # Telegram: failed API attempts per minute in a heartbeat
+EQUITY_ALERT_EVERY_S = 3600.0
+ALERT_DRAIN_S = 5.0
+MANUAL_PAUSE_PREFIX = "telegram:"  # a /pause; the RiskManager treats it as "other" (never auto-resumed)
+STRATEGY_CFG = {"S1": "s1_crossbook", "S2": "s2_usdtalloc", "S3": "s3_momentum"}
+REQUIRED_PLAN_BOOKS = ("USDTTMN", "BTCUSDT", "ETHUSDT", "SOLUSDT")  # the analyst's regime symbols
+
 IntentSource = Callable[[RiskContext], list[Intent]]
 
 
-def state_db_path(cfg: Config, mode: str, feed: str = "live") -> str:
-    """The engine's state DB for ``mode`` and ``feed`` (see "State DB per mode" in the module docstring).
+@dataclass
+class _AIView:
+    """What the analyst's tools read during one cycle: captured at the cycle start, so every tool
+    answer of a cycle comes from the same moment (ticks keep running meanwhile)."""
 
-    The account label is ``mode`` on the live feed and ``{mode}_{feed}`` otherwise (``shadow`` vs
-    ``shadow_synthetic``): synthetic prices never touch the real-feed shadow account, its candles or
-    its z-score history. ``data.state_sqlite_path`` with ``{mode}`` replaced by that label; a path
-    without ``{mode}`` gets it inserted before the suffix (``x/state.sqlite`` ->
-    ``x/state.shadow.sqlite``), so shadow and live can never share a file. Left at its default while
-    ``data.sqlite_path`` is overridden, it is derived from the market DB instead:
-    ``<dir>/<stem>.state_{mode}.sqlite``. ``:memory:`` stays in memory.
-    """
-    label = mode if feed == "live" else f"{mode}_{feed}"
-    template = cfg.data.state_sqlite_path
-    default_state = str(DataCfg.model_fields["state_sqlite_path"].default)
-    default_market = str(DataCfg.model_fields["sqlite_path"].default)
-    if template == default_state and cfg.data.sqlite_path != default_market:
-        if cfg.data.sqlite_path == ":memory:":
-            return ":memory:"
-        market = Path(cfg.data.sqlite_path)
-        template = str(market.parent / f"{market.stem}.state_{{mode}}.sqlite")
-    if template == ":memory:":
-        return template
-    if "{mode}" not in template:
-        path = Path(template)
-        return str(path.with_name(f"{path.stem}.{label}{path.suffix}"))
-    return template.replace("{mode}", label)
+    now: float
+    features: FeatureSnapshot | None
+    books: dict[str, BookSnapshot]
+    candles: dict[str, list[Candle]]
+    trades: dict[str, list[Trade]]
+    pnl: dict[str, Any]
+    decisions: list[dict[str, Any]]
+    health: dict[str, Any]
+
+
+def _record_ts(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return parse_iso(value)
+        except ValueError:
+            return None
+    return None
+
+
+def read_log_window(
+    log_dir: Path,
+    base: str,
+    since: float,
+    max_lines: int = REVIEW_LOG_MAX_LINES,
+    until: float | None = None,
+) -> list[dict[str, Any]]:
+    """Records of a JSONL log family with ``since <= ts <= until``, oldest first (read backwards from
+    the end, so a long run costs only the window). Lines that do not parse are skipped.
+
+    ``until`` (the review's ``now``): the files are read while the engine keeps appending, so
+    anything stamped later — and an undated line written after the last record inside the window —
+    is left out; the same ``now`` then always reads the same records."""
+    out: list[dict[str, Any]] = []
+    seen = 0
+    inside = until is None  # reading backwards: True once a dated record <= until was seen
+    for path in reversed(family_files(log_dir, base)):
+        for line in _reverse_lines(path):
+            seen += 1
+            if seen > max_lines:
+                return list(reversed(out))
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(rec, dict):
+                continue
+            t = _record_ts(rec.get("ts"))
+            if t is not None and t < since:
+                return list(reversed(out))
+            if until is not None:
+                if t is not None and t > until:
+                    continue
+                if t is not None:
+                    inside = True
+                elif not inside:
+                    continue
+            out.append(rec)
+    return list(reversed(out))
 
 
 def default_strategies(cfg: Config) -> list[Strategy]:
@@ -386,6 +494,16 @@ def _s(value: Decimal | None, places: str | None = None) -> str | None:
     if places is not None:
         value = value.quantize(Decimal(places))
     return format(value, "f")
+
+
+def _flat(tree: Any, prefix: str = "") -> dict[str, Any]:
+    """A nested config dump as ``{"a.b.c": value}`` (lists are values)."""
+    if not isinstance(tree, dict):
+        return {prefix: tree}
+    out: dict[str, Any] = {}
+    for key, value in tree.items():
+        out.update(_flat(value, f"{prefix}.{key}" if prefix else str(key)))
+    return out
 
 
 # ---------------------------------------------------------------- acceptance-test intents
@@ -789,6 +907,50 @@ class Engine:
             )
             self.flatten = FlattenManager(cfg, self.markets)
 
+        # AI layer (PRD-04 §8): attached by ``enable_ai`` (build_engine does it); None = no slow loop
+        self.ai_source: str = AI_DISABLED if not cfg.ai.enabled else "off"
+        self.ai_setup: LLMSetup | None = None
+        self.analyst: RegimeAnalyst | None = None
+        self.reviewer: PostTradeReviewer | None = None
+        self.config_manager: ConfigManager | None = None
+        self.mcp: MCPClient | None = None
+        self.runtime_overlay: dict[str, Any] | None = None  # the reviewer overlay applied at startup
+        self.analyst_clock = SimClock(0.0)  # set to each cycle's start: never the TickClock (see slow_step)
+        self.reviewer_clock = SimClock(0.0)
+        self.llm_consecutive_failures = 0
+        self.ai_stats: dict[str, Any] = {"cycles": 0, "plans": 0, "failures": 0, "reviews": 0, "model_calls": 0,
+                                         "cached_calls": 0, "tokens": 0}
+        self.ai_last_error = ""
+        self.ai_last_reason = ""
+        self.last_review: dict[str, Any] | None = None
+        self._ai_view: _AIView | None = None
+        self._ai_triggers: list[dict[str, Any]] = []  # kill/pause/flatten events since the last cycle
+        self._recent_events: deque[dict[str, Any]] = deque(maxlen=RECENT_EVENTS)
+        self._recent_decisions: dict[str, dict[str, Any]] = {}  # decision_id -> merged record (ordered)
+        self._trades: dict[str, deque[Trade]] = {}
+        self._plan_seq = 0
+        self._tick_plan: tuple[MarketPlan | None] | None = None  # the plan in force while a tick runs
+        self._stale_plan_logged: float | None = None
+        self._analyst_busy = False
+        self._reviewer_busy = False
+        self._next_review_ts: float | None = None
+        self._last_health: HealthRecord | None = None
+        self.runtime_dir = runtime_dir_for(mode, feed)  # per account, like the state DB
+        self.pinned_keys: frozenset[str] = frozenset()  # the operator's --set/--overlay keys
+        self._pending_cfg: Config | None = None  # a reviewer change waiting for the next tick boundary
+        self._in_tick = False
+        if exchange is not None:
+            self.decision_log.listeners.append(self._note_decision)
+        bus.on_trade(self._note_trade)
+
+        # Telegram (PRD-06 §2, optional): attached by ``enable_telegram``
+        self.notifier: tg.TelegramNotifier | None = None
+        self.telegram_commands: tg.TelegramCommands | None = None
+        self._operator_requests: list[tuple[str, str, float]] = []
+        self._stale_alerted = False
+        self._last_equity_alert_ts: float | None = None
+        self._llm_failure_alerted = False
+
     # ------------------------------------------------------------ run
 
     async def run(
@@ -825,6 +987,13 @@ class Engine:
             "heartbeat": self._heartbeat_loop,
             "flush": self._flush_loop,
         }
+        if self.analyst is not None:  # the slow loop: its own task, the fast loop never awaits it
+            loop_jobs["slow_loop"] = self._slow_loop
+        if self.reviewer is not None:
+            loop_jobs["reviewer"] = self._reviewer_loop
+        if self.telegram_commands is not None and self.telegram_commands.enabled:
+            commands = self.telegram_commands
+            loop_jobs["telegram"] = lambda: commands.run(self._stop)
         tasks: dict[str, asyncio.Task[None]] = {}
 
         def start(jobs: dict[str, Callable[[], Awaitable[Any]]]) -> None:
@@ -871,6 +1040,7 @@ class Engine:
                 task.cancel()
             await asyncio.gather(*tasks.values(), return_exceptions=True)
             self.shutdown(reason)
+            await self._drain_alerts()
         return reason
 
     def request_stop(self, reason: str) -> None:
@@ -960,6 +1130,9 @@ class Engine:
         out["candles_loaded"] = bars
         self._candle_seq = self.store.max_engine_candle_seq(self.mode)
         out["candle_seq"] = self._candle_seq
+        restored = self._restore_plan(now)
+        if restored is not None:
+            out["plan_restored"] = restored
         if self.router is None or self.features is None:
             return out
         strategy_state = self.store.kv_get(KV_STRATEGY)
@@ -1008,6 +1181,8 @@ class Engine:
             "state_db": self.store.path,
             "strategies": [s.id for s in self.router.strategies] if self.router is not None else [],
             "rules_only": self.current_plan(self.clock.now()) is None,  # no fresh plan: rules-only defaults
+            "ai": self._ai_start_info(),
+            "runtime_overlay": self.runtime_overlay,
             "markets_source": self.markets_source or None,
             "trading": self.trading,
             "exchange": getattr(self.exchange, "name", None),
@@ -1070,10 +1245,16 @@ class Engine:
         log.info("engine: stopped (%s)", reason)
 
     async def aclose(self) -> None:
-        """Close the REST client and the store, release the account lock (``build_engine`` callers)."""
+        """Close the REST and MCP clients and the store, release the account lock (``build_engine``
+        callers)."""
         try:
             if self.rest is not None:
                 await self.rest.close()
+            if self.mcp is not None:
+                try:
+                    await self.mcp.close()
+                except Exception:  # noqa: BLE001 - closing must not fail the shutdown
+                    log.exception("engine: closing the MCP client failed")
             self.store.close()
         finally:
             release_engine_lock(self.lock)
@@ -1137,6 +1318,8 @@ class Engine:
         while True:
             await asyncio.sleep(self.cfg.engine.heartbeat_interval_s)
             self.write_heartbeat(self.clock.now())
+            if self.notifier is not None:
+                await self.notifier.flush_digest()
 
     async def _flush_loop(self) -> None:
         while True:
@@ -1183,28 +1366,55 @@ class Engine:
 
         The clock is frozen at ``now`` and the whole tick is one store transaction. The kv state is
         saved at its end also when the tick raised, so what is committed always matches memory.
+        A reviewer config change accepted while the previous tick was running is swapped in here,
+        first: like the plan, the config never changes half-way through a tick.
         """
+        self._in_tick = True
+        try:
+            self._apply_pending_config()
+            await self._tick(now)
+        finally:
+            self._in_tick = False
+
+    def _apply_pending_config(self) -> None:
+        if self._pending_cfg is None:
+            return
+        cfg, self._pending_cfg = self._pending_cfg, None
+        try:
+            self.reload_config(cfg)
+        except ValueError:
+            log.exception("reviewer: change refused by reload_config; config unchanged")
+
+    async def _tick(self, now: float) -> None:
         self._bookkeeping(now)
         if not self.trading:
             return
         if not self._restored:  # also after a failed startup: never trade or persist on defaults
             await self.startup()
-        with self.clock.frozen(now), self.store.transaction(raise_errors=False):
-            try:
-                await self._trading_tick(now)
-            except BaseException:
+        # the plan in force for the whole tick: a plan the slow loop swaps in meanwhile (it runs
+        # during the tick's awaits) is used from the next tick on, never half-way through this one
+        self._tick_plan = (self.plan,)
+        try:
+            with self.clock.frozen(now), self.store.transaction(raise_errors=False):
                 try:
-                    self._persist(now)
-                except Exception:  # noqa: BLE001 - the tick's own error is the one to report
-                    log.exception("engine: could not save the state of a crashed tick")
-                raise
-            self._persist(now)
+                    await self._trading_tick(now)
+                except BaseException:
+                    try:
+                        self._persist(now)
+                    except Exception:  # noqa: BLE001 - the tick's own error is the one to report
+                        log.exception("engine: could not save the state of a crashed tick")
+                    raise
+                self._persist(now)
+        finally:
+            self._tick_plan = None
 
     async def _trading_tick(self, now: float) -> None:
         if self.flags.killed:
             # first, while nothing of this tick is written yet: the read then takes no write lock
             # for the rest of the tick (``wta reset-kill`` writes the same database)
             await self._poll_kill_reset(now)
+        if self._operator_requests:  # Telegram /pause /resume /kill (operational, never a trade)
+            await self._apply_operator_requests(now)
         books = self._snapshot()
         if self.router is not None:  # candles are snapshotted with the books (replay: candle_seq)
             self._tick_candles = self.candles.snapshot(self.watchlist)
@@ -1240,6 +1450,14 @@ class Engine:
         if self.stale_symbols and warmed_up and now - self._last_stale_warning >= STALE_WARNING_EVERY_S:
             self._last_stale_warning = now
             log.warning("engine: no book newer than %gs for %s", stale_s, ", ".join(self.stale_symbols))
+        if self.notifier is not None and self.started_ts is not None and now - self.started_ts > STALE_ALERT_S:
+            old = sorted(s for s, a in self.book_ages.items() if a is None or a > STALE_ALERT_S)
+            if old and not self._stale_alerted:
+                self._stale_alerted = True
+                ages = [a for s, a in self.book_ages.items() if s in old and a is not None]
+                self._alert(tg.fmt_stale(old, max(ages) if ages else None), "stale")
+            elif not old:
+                self._stale_alerted = False
 
     # ------------------------------------------------------------ tick steps
 
@@ -1491,6 +1709,22 @@ class Engine:
             max(self._error_streak, self._api_consecutive_errors())
             >= self.cfg.risk.consecutive_api_errors_pause
         )
+        if burst and not self._api_burst:
+            self._alert(tg.fmt_api_burst(max(self._error_streak, self._api_consecutive_errors())), "api",
+                        dedupe_key="api_burst")
+        if self.notifier is not None:
+            for ev in result.fills:
+                f = ev.fill
+                closed = ev.result if isinstance(ev.result, ClosedPosition) else None
+                self._alert(
+                    tg.fmt_fill(
+                        ev.managed.intent.strategy, f.symbol, f.side, f.price * f.qty,
+                        pnl=closed.pnl_tmn if closed is not None else None,
+                        pnl_pct=closed.pnl_pct if closed is not None else None,
+                        qty=f.qty, price=f.price, is_maker=f.is_maker,
+                    ),
+                    "fill",
+                )
         if burst:
             self._api_burst = True
         elif self._api_burst and not result.errors and self._api_consecutive_errors() == 0:
@@ -1654,14 +1888,15 @@ class Engine:
     # ------------------------------------------------------------ strategies (PRD-03)
 
     def current_plan(self, now: float | None = None) -> MarketPlan | None:
-        """The plan in force at ``now`` (default: the clock): ``plan`` (set by the AI layer once it
-        is wired) while it is fresh (``now - plan.ts <= ai.plan_stale_s``, the same rule as
+        """The plan in force at ``now`` (default: the clock): ``plan`` (swapped in by the slow loop;
+        during a tick the one taken at the tick's start) while it is fresh (``now - plan.ts <= ai.plan_stale_s``, the same rule as
         ``StrategyContext.plan_fresh``), never one while ``ai.enabled`` is false. None = rules-only
         defaults, so a decision record's ``plan_snapshot`` is always the envelope the strategies used."""
-        if not self.cfg.ai.enabled or self.plan is None:
+        plan = self._tick_plan[0] if self._tick_plan is not None else self.plan
+        if not self.cfg.ai.enabled or plan is None:
             return None
         t = self.clock.now() if now is None else now
-        return self.plan if t - self.plan.ts <= self.cfg.ai.plan_stale_s else None
+        return plan if t - plan.ts <= self.cfg.ai.plan_stale_s else None
 
     def _strategy_block(self) -> str | None:
         """Why the strategies are not asked this tick (None: they are)."""
@@ -2068,6 +2303,724 @@ class Engine:
             "missing_prices": list(val.missing_prices) if val is not None else [],
         }
 
+    # ------------------------------------------------------------ AI layer (PRD-04 §8)
+
+    def enable_ai(
+        self,
+        *,
+        providers: dict[str, Any] | None = None,
+        mcp: Any = "auto",
+        runtime_dir: str | Path | None = None,
+        runtime_overlay: dict[str, Any] | None = None,
+        pinned_keys: Iterable[str] = (),
+    ) -> str:
+        """Attach the Regime Analyst and the Post-trade Reviewer (``wta.ai.wiring.build_llm``).
+
+        ``providers`` replaces the HTTP providers (tests); ``mcp="auto"`` builds the Wallex MCP
+        client from the settings (live feed only), None disables it, anything else is used as the
+        client. ``runtime_dir`` is where the reviewer writes its overlays (default
+        ``configs/runtime/<account>``, ``wiring.runtime_dir_for``); ``runtime_overlay`` is the
+        ``load_runtime_overlay`` info of the overlay already merged into the config (named in the
+        start event; the ConfigManager keeps building on it, including the entries the operator
+        pinned, and restarts the cooldown from its ``applied_ts``). ``pinned_keys`` (the operator's
+        ``--set`` / ``--overlay`` keys) are never offered to or changed by the reviewer. Returns
+        the AI source: ``llm``, ``offline-rules`` or ``disabled``.
+        """
+        if runtime_dir is not None:
+            self.runtime_dir = Path(runtime_dir)
+        self.runtime_overlay = runtime_overlay
+        self.pinned_keys = frozenset(pinned_keys)
+        if not self.cfg.ai.enabled:  # ablation: no analyst, ``plan`` stays None
+            self.ai_source = AI_DISABLED
+            return self.ai_source
+        setup = build_llm(
+            self.cfg, self.settings, self.mode, self.clock.base, llm_cache_dir(self.cfg, self.log_dir),
+            providers=providers, on_call=self._note_llm_call,
+        )
+        self.ai_setup = setup
+        self.ai_source = setup.source
+        self.mcp = build_mcp(self.settings, self.feed, self.mode) if mcp == "auto" else mcp
+        view = self._view
+        tools = InternalTools(
+            ToolDeps(
+                cfg=self.cfg,
+                now=self.analyst_clock.now,
+                features=lambda: view().features,
+                books=lambda: view().books,
+                candles_1m=lambda sym, a, b: [c for c in view().candles.get(sym, []) if a <= c.ts <= b],
+                trades=lambda sym, a, b: [t for t in view().trades.get(sym, []) if a <= t.ts <= b],
+                pnl_summary=lambda: view().pnl,
+                recent_decisions=lambda n: view().decisions[-n:],
+                health=lambda: view().health,
+            )
+        )
+        self.analyst = RegimeAnalyst(self.cfg, setup.analyst, tools, self.mcp, self.analyst_clock, on_plan=self._on_plan,
+                                     secrets=self._secrets, daily_cycle_budget=setup.analyst_cycle_budget)
+        self.config_manager = ConfigManager(self.cfg, self.runtime_dir, pinned=self.pinned_keys,
+                                            account=account_label(self.mode, self.feed), mode=self.mode,
+                                            feed=self.feed, git_commit=self.git_commit)
+        if runtime_overlay:
+            # the pinned entries stay in latest.yaml (not applied now; a later review must not erase them)
+            self.config_manager.overlay = {**dict(runtime_overlay.get("pinned") or {}),
+                                           **dict(runtime_overlay.get("applied") or {})}
+            applied_ts = runtime_overlay.get("applied_ts")
+            if not runtime_overlay.get("skipped") and isinstance(applied_ts, int | float):
+                # the cooldown survives a restart (an apply time "in the future" counts from now)
+                self.config_manager.last_apply_ts = min(float(applied_ts), self.clock.base.now())
+        self.reviewer = PostTradeReviewer(
+            self.cfg,
+            setup.reviewer,
+            self.config_manager,
+            self.reviewer_clock,
+            journal_path=self.log_dir / "journal.md",
+            on_event=lambda kind, reason, data: self._event_at(self.reviewer_clock.now(), kind, reason, data),
+            route=setup.reviewer_route,
+            secrets=self._secrets,
+            daily_budget=setup.reviewer_budget,
+        )
+        if setup.source == AI_OFFLINE:
+            log.warning("engine: %s: plans come from deterministic rules, NOT an LLM", OFFLINE_STATUS)
+        return self.ai_source
+
+    def _ai_start_info(self) -> dict[str, Any]:
+        info: dict[str, Any] = {"source": self.ai_source}
+        if self.ai_setup is not None:
+            info["routes"] = dict(self.ai_setup.routes)
+            info["cache_dir"] = str(self.ai_setup.cache.dir) if self.ai_setup.cache is not None else None
+            if self.ai_setup.warnings:
+                info["warnings"] = list(self.ai_setup.warnings)
+        if self.ai_source == AI_OFFLINE:
+            info["note"] = "offline rules provider (no LLM key): deterministic rules, NOT an LLM"
+        if self.analyst is not None:
+            info["mcp"] = getattr(self.mcp, "url", None) if self.mcp is not None else None
+            info["slow_loop_interval_s"] = self.cfg.engine.slow_loop_interval_s
+            info["reviewer_interval_s"] = self.cfg.engine.reviewer_interval_s
+        return info
+
+    def _restore_plan(self, now: float) -> dict[str, Any] | None:
+        """Startup: the newest stored plan, if still fresh, is in force again (a restart must not
+        drop a valid envelope for up to one slow-loop interval)."""
+        if self.analyst is None or not self.cfg.ai.enabled:
+            return None
+        try:
+            rows = self.store.load_plans(from_ts=now - self.cfg.ai.plan_stale_s)
+        except Exception:  # noqa: BLE001 - no plan is a valid state
+            log.exception("engine: could not read the plans table")
+            return None
+        if not rows:
+            return None
+        try:
+            plan = MarketPlan.model_validate(rows[-1]["plan"])
+        except ValueError:
+            return None
+        if now - plan.ts > self.cfg.ai.plan_stale_s:
+            return None
+        self.plan = plan
+        self.analyst.last_plan = plan
+        return {"ts": plan.ts, "model": plan.model, "prompt_hash": plan.prompt_hash}
+
+    def _view(self) -> _AIView:
+        """The analyst cycle's captured view (a fresh one outside a cycle)."""
+        if self._ai_view is None:
+            self._ai_view = self._capture_ai_view(self.analyst_clock.now() or self.clock.now())
+        return self._ai_view
+
+    def _capture_ai_view(self, now: float) -> _AIView:
+        return _AIView(
+            now=now,
+            features=self.last_features,
+            books=self.bus.snapshot(self.watchlist),
+            candles=self.candles.snapshot(self.watchlist),
+            trades={s: list(d) for s, d in sorted(self._trades.items())},
+            pnl=self.pnl_summary(now),
+            decisions=self.recent_decisions(RECENT_DECISIONS),
+            health=self.ai_health_view(now),
+        )
+
+    def pnl_summary(self, now: float) -> dict[str, Any]:
+        """``get_pnl_summary``: equity, drawdown, daily PnL, realized by strategy, fees vs budget,
+        exposure and open positions (Decimals as strings)."""
+        if not self.trading:
+            return {"error": "monitoring only: no account"}
+        p = self.portfolio
+        equity, day0 = p.equity_tmn, p.day_start_equity_tmn
+        budget = self.cfg.risk.fee_budget_pct * p.initial_equity_tmn
+        positions = [
+            {
+                "id": pos.id,
+                "strategy": pos.strategy,
+                "symbol": pos.symbol,
+                "qty": _s(pos.qty),
+                "entry_price": _s(pos.entry_price),
+                "entry_utc": iso(pos.entry_ts),
+                "age_s": round(now - pos.entry_ts),
+                "stop_price": _s(pos.stop_price),
+                "target_price": _s(pos.target_price),
+            }
+            for _, pos in sorted(p.positions.items())
+        ]
+        out: dict[str, Any] = {
+            "equity_tmn": _s(equity, "0.01"),
+            "initial_equity_tmn": _s(p.initial_equity_tmn),
+            "return_pct": _s(p.total_return_pct, "0.000001"),
+            "peak_equity_tmn": _s(p.peak_equity_tmn, "0.01"),
+            "drawdown_pct": _s(p.drawdown_pct, "0.000001"),
+            "daily_pnl_pct": _s(p.daily_pnl_pct, "0.000001"),
+            "daily_pnl_tmn": _s(equity - day0, "0.01") if equity is not None and day0 is not None else None,
+            "realized_pnl_tmn": _s(p.realized_total_tmn, "0.01"),
+            "realized_by_strategy": {k: _s(v, "0.01") for k, v in sorted(p.realized_pnl_tmn.items())},
+            "fees_paid_tmn": _s(p.fees_paid_tmn_total, "0.01"),
+            "fee_budget_tmn": _s(budget, "0.01"),
+            "fee_budget_used_pct": _s(p.fees_paid_tmn_total / budget if budget else D0, "0.000001"),
+            "usdt_share": _s(p.usdt_share, "0.000001"),
+            "coin_exposure_pct": _s(p.coin_exposure_pct, "0.000001"),
+            "orders_today": p.orders_today(now),
+            "orders_last_hour": p.orders_last_hour(now),
+            "open_orders": sum(1 for o in p.open_orders.values() if not o.is_terminal),
+            "open_positions": positions,
+            "balances": {a: _s(b.total) for a, b in sorted(p.balances.items()) if b.total},
+        }
+        val = p.last_valuation
+        if val is not None and val.missing_prices:
+            out["valuation_missing_prices"] = list(val.missing_prices)
+        return out
+
+    def ai_health_view(self, now: float) -> dict[str, Any]:
+        """``get_health``: data freshness, API errors, paused/killed, flatten phase, time to deadline
+        (compact; the full heartbeat is far over the tool cap)."""
+        stale_s = self.cfg.engine.stale_data_s
+        ages = {s: self.bus.age(s, now) for s in self.watchlist}
+        known = [a for a in ages.values() if a is not None]
+        stale = sorted(s for s, a in ages.items() if a is None or a > stale_s)
+        f = self.flags
+        out: dict[str, Any] = {
+            "ts": iso(now),
+            "feed": self.feed,
+            "fresh_books": len(self.watchlist) - len(stale),
+            "watchlist": len(self.watchlist),
+            "stale_books": stale,
+            "max_book_age_s": round(max(known), 1) if known else None,
+            "api_consecutive_errors": self._api_consecutive_errors(),
+            "api_error_burst": self._api_burst,
+            "paused": f.paused,
+            "pause_reason": f.pause_reason,
+            "killed": f.killed,
+            "kill_reason": f.kill_reason,
+            "flatten_phase": f.flatten_phase,
+            "time_to_deadline_s": None if self.deadline.end_ts is None else int(self.deadline.end_ts - now),
+            "anomalies": list(self.last_anomalies)[:5],
+            "strategy_status": self.strategy_status,
+            "tick_crashes": self.tick_crashes,
+        }
+        if self.feed == "synthetic":
+            out["synthetic"] = True
+        hb = self._last_health
+        if hb is not None:
+            out["last_heartbeat"] = {
+                "ts": hb.ts,
+                "rest_ok": hb.rest_ok,
+                "ws_ok": hb.ws_ok,
+                "api_errors_1m": hb.api_errors_1m,
+                "reasons": [r[:160] for r in hb.reasons[:6]],
+            }
+        return out
+
+    def recent_decisions(self, n: int = RECENT_DECISIONS) -> list[dict[str, Any]]:
+        """The last ``n`` decisions (outcomes merged), compact (``get_recent_decisions``)."""
+        rows = list(self._recent_decisions.values())[-max(0, n):]
+        return [compact_decision(r) for r in rows]
+
+    def _note_decision(self, rec: dict[str, Any]) -> None:
+        """DecisionLog hook: the in-memory ring buffer behind ``get_recent_decisions``."""
+        kind, did = rec.get("kind"), str(rec.get("decision_id"))
+        if kind == "outcome":
+            target = self._recent_decisions.get(did)
+            if target is not None:
+                target["outcome"] = rec.get("outcome")
+            return
+        if kind == "plan":
+            return
+        if did in self._recent_decisions:
+            self._recent_decisions[did].update({k: v for k, v in rec.items() if v not in (None, "", {}, [])})
+            return
+        self._recent_decisions[did] = dict(rec)
+        while len(self._recent_decisions) > RECENT_DECISIONS:
+            self._recent_decisions.pop(next(iter(self._recent_decisions)))
+
+    def _note_trade(self, trade: Trade) -> None:
+        self._trades.setdefault(trade.symbol, deque(maxlen=TRADES_KEPT)).append(trade)
+
+    def _note_llm_call(self, info: dict[str, Any]) -> None:
+        """LLMClient ``on_call``: counters for the heartbeat (token usage is logged, PRD-04 §2)."""
+        self.ai_stats["model_calls"] += 1
+        if info.get("cached"):
+            self.ai_stats["cached_calls"] += 1
+        usage = info.get("usage") or {}
+        tokens = usage.get("total_tokens")
+        if not isinstance(tokens, int):
+            tokens = sum(v for k in ("prompt_tokens", "completion_tokens") if isinstance(v := usage.get(k), int))
+        self.ai_stats["tokens"] += tokens
+        log.info(
+            "llm call: role=%s %s/%s cached=%s latency_ms=%s tokens=%s fallback=%s",
+            info.get("role"), info.get("provider"), info.get("model"), info.get("cached"),
+            info.get("latency_ms"), tokens, info.get("fallback"),
+        )
+
+    def _analyst_state(self, now: float) -> dict[str, Any]:
+        """The analyst's input (JSON only, so it is taped and replays byte for byte)."""
+        view = self._view()
+        features: Any = {"error": "features not available yet"}
+        if view.features is not None:
+            features = (
+                self.analyst.first_features(view.features)
+                if self.analyst is not None
+                else feature_view(view.features, self.watchlist, max_bytes=4 * self.cfg.ai.tool_result_max_bytes,
+                                  legend=True)
+            )
+        state = {
+            "features": features,
+            "pnl_summary": view.pnl,
+            "health": view.health,
+            "last_plan": self.plan.model_dump(mode="json") if self.plan is not None else None,
+            "events": list(self._recent_events),
+        }
+        return to_jsonable(state)
+
+    def _analyst_timeout_s(self) -> float:
+        """Whole-cycle cap. Every model call has ``ai.analyst_timeout_s`` on the primary and again on
+        the fallback; a cycle makes at most the tool rounds + the final answer + one JSON fix
+        (``analyst_requests_per_cycle``). With MCP: up to ``MAX_CALLS_PER_ROUND`` tool calls of
+        ``MCP_TIMEOUT_S`` per round, plus 30 s for the handshake. A primary that hangs on every call
+        must not cancel a cycle the fallback answers."""
+        ai = self.cfg.ai
+        llm = self.analyst.llm if self.analyst is not None else None
+        routes = 2 if llm is not None and getattr(llm, "fallback", None) is not None else 1
+        cap = ai.analyst_timeout_s * analyst_requests_per_cycle(self.cfg) * routes
+        if self.mcp is not None:
+            cap += MCP_TIMEOUT_S * MAX_CALLS_PER_ROUND * max(0, ai.analyst_max_tool_rounds) + 30.0
+        return cap
+
+    async def slow_step(self, now: float) -> MarketPlan | None:
+        """One poll of the slow loop: stale-plan check, then ``analyst.should_run`` (startup, every
+        ``engine.slow_loop_interval_s``, kill/pause/flatten events, fast dollar/BTC moves; never more
+        often than every 60 s) and, when due, one analyst cycle.
+
+        ``now`` comes from the real clock (``clock.base``), never the TickClock: a tick freezes that
+        clock for its whole length, and the slow loop runs during the tick's awaits. The analyst
+        reads its own ``analyst_clock``, set to ``now`` for the cycle.
+        """
+        if self.analyst is None:
+            return None
+        self._check_plan_stale(now)
+        if self._analyst_busy:
+            return None
+        due, reason = self.analyst.should_run(now, self.analyst.last_run_ts, self.last_features, list(self._ai_triggers))
+        if not due:
+            return None
+        return await self.analyst_cycle(now, reason)
+
+    async def analyst_cycle(self, now: float, reason: str = "manual") -> MarketPlan | None:
+        """One analyst cycle at ``now``; a plan is persisted and swapped in by ``_on_plan``.
+
+        Never raises on AI trouble (timeouts, provider errors, invalid JSON: ``None``, the last plan
+        stays until it is stale, failures are counted); a strict-replay cache miss does raise.
+        """
+        if self.analyst is None:
+            return None
+        self._analyst_busy = True
+        try:
+            self.analyst_clock.set(now)
+            self._ai_view = self._capture_ai_view(now)
+            state = self._analyst_state(now)
+            self._ai_triggers.clear()
+            self.ai_last_reason = reason
+            self.ai_stats["cycles"] += 1
+            timeout = self._analyst_timeout_s()
+            try:
+                plan = await asyncio.wait_for(self.analyst.run(state, reason), timeout=timeout)
+                error = self.analyst.last_error
+            except TimeoutError:
+                plan, error = None, f"analyst cycle timed out after {timeout:g}s"
+                self.analyst.last_error = error
+        finally:
+            self._analyst_busy = False
+            self._ai_view = None  # the next cycle (or a tool call outside one) captures a fresh view
+        if plan is None:
+            self._analyst_failed(now, reason, error)
+        else:
+            self._analyst_succeeded(now, plan)
+        return plan
+
+    def _on_plan(self, plan: MarketPlan, record: dict[str, Any]) -> None:
+        """Analyst ``on_plan``: persist (state DB ``plans`` + ``decisions.jsonl`` kind ``plan``), then
+        swap ``self.plan`` (atomic: the next tick's StrategyContext gets it)."""
+        self._plan_seq += 1
+        decision_id = make_decision_id(plan.ts, "AI", "PLAN", self._plan_seq)
+        features = {k: v for k, v in record.items() if k not in ("notes", "config_hash")}
+        features["ai_source"] = self.ai_source
+        if self.ai_source == AI_OFFLINE:
+            features["ai_label"] = OFFLINE_STATUS
+        try:
+            # stamped with the cycle's time (no await in here: a tick that is waiting on the
+            # exchange meanwhile gets its own frozen time back unchanged)
+            with self.clock.frozen(plan.ts):
+                if self.trading:
+                    self.decision_log.record(
+                        kind="plan",
+                        decision_id=decision_id,
+                        strategy="AI",
+                        symbol="PLAN",
+                        features=features,
+                        plan_snapshot=plan,
+                        notes=plan.notes,
+                        config_hash=record.get("config_hash"),  # the config the plan was made under
+                    )
+                self.store.add_plan(plan.ts, plan.model_dump(mode="json"), plan.prompt_hash)
+        finally:
+            self.plan = plan
+            self._stale_plan_logged = None
+
+    def _event_at(self, now: float, kind: str, reason: str, data: dict[str, Any]) -> None:
+        """An event of the slow loop or the reviewer, stamped with that task's time (synchronous:
+        it never interleaves with a tick)."""
+        with self.clock.frozen(now):
+            self._event(kind, reason, data)
+
+    def _analyst_succeeded(self, now: float, plan: MarketPlan) -> None:
+        self.ai_stats["plans"] += 1
+        if self.llm_consecutive_failures:
+            self._event_at(
+                now,
+                "ai_recovered",
+                f"analyst plan again after {self.llm_consecutive_failures} failed cycle(s)",
+                {"model": plan.model, "prompt_hash": plan.prompt_hash, "ai_source": self.ai_source},
+            )
+        self.llm_consecutive_failures = 0
+        self._llm_failure_alerted = False
+        self.ai_last_error = ""
+        log.info(
+            "analyst: plan %s (%s, cached=%s, tools %s via %s, %s ms): %s",
+            plan.prompt_hash[:12], plan.model, plan.cached, ",".join(plan.tools_used) or "-", plan.tools_source,
+            plan.latency_ms, " ".join(plan.notes.split())[:200],
+        )
+
+    def _analyst_failed(self, now: float, reason: str, error: str) -> None:
+        self.ai_stats["failures"] += 1
+        self.llm_consecutive_failures += 1
+        self.ai_last_error = mask_secrets(error or "no plan", self._secrets)[:300]
+        keep = (
+            f"the plan from {iso(self.plan.ts)} stays in force until it is {self.cfg.ai.plan_stale_s:g}s old"
+            if self.current_plan(now) is not None
+            else "strategies run rules-only"
+        )
+        log.warning("analyst: no plan (%s, trigger %s): %s; %s", self.ai_source, reason, self.ai_last_error, keep)
+        if self.llm_consecutive_failures == 1:
+            self._event_at(
+                now,
+                "ai_degraded",
+                f"analyst cycle failed: {self.ai_last_error}; {keep}",
+                {"trigger": reason, "ai_source": self.ai_source, "consecutive_failures": 1},
+            )
+        if self.llm_consecutive_failures >= LLM_FAILURE_ALERT and not self._llm_failure_alerted:
+            self._llm_failure_alerted = True
+            self._alert(tg.fmt_llm_failures(self.llm_consecutive_failures, self.ai_last_error), "llm")
+
+    def _check_plan_stale(self, now: float) -> None:
+        """A plan older than ``ai.plan_stale_s`` is ignored by the strategies; say so once per plan."""
+        plan = self.plan
+        if plan is None or not self.cfg.ai.enabled:
+            return
+        age = now - plan.ts
+        if age <= self.cfg.ai.plan_stale_s or self._stale_plan_logged == plan.ts:
+            return
+        self._stale_plan_logged = plan.ts
+        text = (
+            f"plan from {iso(plan.ts)} is {age:.0f}s old (> ai.plan_stale_s {self.cfg.ai.plan_stale_s:g}s): "
+            "ignored; strategies run rules-only until a new plan arrives"
+        )
+        log.warning("engine: %s", text)
+        self._event_at(now, "plan_stale", text, {"plan_ts": plan.ts, "age_s": round(age, 3), "model": plan.model,
+                                                 "prompt_hash": plan.prompt_hash})
+
+    async def _slow_loop(self) -> None:
+        """The analyst task (supervised, never awaited by the fast loop): first once a tick has
+        computed features (at most ``SLOW_LOOP_FIRST_WAIT_S`` after the loop starts), then a
+        ``slow_step`` every ``SLOW_LOOP_POLL_S``. A strict-replay cache miss stops the engine
+        (determinism failure)."""
+        loop = asyncio.get_running_loop()
+        give_up = loop.time() + SLOW_LOOP_FIRST_WAIT_S
+        while not self._stop.is_set() and loop.time() < give_up and (
+            self.ticks == 0 or (self.router is not None and self.last_features is None)
+        ):
+            await asyncio.sleep(0.2)
+        while not self._stop.is_set():
+            try:
+                await self.slow_step(self.clock.base.now())
+            except CacheMissError as exc:
+                log.error("engine: replay cache miss in the slow loop: %s", exc)
+                self.request_stop(f"replay determinism failure: {exc}")
+                return
+            await asyncio.sleep(SLOW_LOOP_POLL_S)
+
+    # ------------------------------------------------------------ reviewer + config reload (PRD-04 §7)
+
+    async def review_step(self, now: float) -> Any:
+        """One poll of the reviewer task: a review every ``engine.reviewer_interval_s`` (the first one
+        that long after the start)."""
+        if self.reviewer is None or self._reviewer_busy:
+            return None
+        if self._next_review_ts is None:
+            start = self.started_ts if self.started_ts is not None else now
+            self._next_review_ts = start + self.cfg.engine.reviewer_interval_s
+        if now < self._next_review_ts:
+            return None
+        self._next_review_ts = now + self.cfg.engine.reviewer_interval_s
+        return await self.review_cycle(now)
+
+    def read_review_logs(self, now: float) -> dict[str, list[dict[str, Any]]]:
+        """The hour up to ``now`` of this run's ``decisions`` (outcome updates included), ``health``
+        and ``events`` lines (files only: safe in a worker thread; nothing stamped after ``now``)."""
+        since = now - REVIEW_WINDOW_S
+        return {base: read_log_window(self.log_dir, base, since, until=now) for base in ("decisions", "health", "events")}
+
+    def review_input(self, now: float, logs: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
+        """The reviewer's input: the last hour of decisions (outcome updates included), the plans
+        among them, heartbeats and events from this run's log files, plus the PnL summary."""
+        assert self.reviewer is not None
+        logs = self.read_review_logs(now) if logs is None else logs
+        decisions = logs.get("decisions", [])
+        plans = [d for d in decisions if d.get("kind") == "plan"]
+        health = logs.get("health", []) + logs.get("events", [])
+        return self.reviewer.build_input(decisions, plans, health, self.pnl_summary(now), window_s=REVIEW_WINDOW_S)
+
+    async def review_cycle(self, now: float) -> Any:
+        """One review at ``now``: journal entry (``<log_dir>/journal.md``), bounded changes through
+        the ConfigManager, ``reload_config`` when one was accepted. Never raises on AI trouble; a
+        strict-replay cache miss does."""
+        if self.reviewer is None:
+            return None
+        self._reviewer_busy = True
+        try:
+            self.reviewer_clock.set(now)
+            logs = await asyncio.to_thread(self.read_review_logs, now)  # file reads off the event loop
+            review_input = self.review_input(now, logs)
+            timeout = self.cfg.ai.reviewer_timeout_s * 4  # two attempts, each with one failover
+            try:
+                result = await asyncio.wait_for(self.reviewer.run(review_input), timeout=timeout)
+            except TimeoutError:
+                log.warning("reviewer: timed out after %gs; config unchanged", timeout)
+                self.last_review = {"ts": iso(now), "skipped": f"timed out after {timeout:g}s"}
+                return None
+        finally:
+            self._reviewer_busy = False
+        self.ai_stats["reviews"] += 1
+        change = result.change
+        new_hash = self.config_hash
+        if change is not None and change.accepted and change.config is not None:
+            new_hash = change.new_hash or change.config.config_hash
+            if self._in_tick:
+                # a tick is suspended on an exchange await: its intents were computed under the old
+                # config, so the swap waits for the next tick boundary (like the plan, ``_tick_plan``)
+                self._pending_cfg = change.config
+                log.info("reviewer: config %s takes effect at the next tick", new_hash)
+            else:
+                try:
+                    self.reload_config(change.config)
+                except ValueError:
+                    log.exception("reviewer: change refused by reload_config; config unchanged")
+                    new_hash = self.config_hash
+        self.last_review = {
+            "ts": iso(now),
+            "model": result.model or None,
+            "skipped": result.skipped_reason or None,
+            "accepted": len(change.accepted) if change is not None else 0,
+            "rejected": len(change.rejected) if change is not None else 0,
+            "config_hash": new_hash,
+        }
+        return result
+
+    async def _reviewer_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self.review_step(self.clock.base.now())
+            except CacheMissError as exc:
+                log.error("engine: replay cache miss in the reviewer: %s", exc)
+                self.request_stop(f"replay determinism failure: {exc}")
+                return
+            await asyncio.sleep(REVIEW_POLL_S)
+
+    def reload_config(self, new_cfg: Config) -> str:
+        """Swap in a reviewer-changed config (PRD-04 §8): strategies (their S1Cfg/S2Cfg/S3Cfg),
+        router, FeatureEngine, analyst; the decision log stamps the new ``config_hash``.
+
+        Only reviewer-editable paths may differ: ``risk.*``, ``execution.*`` and the rest are
+        refused (``ValueError``), so the RiskManager and the OrderManager keep their parameters
+        and their authority. Call it between ticks (``review_cycle`` defers it to the next tick
+        boundary while a tick runs). A running analyst cycle keeps the config it started with
+        (``RegimeAnalyst.cycle_cfg``).
+        """
+        old_tree = _flat(self.cfg.model_dump(mode="json"))
+        new_tree = _flat(new_cfg.model_dump(mode="json"))
+        changed = sorted(k for k in set(old_tree) | set(new_tree) if old_tree.get(k) != new_tree.get(k))
+        editable = set(self.cfg.llm.reviewer.editable)
+        refused = [k for k in changed if k not in editable]
+        if refused:
+            raise ValueError(f"reload_config: not reviewer-editable: {', '.join(refused)}")
+        old_hash = self.config_hash
+        self.cfg = new_cfg
+        self.config_hash = new_cfg.config_hash
+        if self.router is not None:
+            self.router.cfg = new_cfg
+            for strat in self.router.strategies:
+                section = STRATEGY_CFG.get(strat.id)
+                if section is not None and hasattr(strat, "cfg"):
+                    strat.cfg = getattr(new_cfg.strategies, section)  # type: ignore[attr-defined]
+        if self.features is not None:
+            self.features.cfg = new_cfg
+        if self.analyst is not None:
+            self.analyst.cfg = new_cfg
+        if self.trading:
+            self.decision_log.set_config_hash(self.config_hash)
+        log.info("engine: config reloaded %s -> %s (%s)", old_hash, self.config_hash, ", ".join(changed) or "no change")
+        return self.config_hash
+
+    # ------------------------------------------------------------ Telegram (PRD-06 §2)
+
+    def enable_telegram(
+        self,
+        notifier: tg.TelegramNotifier | None = None,
+        commands: tg.TelegramCommands | None = None,
+        *,
+        transport: Any = None,
+        commands_enabled: bool = True,
+    ) -> bool:
+        """Alerts (and the /status /pause /resume /kill commands) when ``TELEGRAM_BOT_TOKEN`` and
+        ``TELEGRAM_CHAT_ID`` are set and ``alerts.telegram_enabled`` is true. Returns True if on.
+
+        The inbound commands also need ``alerts.telegram_commands_enabled`` and ``commands_enabled``
+        (flatten_now passes False): only one engine per bot may poll ``getUpdates``, else a /kill
+        meant for the live engine can land in another one. A poller that gets HTTP 409 (another
+        instance owns the bot) stops and says so in the heartbeat reasons."""
+        prefix = f"[wta {self.mode}{' synthetic' if self.feed == 'synthetic' else ''}]"
+        if notifier is None:
+            candidate = tg.TelegramNotifier.from_settings(
+                self.settings, self.cfg.alerts, self.clock.base, prefix=prefix, transport=transport
+            )
+            notifier = candidate if candidate.enabled else None
+        wants_commands = commands_enabled and self.cfg.alerts.telegram_commands_enabled
+        if commands is None and notifier is not None and wants_commands:
+            cmd = tg.TelegramCommands.from_settings(
+                self.settings, self.cfg.alerts, self._telegram_command, self.clock.base, prefix=prefix,
+                transport=transport,
+            )
+            commands = cmd if cmd.enabled else None
+        self.notifier, self.telegram_commands = notifier, commands
+        return notifier is not None
+
+    def _alert(self, text: str, kind: str, dedupe_key: str | None = None) -> None:
+        """Fire-and-forget: a slow Telegram never delays a tick (``send_nowait``)."""
+        if self.notifier is not None:
+            self.notifier.send_nowait(mask_secrets(text, self._secrets), kind, dedupe_key=dedupe_key)
+
+    async def _drain_alerts(self) -> None:
+        if self.notifier is None:
+            return
+        try:
+            await asyncio.wait_for(self.notifier.drain(), timeout=ALERT_DRAIN_S)
+            await asyncio.wait_for(self.notifier.flush_digest(force=True), timeout=ALERT_DRAIN_S)
+        except (TimeoutError, Exception):  # noqa: BLE001 - alerts never block a shutdown
+            log.warning("engine: telegram alerts not fully delivered at shutdown")
+
+    def _event_alert(self, kind: str, reason: str, data: dict[str, Any]) -> None:
+        if self.notifier is None:
+            return
+        text: str | None = None
+        if kind in ("start", "restart", "stop"):
+            equity = self.portfolio.equity_tmn if self.trading else None
+            text = tg.fmt_start_stop(kind, self.mode, git_commit=self.git_commit, config_hash=self.config_hash,
+                                     reason=reason, equity=equity)
+        elif kind in ("pause", "resume", "kill", "reset_kill_applied"):
+            text = tg.fmt_risk("reset_kill" if kind == "reset_kill_applied" else kind, reason,
+                               source=str(data.get("source") or ""))
+        elif kind == "flatten":
+            sub = str(data.get("kind") or data.get("phase") or "")
+            text = tg.fmt_flatten("kill" if sub == "kill_flatten_start" else sub, reason)
+        elif kind == "config_change":
+            diff = "; ".join(f"{d.get('path')}: {d.get('old')} -> {d.get('new')}" for d in data.get("diff") or [])
+            text = f"CONFIG CHANGE ({data.get('source', '?')}): {data.get('old_hash')} -> {data.get('new_hash')}\n{diff}"
+        elif kind == "final_state":
+            text = f"FINAL STATE: {reason}"
+        elif kind == "tick_error":
+            text = f"TICK ERROR: {reason}"
+        if text is not None:
+            self._alert(text, kind)
+
+    async def _telegram_command(self, command: str, args: str) -> str:
+        """``TelegramCommands.on_command``: operational controls only (no trading). /status reads;
+        /pause, /resume, /kill are queued and applied at the start of the next tick."""
+        now = self.clock.base.now()
+        self._event(
+            "operator_command",
+            f"/{command} via Telegram" + (f": {args}" if args else ""),
+            {"command": command, "args": args, "source": "telegram"},
+        )
+        if command == "status":  # file and read-only DB reads: off the event loop
+            return await asyncio.to_thread(self.status_text, now)
+        if command not in ("pause", "resume", "kill"):
+            return f"/{command}: not supported"
+        self._operator_requests.append((command, args, now))
+        return {
+            "pause": "pause requested: no new entries from the next tick (entry orders are canceled)",
+            "resume": "resume requested: lifts a /pause at the next tick (risk pauses and a kill stay)",
+            "kill": "kill-switch requested: at the next tick entries are canceled and everything is "
+            "flattened to TMN; only `wta reset-kill` clears it",
+        }[command]
+
+    def status_text(self, now: float, width: int = 60) -> str:
+        """``wta status`` text for this engine's logs and state DB (Telegram /status)."""
+        try:
+            st = status_for_config(self.cfg, now, log_dir=self.log_dir, mode=self.mode, feed=self.feed)
+            return format_status(st, width=width)
+        except Exception as exc:  # noqa: BLE001 - a status reply must never break the poller
+            return f"status unavailable: {type(exc).__name__}"
+
+    async def _apply_operator_requests(self, now: float) -> None:
+        """Telegram /pause /resume /kill, inside the tick (clock frozen, one transaction)."""
+        requests, self._operator_requests = self._operator_requests, []
+        for command, args, _ts in requests:
+            why = args or "operator request"
+            base = {"command": command, "args": args, "source": "telegram"}
+            if command == "kill":
+                if self.flags.killed:
+                    self._event("operator_command_ignored", "/kill: the kill-switch is already active", base)
+                    continue
+                await self._kill(f"telegram /kill: {why}", now, source="telegram")
+            elif command == "pause":
+                if self.flags.killed or self.flags.paused:
+                    state = f"killed ({self.flags.kill_reason})" if self.flags.killed else f"paused ({self.flags.pause_reason})"
+                    self._event("operator_command_ignored", f"/pause: already {state}", base)
+                    continue
+                self.flags.paused, self.flags.paused_until_ts = True, None
+                self.flags.pause_reason = f"{MANUAL_PAUSE_PREFIX} {why}"
+                canceled = await self.order_manager.cancel_where(cancel_at_flatten_start, "pause")
+                self._balances_stale = True
+                self._event("pause", self.flags.pause_reason,
+                            {"source": "telegram", "entries_canceled": canceled, **self._risk_snapshot()})
+                self._persist_flags(now)
+            elif command == "resume":
+                if not (self.flags.paused and self.flags.pause_reason.startswith(MANUAL_PAUSE_PREFIX)):
+                    self._event(
+                        "operator_command_ignored",
+                        "/resume lifts only a /pause: risk pauses clear by their own rule, a kill needs wta reset-kill",
+                        {**base, "paused": self.flags.paused, "pause_reason": self.flags.pause_reason,
+                         "killed": self.flags.killed},
+                    )
+                    continue
+                previous = self.flags.pause_reason
+                self.flags.paused, self.flags.pause_reason, self.flags.paused_until_ts = False, "", None
+                self._event("resume", f"telegram /resume: {why}", {"source": "telegram", "previous_reason": previous})
+                self._persist_flags(now)
+
     # ------------------------------------------------------------ health
 
     def _api_error_count(self) -> int:
@@ -2172,6 +3125,25 @@ class Engine:
                 "bars": {s: self.candles.count(s) for s in self.watchlist},
                 "refresher": self.candle_refresher.stats() if self.candle_refresher is not None else None,
             }
+        ai = self.ai_health(now)
+        extra["ai_source"] = ai["ai_source"]
+        extra["ai"] = ai
+        if ai.get("mcp_ok") is not None:
+            extra["mcp_ok"] = ai["mcp_ok"]
+        if ai["llm_ok"] is False:
+            reasons.append(
+                f"llm: {ai['llm_consecutive_failures']} failed analyst cycle(s) in a row"
+                f" ({ai.get('last_error') or 'no plan'}); "
+                + ("the last plan stays until it is stale" if ai.get("plan_fresh") else "strategies run rules-only")
+            )
+        if ai.get("plan_stale"):
+            reasons.append(f"plan stale ({ai['plan_age_s']:.0f}s > {self.cfg.ai.plan_stale_s:g}s): rules-only")
+        if self.notifier is not None:
+            extra["telegram"] = self.notifier.stats()
+            if self.telegram_commands is not None:
+                extra["telegram_commands"] = self.telegram_commands.stats()
+        if self.telegram_commands is not None and self.telegram_commands.stopped_reason:
+            reasons.append(f"telegram commands off: {self.telegram_commands.stopped_reason}")
         return HealthRecord(
             ts=iso(now),
             mode=self.mode,
@@ -2184,20 +3156,66 @@ class Engine:
             ws_ok=ws_ok,
             rest_ok=rest_ok,
             api_errors_1m=self.api_errors_1m(now),
-            llm_ok=None,
+            llm_ok=ai["llm_ok"],
             paused=self.flags.paused,
             killed=self.flags.killed,
             reasons=reasons,
             extra=extra,
         )
 
+    def ai_health(self, now: float) -> dict[str, Any]:
+        """``health.extra.ai`` (and ``HealthRecord.llm_ok``).
+
+        ``llm_ok``: None while no LLM is in use (``ai.enabled`` false, the offline rules provider —
+        it is not an LLM — or no cycle yet), False after a failed analyst cycle (provider error,
+        timeout, invalid JSON twice, budget), True after a plan from the LLM. ``ai_source``:
+        ``llm``, ``offline-rules`` or ``disabled``.
+        """
+        plan = self.plan
+        fresh = self.current_plan(now)
+        out: dict[str, Any] = {
+            "ai_source": self.ai_source,
+            "llm_ok": None,
+            "plan_age_s": None if plan is None else round(now - plan.ts, 3),
+            "plan_model": None if plan is None else plan.model,
+            "plan_fresh": fresh is not None,
+            "plan_stale": plan is not None and fresh is None and self.cfg.ai.enabled,
+            "tools_source": None if plan is None else plan.tools_source,
+            "llm_consecutive_failures": self.llm_consecutive_failures,
+        }
+        if self.ai_source == AI_OFFLINE:
+            out["label"] = OFFLINE_STATUS
+        if self.analyst is None:
+            return out
+        if self.ai_source == AI_LLM and self.ai_stats["cycles"]:
+            out["llm_ok"] = self.llm_consecutive_failures == 0
+        mcp = self.mcp
+        out["mcp_ok"] = None if mcp is None else (not self.analyst.mcp_error and self.analyst._mcp_schemas is not None)
+        if self.analyst.mcp_error:
+            out["mcp_error"] = mask_secrets(self.analyst.mcp_error, self._secrets)[:200]
+        out.update(
+            last_cycle_ts=None if self.analyst.last_run_ts is None else iso(self.analyst.last_run_ts),
+            last_reason=self.ai_last_reason or None,
+            stats=dict(self.ai_stats),
+        )
+        if self.ai_last_error:
+            out["last_error"] = self.ai_last_error
+        if self.ai_setup is not None and self.ai_setup.routes:
+            out["routes"] = dict(self.ai_setup.routes)
+        if self.last_review is not None:
+            out["last_review"] = dict(self.last_review)
+        return out
+
     def write_heartbeat(self, now: float) -> HealthRecord:
         record = self.health_record(now)
         self.health_log.write(record)
         self.heartbeats += 1
+        self._last_health = record
         fresh = sum(1 for s in self.watchlist if s not in self.stale_symbols)
+        ai = record.extra.get("ai") or {}
         log.info(
-            "heartbeat: feed=%s rest_ok=%s ws_ok=%s fresh_books=%d/%d equity=%s killed=%s paused=%s",
+            "heartbeat: feed=%s rest_ok=%s ws_ok=%s fresh_books=%d/%d equity=%s killed=%s paused=%s ai=%s llm_ok=%s "
+            "plan_age_s=%s",
             self.feed,
             record.rest_ok,
             record.ws_ok,
@@ -2206,16 +3224,50 @@ class Engine:
             record.equity_tmn,
             record.killed,
             record.paused,
+            ai.get("ai_source"),
+            record.llm_ok,
+            ai.get("plan_age_s"),
         )
+        self._heartbeat_alerts(record, now)
         return record
 
+    def _heartbeat_alerts(self, record: HealthRecord, now: float) -> None:
+        """Telegram: API error bursts seen by the heartbeat and the hourly equity line."""
+        if self.notifier is None:
+            return
+        if record.api_errors_1m >= API_ERRORS_ALERT_1M:
+            self._alert(tg.fmt_api_burst(record.api_errors_1m), "api", dedupe_key="api_errors_1m")
+        if not self.trading or record.equity_tmn is None:
+            return
+        if self._last_equity_alert_ts is None:
+            self._last_equity_alert_ts = now  # the start alert already carries the equity
+            return
+        if now - self._last_equity_alert_ts >= EQUITY_ALERT_EVERY_S:
+            self._last_equity_alert_ts = now
+            p = self.portfolio
+            self._alert(
+                tg.fmt_equity_hourly(record.equity_tmn, p.total_return_pct, p.drawdown_pct,
+                                     peak=p.peak_equity_tmn, daily_pnl=p.daily_pnl_pct),
+                "equity",
+            )
+
     def _event(self, kind: str, reason: str, data: dict[str, Any]) -> None:
-        """``events.jsonl`` + the store's ``events`` table. A failing store never blocks the log."""
+        """``events.jsonl`` + the store's ``events`` table. A failing store never blocks the log.
+        Then: the analyst's recent events and triggers (kill/pause/flatten) and the Telegram alert."""
         self.events_log.log(kind, reason, data)
         try:
             self.store.add_event(self.clock.now(), kind, {"reason": reason, **data})
         except Exception:
             log.exception("engine: could not store event %s", kind)
+        try:
+            self._recent_events.append(
+                {"ts": iso(self.clock.now()), "kind": kind, "reason": " ".join(str(reason).split())[:200]}
+            )
+            if kind in AI_TRIGGER_EVENTS:
+                self._ai_triggers.append({"kind": kind, "data": {k: data.get(k) for k in ("kind", "trigger")}})
+            self._event_alert(kind, reason, data)
+        except Exception:  # noqa: BLE001 - bookkeeping must never break the event log
+            log.exception("engine: event hooks failed for %s", kind)
 
 
 # ---------------------------------------------------------------- wiring
@@ -2238,8 +3290,18 @@ async def build_engine(
     require_deadline: bool = True,
     strategies: list[Strategy] | None = None,
     overlays: list[str] | None = None,
+    ai: bool = True,
+    ai_providers: dict[str, Any] | None = None,
+    mcp: Any = "auto",
+    runtime_overlay: bool = True,
+    runtime_dir: str | Path | None = None,
+    pinned_keys: Iterable[str] = (),
+    telegram: bool = True,
+    telegram_commands: bool = True,
+    telegram_transport: Any = None,
 ) -> Engine:
-    """Build a trading engine: markets, state DB, data feed, exchange (paper or Wallex), strategies.
+    """Build a trading engine: markets, state DB, data feed, exchange (paper or Wallex), strategies,
+    the AI layer and the Telegram alerts.
 
     * markets: ``load_markets(rest)`` (``/v1/markets`` + fees, else the offline snapshot). Live mode
       refuses the snapshot.
@@ -2257,6 +3319,20 @@ async def build_engine(
       another engine or flatten_now holds it); ``Engine.aclose()`` releases it.
     * clock: wrapped in a ``TickClock`` for the engine and the paper exchange; the data feeds keep
       the real one.
+    * reviewer overlay (``runtime_overlay``): ``<runtime_dir>/latest.yaml`` is merged first —
+      reviewer-editable paths within bounds only, the ``pinned_keys`` (the operator's ``--set`` /
+      ``--overlay`` keys) win and are never offered to the reviewer — and named with its hash in the
+      start event. The default ``runtime_dir`` is the account's own (``configs/runtime/<mode>`` on
+      the live feed, ``configs/runtime/<mode>_<feed>`` otherwise, like the state DB), and an
+      overlay written by another account is refused. With ``ai.enabled: false`` (the ablation) the
+      overlay is NOT applied (``runtime_overlay.skipped`` in the start event): the rules-only run
+      uses the plain configs/*.yaml values, never strategy parameters chosen by an LLM review.
+    * AI (``ai``): ``Engine.enable_ai`` — LLM clients (OpenRouter primary, Gemini fallback) when a
+      key is set, the offline rules provider when none is, nothing with ``ai.enabled: false``;
+      ``ai_providers`` replaces the HTTP providers (tests), ``mcp`` the Wallex MCP client.
+    * Telegram (``telegram``): ``Engine.enable_telegram`` (a no-op without ``TELEGRAM_*`` and
+      ``alerts.telegram_enabled``). ``telegram_commands=False`` (flatten_now, a second engine) keeps
+      the alerts but polls no inbound commands: exactly one engine may own the bot's getUpdates.
     """
     if mode not in ("shadow", "live"):
         raise ValueError(f"unknown mode {mode!r} (shadow or live)")
@@ -2277,11 +3353,29 @@ async def build_engine(
                 raise LiveGuardError(f"refusing to start live mode: {why}")
     if synthetic_shock is not None and feed != "synthetic":
         raise ValueError("a synthetic shock needs --feed synthetic")
+    rt_dir = Path(runtime_dir) if runtime_dir is not None else runtime_dir_for(mode, feed)
+    pinned = frozenset(pinned_keys)
+    overlay_info: dict[str, Any] | None = None
+    latest_overlay = rt_dir / RUNTIME_LATEST
+    if runtime_overlay and not cfg.ai.enabled:
+        if latest_overlay.is_file():
+            overlay_info = {"path": str(latest_overlay), "skipped": "ai.enabled is false", "applied": {}}
+            log.info("engine: reviewer overlay %s not applied: ai.enabled is false (rules-only ablation)",
+                     latest_overlay)
+    elif runtime_overlay:
+        cfg, overlay_info = load_runtime_overlay(cfg, latest_overlay, pinned, account=account_label(mode, feed))
+        if overlay_info is not None:
+            log.info(
+                "engine: reviewer overlay %s (sha256 %s): applied %s, rejected %d; config %s -> %s%s",
+                overlay_info["path"], overlay_info["sha256"], ", ".join(sorted(overlay_info["applied"])) or "nothing",
+                len(overlay_info["rejected"]), overlay_info["config_hash_before"], overlay_info["config_hash_after"],
+                f" (skipped: {overlay_info['skipped']})" if overlay_info.get("skipped") else "",
+            )
     tick_clock = clock if isinstance(clock, TickClock) else TickClock(base_clock)
     state_path = state_db_path(cfg, mode, feed)
     lock = acquire_engine_lock(state_path)
     try:
-        return await _build_engine(
+        engine = await _build_engine(
             cfg,
             settings,
             mode,
@@ -2302,6 +3396,18 @@ async def build_engine(
     except BaseException:
         release_engine_lock(lock)
         raise
+    try:
+        if ai:
+            engine.enable_ai(providers=ai_providers, mcp=mcp, runtime_dir=rt_dir, runtime_overlay=overlay_info,
+                             pinned_keys=pinned)
+        else:
+            engine.runtime_overlay = overlay_info
+        if telegram:
+            engine.enable_telegram(transport=telegram_transport, commands_enabled=telegram_commands)
+    except BaseException:
+        await engine.aclose()
+        raise
+    return engine
 
 
 async def _build_engine(
@@ -2431,12 +3537,14 @@ async def run_engine(
     paper_balances: dict[str, Decimal] | None = None,
     synthetic_shock: tuple[float, float] | None = None,
     overlays: list[str] | None = None,
+    **build_options: Any,
 ) -> int:
     """Build the trading engine (``build_engine``) and run it until stopped.
 
     ``mode="live"`` runs the live guards (``wta.safety``) before anything is built or started and
     raises ``LiveGuardError`` when one fails. ``overlays`` (the ``--overlay`` files already merged
-    into ``cfg``) are named in the start event next to the config hash.
+    into ``cfg``) are named in the start event next to the config hash. ``build_options`` go to
+    ``build_engine`` (``runtime_overlay``, ``pinned_keys``, ``ai_providers``, ...).
     """
     if mode == "live":
         check_live_guard(i_understand_live, allow_dirty, settings)
@@ -2452,9 +3560,87 @@ async def run_engine(
         i_understand_live=i_understand_live,
         allow_dirty=allow_dirty,
         overlays=overlays,
+        **build_options,
     )
     try:
         await engine.run(stop_event, seconds, handle_signals=handle_signals)
     finally:
         await engine.aclose()
     return 0
+
+
+PLAN_WARMUP_S = 15.0  # ``wta plan``: wait at most this long for the books of the regime symbols
+
+
+async def plan_once(
+    cfg: Config,
+    settings: Settings,
+    *,
+    feed: str = "live",
+    log_dir: str | Path = "logs/shadow",
+    warmup_s: float = PLAN_WARMUP_S,
+    clock: Clock | None = None,
+    **build_options: Any,
+) -> dict[str, Any]:
+    """``wta plan``: ONE analyst cycle on the shadow account's data, nothing traded or persisted.
+
+    Builds the shadow engine of ``feed`` (its state DB, so the candle history and the cross-book
+    z-score state of earlier runs are used; the account lock is taken, so this refuses to run next
+    to a shadow engine on the same account), restores candles and feature state read-only, runs
+    only the market-data task(s) until the books of the regime symbols arrive (at most
+    ``warmup_s``), computes one FeatureSnapshot and runs one analyst cycle with reason ``manual``.
+    No tick runs (no order, no exit, no kv write); the plan is returned, not stored (the LLM cache
+    and tape still record the call, so it replays). Returns ``{"plan", "analyst", "ai_source",
+    "error", ...}`` (JSON-safe).
+    """
+    build_options.setdefault("telegram", False)
+    engine = await build_engine(cfg, settings, "shadow", feed=feed, log_dir=log_dir, clock=clock, **build_options)
+    stop = asyncio.Event()
+    tasks: list[asyncio.Task[Any]] = []
+    try:
+        now = engine.clock.now()
+        engine._restore_strategies(now)  # candles + feature/strategy state: reads only
+        if engine.rest_poller is not None:
+            tasks.append(asyncio.create_task(engine.rest_poller.run(), name="plan-rest"))
+        if engine.synthetic is not None:
+            engine.synthetic.on_candle = engine.candles.update  # in memory only: no state-DB write
+            tasks.append(asyncio.create_task(engine.synthetic.run(stop), name="plan-synthetic"))
+        loop = asyncio.get_running_loop()
+        give_up = loop.time() + max(0.0, warmup_s)
+        wanted = [s for s in REQUIRED_PLAN_BOOKS if s in engine.watchlist]
+        while loop.time() < give_up and any(engine.bus.latest(s) is None for s in wanted):
+            await asyncio.sleep(STARTUP_BOOKS_POLL_S)
+        now = engine.clock.now()
+        books = engine.bus.snapshot(engine.watchlist)
+        if engine.features is not None:
+            engine.last_features = engine.features.compute(now, books, engine.candles.snapshot(engine.watchlist),
+                                                           engine.watchlist)
+        out: dict[str, Any] = {
+            "ai_source": engine.ai_source,
+            "mode": "shadow",
+            "feed": feed,
+            "books": sorted(books),
+            "ts": iso(now),
+            "config_hash": engine.config_hash,
+        }
+        if engine.ai_source == AI_OFFLINE:
+            out["label"] = OFFLINE_STATUS + ": deterministic rules, NOT an LLM"
+        if feed == "synthetic":
+            out["note"] = SYNTHETIC_NOTE
+        if engine.analyst is None:
+            out.update(plan=None, analyst=None, error="ai.enabled is false: no analyst (rules-only)")
+            return out
+        engine.analyst.on_plan = None  # a dry run: nothing goes to decisions.jsonl or the plans table
+        plan = await engine.analyst_cycle(now, "manual")
+        out["plan"] = plan.model_dump(mode="json") if plan is not None else None
+        out["analyst"] = to_jsonable(engine.analyst.last_record) if plan is not None else None
+        out["error"] = None if plan is not None else engine.analyst.last_error or "no plan"
+        return out
+    finally:
+        stop.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for writer in (engine.health_log, engine.events_log, engine.decision_log, engine.orders_log):
+            writer.close()
+        await engine.aclose()

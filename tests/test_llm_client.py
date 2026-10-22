@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from wta.ai.cache import CacheMissError, LLMCache, cache_key
 from wta.ai.llm_client import (
+    GEMINI_SCHEMA_KEYS,
     GeminiProvider,
     LLMClient,
     LLMResponse,
@@ -27,6 +28,8 @@ from wta.ai.llm_client import (
     Route,
     ToolCall,
     extract_json,
+    gemini_function,
+    gemini_schema,
 )
 from wta.models import RegimeCall
 from wta.utils.timeutil import SimClock
@@ -239,12 +242,60 @@ async def test_gemini_tools_become_function_declarations_and_calls_are_parsed() 
         route = router.post(GEM_CHAT).mock(return_value=gem_ok(parts))
         resp = await provider.chat(MESSAGES, [TOOL], FALLBACK.model, 0.0, 500, json_mode=True)
     sent = body(route)
+    params = {k: v for k, v in TOOL["parameters"].items() if k != "additionalProperties"}  # Gemini: HTTP 400
     assert sent["tools"] == [{"functionDeclarations": [
-        {"name": TOOL["name"], "description": TOOL["description"], "parameters": TOOL["parameters"]}]}]
+        {"name": TOOL["name"], "description": TOOL["description"], "parameters": params}]}]
     assert "responseMimeType" not in sent["generationConfig"]
     assert resp.text == "Let me look."
     assert resp.tool_calls == [ToolCall("get_candle_stats_1", "get_candle_stats", {"symbol": "ETHUSDT", "n": 20}),
                                ToolCall("get_health_2", "get_health", {})]
+
+
+def _gemini_rejects(decl: dict[str, Any]) -> str | None:
+    """What the real Gemini API refused in a shadow run (and documents): unknown schema keywords
+    and an OBJECT without properties."""
+
+    def walk(node: Any, where: str) -> str | None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key not in GEMINI_SCHEMA_KEYS:
+                    return f"Unknown name {key!r} at {where}"
+                if key == "properties":
+                    if not value:
+                        return f"{where}.properties: should be non-empty for OBJECT type"
+                    for name, sub in value.items():
+                        found = walk(sub, f"{where}.properties.{name}")
+                        if found:
+                            return found
+                elif key in ("items",):
+                    found = walk(value, f"{where}.{key}")
+                    if found:
+                        return found
+        return None
+
+    return walk(decl.get("parameters", {}), "parameters") if "parameters" in decl else None
+
+
+def test_every_analyst_tool_is_a_valid_gemini_function_declaration() -> None:
+    from wta.ai.analyst import mcp_tool_schema
+    from wta.ai.tools import INTERNAL_TOOL_SCHEMAS, LOCAL_TOOL_SCHEMAS
+
+    mcp_like = mcp_tool_schema({"name": "wallex_basic_get_market_depth", "description": "Depth.",
+                                "inputSchema": {"type": "object", "$schema": "x", "additionalProperties": False,
+                                                "properties": {"symbol": {"type": "string"}},
+                                                "required": ["symbol", "ghost"]}})
+    for tool in [*INTERNAL_TOOL_SCHEMAS, *LOCAL_TOOL_SCHEMAS, mcp_like]:
+        decl = gemini_function(tool)
+        assert _gemini_rejects(decl) is None, (tool["name"], decl)
+        assert decl["name"] == tool["name"]
+    no_args = gemini_function({"name": "get_health", "description": "h",
+                               "parameters": {"type": "object", "properties": {}, "additionalProperties": False}})
+    assert no_args == {"name": "get_health", "description": "h"}
+    assert gemini_function(mcp_like)["parameters"]["required"] == ["symbol"]
+    stats = gemini_function(next(t for t in INTERNAL_TOOL_SCHEMAS if t["name"] == "get_candle_stats"))
+    assert stats["parameters"]["properties"]["resolution"]["enum"] == ["1", "15", "60"]
+    assert gemini_schema({"type": "array", "uniqueItems": True, "items": {"type": "string", "$ref": "#/x"}}) == {
+        "type": "array", "items": {"type": "string"}}
 
 
 @pytest.mark.parametrize(

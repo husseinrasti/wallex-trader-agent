@@ -51,6 +51,7 @@ DEFAULT_MARKET_DB = Path("data/wta.sqlite")
 
 OFFLINE_MODEL = "offline-rules-v1"  # wta.ai.offline_provider: the rules provider used without an LLM key
 OFFLINE_TEXT = "offline rules (no LLM key)"
+AI_OFFLINE_SOURCE = "offline-rules"  # health.extra.ai_source of an engine on the offline rules provider
 SYNTHETIC_WARNING = "SYNTHETIC market data: an offline exercise of the engine, never evidence of performance"
 KV_FLAGS = "engine_flags"  # wta.execution.reconcile.KV_FLAGS
 KV_PORTFOLIO = "portfolio_state"  # wta.execution.reconcile.KV_PORTFOLIO
@@ -221,6 +222,8 @@ def _events(log_dir: Path, now: float, errors: list[str]) -> dict[str, Any]:
                 "config_hash": data.get("config_hash"),
                 "pid": data.get("pid"),
                 "challenge_end_utc": data.get("challenge_end_utc"),
+                "ai": data.get("ai") if isinstance(data.get("ai"), dict) else None,
+                "runtime_overlay": data.get("runtime_overlay") if isinstance(data.get("runtime_overlay"), dict) else None,
             }
         return out
 
@@ -521,6 +524,8 @@ def build_status(
         "rest_ok": (hb or {}).get("rest_ok"),
         "api_errors_1m": (hb or {}).get("api_errors_1m"),
         "llm_ok": (hb or {}).get("llm_ok"),
+        "ai_source": extra.get("ai_source") or (start.get("ai") or {}).get("source"),
+        "ai": extra.get("ai") if isinstance(extra.get("ai"), dict) else None,
         "health_reasons": (hb or {}).get("reasons", []),
         "challenge_end_utc": start.get("challenge_end_utc"),
         "deadline_in_s": None if end_ts is None else round(end_ts - now, 3),
@@ -745,6 +750,11 @@ def build_status(
 # ---------------------------------------------------------------- format
 
 
+def _state_db_hint(status: dict[str, Any]) -> str:
+    expected = (status.get("sources") or {}).get("state_db_expected")
+    return "details need the engine state db" + (f" ({expected}: not found)" if expected else "")
+
+
 def _dur(seconds: float | None) -> str:
     if seconds is None:
         return "?"
@@ -859,14 +869,39 @@ def format_status(status: dict[str, Any], width: int = 100) -> str:
     )
     if eng.get("heartbeat_ts") is not None:
         llm = eng.get("llm_ok")
+        source = eng.get("ai_source")
+        if source == AI_OFFLINE_SOURCE:
+            llm_text = f"llm none: {OFFLINE_TEXT}"
+        elif source == "disabled":
+            llm_text = "ai disabled (rules-only)"
+        else:
+            llm_text = f"llm {'n/a' if llm is None else _ok(llm)}"
         out += _line(
             "Health",
             [
-                f"rest {_ok(eng.get('rest_ok'))}",
-                f"ws {_ok(eng.get('ws_ok'))}",
+                "rest/ws n/a (synthetic feed)" if eng.get("synthetic") else f"rest {_ok(eng.get('rest_ok'))}",
+                "" if eng.get("synthetic") else f"ws {_ok(eng.get('ws_ok'))}",
                 f"api errors {eng.get('api_errors_1m') or 0}/min",
-                f"llm {'n/a' if llm is None else _ok(llm)}",
+                llm_text,
                 *[str(r) for r in eng.get("health_reasons") or []],
+            ],
+            width,
+        )
+    ai = eng.get("ai") or {}
+    if ai:
+        source = ai.get("ai_source")
+        failures = ai.get("llm_consecutive_failures") or 0
+        out += _line(
+            "AI",
+            [
+                OFFLINE_TEXT if source == AI_OFFLINE_SOURCE else f"source {source or '?'}",
+                "no plan yet" if not ai.get("plan_model") else ("plan STALE" if ai.get("plan_stale") else "plan fresh")
+                + " at the last heartbeat",
+                f"model {ai['plan_model']}" if ai.get("plan_model") else "",
+                f"tools {ai['tools_source']}" if ai.get("tools_source") else "",
+                f"mcp {_ok(ai['mcp_ok'])}" if ai.get("mcp_ok") is not None else "",
+                f"{failures} failed cycle(s) in a row" if failures else "",
+                f"last error: {ai['last_error']}" if failures and ai.get("last_error") else "",
             ],
             width,
         )
@@ -931,7 +966,7 @@ def format_status(status: dict[str, Any], width: int = 100) -> str:
         [
             f"{'?' if n_pos is None else n_pos} open",
             f"{'?' if orders is None else orders} open orders",
-            "" if status.get("sources", {}).get("state_db_found") else "details need the engine state db",
+            "" if status.get("sources", {}).get("state_db_found") else _state_db_hint(status),
         ],
         width,
     )
@@ -1073,20 +1108,37 @@ def status_for_config(
     log_dir: Path = Path("logs"),
     pid_dir: Path = Path("run"),
     mode: str | None = None,
+    feed: str | None = None,
 ) -> dict[str, Any]:
     """``build_status`` with paths and limits from a ``wta.config.Config``.
 
-    ``mode`` picks the state DB; by default the mode of the latest heartbeat, else ``shadow``.
+    The state DB is ``wta.config.state_db_path(cfg, mode, feed)`` — the file the engine of that
+    mode and feed writes — when it exists, else (live feed only) the older ``resolve_state_db``
+    candidates. A synthetic-feed account has no legacy location: when its own DB is missing the
+    status shows none (``sources.state_db_expected`` names the missing file) rather than the
+    real-feed account's flags, positions and orders under the SYNTHETIC banner.
+    ``mode`` / ``feed`` default to those of the latest heartbeat (else ``shadow`` / ``live``).
     """
-    if mode is None:
-        hb = None
+    from wta.config import state_db_path  # light import; never the engine
+
+    hb = None
+    if mode is None or feed is None:
         try:
             hb = latest(Path(log_dir), "health")
         except OSError:
             hb = None
+    if mode is None:
         mode = str((hb or {}).get("mode") or "shadow")
-    state_db = resolve_state_db(cfg.data.state_sqlite_path, cfg.data.sqlite_path, mode)
-    return build_status(
+    if feed is None:
+        extra = (hb or {}).get("extra")
+        hb_feed = extra.get("feed") if isinstance(extra, dict) else None
+        feed = hb_feed if hb_feed in ("live", "synthetic") else "live"
+    configured = state_db_path(cfg, mode, feed)
+    state_db: Path | None = Path(configured) if configured != ":memory:" else None
+    if state_db is None or not state_db.is_file():
+        # the legacy locations hold real-feed accounts only: never show them for a synthetic run
+        state_db = resolve_state_db(cfg.data.state_sqlite_path, cfg.data.sqlite_path, mode) if feed == "live" else None
+    st = build_status(
         Path(log_dir),
         state_db,
         now,
@@ -1096,3 +1148,6 @@ def status_for_config(
         fee_budget_pct=cfg.risk.fee_budget_pct,
         plan_stale_s=cfg.ai.plan_stale_s,
     )
+    st["sources"]["state_db_expected"] = configured
+    st["sources"]["account"] = {"mode": mode, "feed": feed}
+    return st

@@ -11,8 +11,10 @@
 * The client is read-only by construction: ``call_tool`` only calls names on its ``allowlist``
   (``READ_ONLY_ALLOWLIST`` unless a caller passes another one; an empty or ``None`` allowlist
   allows nothing), and refuses every name that ``is_state_changing`` flags even when it is listed.
-* The API key travels only in the auth header. It is scrubbed from every error message and never
-  shown by ``repr``.
+* The API key travels only in the auth header. It is scrubbed from every error message, from every
+  string of a ``tools/call`` result (``content``, ``structuredContent``, an ``isError`` text that
+  echoes it) and never shown by ``repr``: nothing the server sends back can carry it into a prompt,
+  the LLM cache or the MCP tape.
 """
 
 from __future__ import annotations
@@ -386,7 +388,9 @@ class MCPClient:
         result = await self._rpc("tools/call", {"name": name, "arguments": arguments or {}})
         if not isinstance(result, dict):
             raise MCPError(f"tools/call {name}: the server returned no result object")
-        return result
+        # a server may echo the key (e.g. "invalid api key <key>" in an isError result): the result
+        # goes into the model's messages, the LLM cache and the tape, so it is masked here, once
+        return self._mask_obj(result)
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -401,6 +405,19 @@ class MCPClient:
 
     def _mask(self, text: str) -> str:
         return mask_secrets(text, [self._api_key]) if self._api_key else text
+
+    def _mask_obj(self, obj: Any) -> Any:
+        """``obj`` with the key masked in every string (dict keys included); numbers (Decimal) and
+        the structure stay as they are."""
+        if not self._api_key:
+            return obj
+        if isinstance(obj, str):
+            return self._mask(obj)
+        if isinstance(obj, dict):
+            return {self._mask(k) if isinstance(k, str) else k: self._mask_obj(v) for k, v in obj.items()}
+        if isinstance(obj, list | tuple):
+            return [self._mask_obj(v) for v in obj]
+        return obj
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": ACCEPT, "Content-Type": "application/json"}
@@ -434,7 +451,7 @@ class MCPClient:
             text = self._mask(f"{method}: {err.get('message') or 'JSON-RPC error'}")
             data = err.get("data")
             if data is not None:
-                data = json.loads(self._mask(canonical_json(data).decode("utf-8")))
+                data = self._mask_obj(data)
             raise MCPError(text, code=err.get("code"), data=data)
         return reply.get("result")
 

@@ -27,7 +27,14 @@ from wta.ai.offline_provider import (
     make_offline_llm,
     use_offline_provider,
 )
-from wta.ai.tools import INTERNAL_TOOL_SCHEMAS, LOCAL_TOOL_SCHEMAS, InternalTools, ToolDeps, truncate
+from wta.ai.tools import (
+    INTERNAL_TOOL_SCHEMAS,
+    LOCAL_TOOL_SCHEMAS,
+    InternalTools,
+    ToolDeps,
+    feature_view,
+    truncate,
+)
 from wta.config import Config, Settings, apply_changes, canonical_json
 from wta.features.engine import FeatureSnapshot
 from wta.models import MarketPlan
@@ -267,6 +274,22 @@ def test_disabled_strategies_are_not_enabled(cfg: Config, t0: float) -> None:
     no_s1 = apply_changes(cfg, {"strategies.s1_crossbook.enabled": False})
     plan = plan_from(OfflineRulesProvider(no_s1), {"get_features": features_payload(calm(), t0)})
     assert plan["enabled_strategies"] == ["S2"]
+
+
+def test_plan_from_the_curated_feature_view(provider: OfflineRulesProvider, t0: float) -> None:
+    """What the engine's get_features returns (short keys, JSON numbers): read through feature_rows."""
+    per = calm()
+    per["BTCUSDT"] = feat(trend=1, r24="0.03", gap="0.004")
+    per["ETHUSDT"] = feat(trend=-1, r24="-0.03", gap="-0.004")
+    snap = FeatureSnapshot(ts=t0, symbols={s: {k: Decimal(v) if isinstance(v, str) else v for k, v in f.items()}
+                                           for s, f in per.items()})
+    view = feature_view(snap, list(REGIME_SYMBOLS))
+    assert view["symbols"]["BTCUSDT"]["trend"] == 1 and "trend_flag" not in view["symbols"]["BTCUSDT"]
+    plan = plan_from(provider, {"get_features": view, "get_pnl_summary": {"drawdown_pct": "0.001"}})
+    assert plan["regimes"]["BTCUSDT"]["regime"] == "trend_up"
+    assert plan["regimes"]["ETHUSDT"]["regime"] == "trend_down"
+    assert all(r["evidence"].endswith("[features]") for r in plan["regimes"].values())
+    assert "missing_features" not in plan["risk_flags"] and "salvaged" not in plan["notes"]
 
 
 # ---------------------------------------------------------------- size-capped tool results

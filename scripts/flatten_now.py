@@ -109,6 +109,7 @@ async def flatten_now(
         i_understand_live=live,
         allow_dirty=allow_dirty,
         require_deadline=False,  # flattening sells everything now: no deadline schedule involved
+        telegram_commands=False,  # alerts yes; the running agent (if any) owns the bot's commands
     )
     engine.enable_manual_flatten(phase1_s)
     try:

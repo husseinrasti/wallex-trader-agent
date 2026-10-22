@@ -2,13 +2,25 @@
 
 Only paths listed in ``configs/llm.yaml -> reviewer.editable`` may change, only within their
 bounds, at most ``max_changes_per_review`` per review and not more often than ``cooldown_s``.
-Risk parameters are never editable (enforced twice: by the allowlist and by a hard prefix check).
-Accepted changes produce ``configs/runtime/config-<ts>.yaml`` (an overlay), a new ``config_hash``
-and a ``config_change`` event ``{old_hash, new_hash, diff, source}``.
+Risk parameters are never editable (enforced twice: by the allowlist and by a hard prefix check),
+and neither are the operator's pinned keys (``--set`` / ``--overlay``: ``pinned``).
+Accepted changes produce ``<runtime_dir>/config-<ts>.yaml`` (an overlay) and ``latest.yaml``,
+a new ``config_hash`` and a ``config_change`` event ``{old_hash, new_hash, diff, source}``.
+
+Every overlay starts with a ``# meta {...}`` line (canonical JSON: ``account``, ``mode``, ``feed``,
+``git_commit``, ``applied_ts``, ``old_hash``, ``new_hash``, ``source``): ``load_runtime_overlay``
+refuses an overlay written by another account and restarts the cooldown from ``applied_ts``.
+Both files are written atomically (temp file, fsync, rename): a crash leaves the old file or the
+new one, never a truncated one.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -18,10 +30,41 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from wta.config import CONFIG_DIR, Config, apply_changes, config_hash, get_path
+from wta.config import CONFIG_DIR, Config, apply_changes, canonical_json, config_hash, get_path
 
 FORBIDDEN_PREFIXES = ("risk.", "execution.", "markets.", "engine.initial_equity", "engine.challenge",
                       "engine.flatten", "ai.replay_strict", "llm.")
+PINNED_WHY = "pinned by the operator (--set/--overlay)"
+META_PREFIX = "# meta "
+_META_RE = re.compile(r"^# meta (\{.*\})\s*$", re.M)
+
+
+def overlay_meta(text: str) -> dict[str, Any]:
+    """The ``# meta {...}`` header of an overlay text ({} for an older file without one)."""
+    m = _META_RE.search(text)
+    if m is None:
+        return {}
+    try:
+        meta = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` so a crash leaves either the old or the new content (temp file in
+    the same directory, fsync, ``os.replace``)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 @dataclass
@@ -71,9 +114,26 @@ def _same(old: Any, new: Any) -> bool:
 
 
 class ConfigManager:
-    def __init__(self, cfg: Config, runtime_dir: Path = CONFIG_DIR / "runtime") -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        runtime_dir: Path = CONFIG_DIR / "runtime",
+        *,
+        pinned: Iterable[str] = (),
+        account: str = "",
+        mode: str = "",
+        feed: str = "",
+        git_commit: str = "",
+    ) -> None:
+        """``pinned``: the operator's ``--set`` / ``--overlay`` keys (never changed by a review).
+        ``account`` / ``mode`` / ``feed`` / ``git_commit`` label the overlays this manager writes."""
         self.cfg = cfg
-        self.runtime_dir = runtime_dir
+        self.runtime_dir = Path(runtime_dir)
+        self.pinned: frozenset[str] = frozenset(pinned)
+        self.account = account
+        self.mode = mode
+        self.feed = feed
+        self.git_commit = git_commit
         self.last_apply_ts: float | None = None
         self.overlay: dict[str, Any] = {}
 
@@ -94,6 +154,9 @@ class ConfigManager:
                 continue
             if path.startswith(FORBIDDEN_PREFIXES) or path not in rc.editable:
                 res.rejected.append({**s, "why": "path not editable"})
+                continue
+            if path in self.pinned:
+                res.rejected.append({**s, "why": PINNED_WHY})
                 continue
             if path in changes:
                 res.rejected.append({**s, "why": "duplicate path in this review"})
@@ -132,6 +195,12 @@ class ConfigManager:
         self.last_apply_ts = now
         return res
 
+    def meta(self, now: float, source: str, res: ChangeResult) -> dict[str, Any]:
+        """The ``# meta`` header of an overlay written at ``now``."""
+        return {"account": self.account or None, "mode": self.mode or None, "feed": self.feed or None,
+                "git_commit": self.git_commit or None, "applied_ts": now, "old_hash": res.old_hash,
+                "new_hash": res.new_hash, "source": source}
+
     def _write_overlay(self, now: float, source: str, res: ChangeResult) -> Path:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         nested: dict[str, Any] = {}
@@ -144,8 +213,8 @@ class ConfigManager:
         stamp = datetime.fromtimestamp(now, tz=UTC).strftime("%Y%m%dT%H%M%SZ")
         path = self.runtime_dir / f"config-{stamp}.yaml"
         header = (f"# runtime overlay written by {source} at {stamp}\n# old_hash {res.old_hash} -> new_hash "
-                  f"{res.new_hash}\n")
-        path.write_text(header + yaml.safe_dump(nested, sort_keys=True))
-        latest = self.runtime_dir / "latest.yaml"
-        latest.write_text(header + yaml.safe_dump(nested, sort_keys=True))
+                  f"{res.new_hash}\n{META_PREFIX}{canonical_json(self.meta(now, source, res)).decode()}\n")
+        text = header + yaml.safe_dump(nested, sort_keys=True)
+        atomic_write_text(path, text)
+        atomic_write_text(self.runtime_dir / "latest.yaml", text)
         return path

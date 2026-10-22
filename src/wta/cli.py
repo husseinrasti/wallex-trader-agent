@@ -20,12 +20,22 @@ Commands::
         --inject-intents FILE     JSONL intents sent through risk -> orders (shadow acceptance tests)
         --paper-balances JSON     starting paper account, e.g. '{"TMN": 3000000, "USDT": 10}'
         --synthetic-shock-at S --synthetic-shock-pct P    one-off synthetic crash (P = -0.08 is -8 %)
+        --no-runtime-overlay      do not re-apply the reviewer's <runtime-dir>/latest.yaml at startup
+        --runtime-dir DIR         the reviewer's overlay directory (default configs/runtime/<account>:
+                                  live, shadow or shadow_synthetic; one per account, like the state DB)
     reset-kill --reason TEXT  clear the kill-switch by hand (writes a reset_kill event); --mode
                               shadow|live and --feed live|synthetic pick the state DB (default: the
                               one that is killed)
+    status [--mode] [--feed] [--log-dir] [--json]   one-screen summary (latest heartbeat, state DB,
+                              plan, AI source, processes); read-only
+    tui [--mode] [--feed] [--log-dir] [--once]      rich terminal dashboard (read-only process)
+    plan [--mode shadow] [--feed live|synthetic]    ONE analyst cycle on the shadow account's data,
+                              prints the plan JSON (nothing traded, nothing stored but the LLM cache)
+    alert TEXT                one Telegram message (a no-op without TELEGRAM_* and
+                              alerts.telegram_enabled)
     logs check                validate logs/*.jsonl against their schemas
     db vacuum                 compact the SQLite database
-    backtest, replay, report, tui, status, export     later PRDs (exit 3)
+    backtest, replay, report, export     later PRDs (exit 3)
 
 Options such as ``--set key=value`` go after the command: ``wta run --mode shadow --set a.b=1``.
 
@@ -63,7 +73,15 @@ from rich.console import Console
 from rich.table import Table
 
 from wta import engine as engine_mod
-from wta.config import Config, Settings, load_config, load_settings, mask_secrets, parse_overrides
+from wta.config import (
+    Config,
+    Settings,
+    canonical_json,
+    load_config,
+    load_settings,
+    mask_secrets,
+    parse_overrides,
+)
 from wta.data.collector import RestPoller, default_ws_factory, recordable_symbols, run_recorder
 from wta.data.store import Store
 from wta.engine import (
@@ -90,8 +108,6 @@ PLACEHOLDERS: dict[str, tuple[str, str]] = {
     "backtest": ("PRD-05", "backtest over recorded/historical data"),
     "replay": ("PRD-05", "re-run recorded inputs and cached LLM answers"),
     "report": ("PRD-05", "backtest and shadow reports"),
-    "tui": ("PRD-06", "terminal dashboard"),
-    "status": ("PRD-06", "one-screen summary of the latest heartbeat"),
     "export": ("PRD-06", "copy logs and reports into deliverables/"),
 }
 
@@ -490,6 +506,13 @@ def _run_options(args: argparse.Namespace) -> dict[str, Any] | str:
         options["feed"] = args.feed
     if args.overlay:
         options["overlays"] = [str(p) for p in args.overlay]
+    if getattr(args, "no_runtime_overlay", False):
+        options["runtime_overlay"] = False
+    if getattr(args, "runtime_dir", None):
+        options["runtime_dir"] = args.runtime_dir
+    pinned = _pinned_keys(args)
+    if pinned:
+        options["pinned_keys"] = pinned
     if args.inject_intents:
         try:
             options["injected"] = load_injected_intents(args.inject_intents)
@@ -503,6 +526,18 @@ def _run_options(args: argparse.Namespace) -> dict[str, Any] | str:
     if shock[0] is not None:
         options["synthetic_shock"] = (float(shock[0]), float(shock[1]))
     return options
+
+
+def _pinned_keys(args: argparse.Namespace) -> list[str]:
+    """Config keys the operator set by hand (``--set`` and ``--overlay``): the reviewer's runtime
+    overlay never overrides them at startup."""
+    keys = set(parse_overrides(getattr(args, "set", None) or []))
+    for path in getattr(args, "overlay", None) or []:
+        try:
+            keys.update(overlay_pairs(yaml.safe_load(Path(path).read_text()) or {}))
+        except (OSError, ValueError, yaml.YAMLError):
+            continue  # load_cli_config already refused a broken overlay
+    return sorted(keys)
 
 
 def cmd_run(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
@@ -536,7 +571,7 @@ def cmd_run(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
         return EXIT_CANNOT_RUN
 
 
-def run_log_dir(mode: str, given: str | None) -> str:
+def run_log_dir(mode: str, given: str | None = None) -> str:
     """``--log-dir`` of ``wta run``: as given, else ``logs`` for live and ``logs/shadow`` for shadow
     (the ``make shadow`` layout): a shadow engine next to live never appends to the live logs."""
     if given:
@@ -615,6 +650,115 @@ def cmd_reset_kill(args: argparse.Namespace, cfg: Config, settings: Settings) ->
     print(f"  reset_kill event written to {Path(args.log_dir) / 'events.jsonl'} and {path}")
     print("  a running engine applies it on its next tick; otherwise the next start does")
     return EXIT_OK
+
+
+# ---------------------------------------------------------------- status / tui / plan / alert
+
+
+def _feed_of_heartbeat(log_dir: Path) -> tuple[str | None, str | None]:
+    """(mode, feed) of the newest heartbeat in ``log_dir``, if any."""
+    from wta.logging_.health_log import latest
+
+    try:
+        hb = latest(log_dir, "health") or {}
+    except OSError:
+        return None, None
+    extra = hb.get("extra") if isinstance(hb.get("extra"), dict) else {}
+    feed = extra.get("feed")
+    return hb.get("mode"), feed if feed in ("live", "synthetic") else None
+
+
+def _heartbeat_ts(log_dir: Path) -> float:
+    """``ts`` of the newest heartbeat in ``log_dir`` (-inf when there is none)."""
+    from wta.logging_.health_log import latest
+    from wta.utils.timeutil import parse_iso
+
+    try:
+        hb = latest(log_dir, "health") or {}
+        ts = parse_iso(hb.get("ts")) if isinstance(hb.get("ts"), str) else None
+    except (OSError, ValueError):
+        ts = None
+    return float("-inf") if ts is None else ts
+
+
+def _default_ops_dir(mode: str | None, given: str | None) -> Path:
+    """``--log-dir`` as given; with ``--mode`` the ``wta run`` default of that mode; with neither,
+    the live (``logs``) or the shadow (``logs/shadow``) directory, whichever holds the newer
+    heartbeat (shadow when neither has one): a live engine is never hidden behind the shadow one."""
+    if given or mode:
+        return Path(run_log_dir(mode or "shadow", given))
+    live, shadow = Path(run_log_dir("live")), Path(run_log_dir("shadow"))
+    return live if _heartbeat_ts(live) > _heartbeat_ts(shadow) else shadow
+
+
+def _ops_paths(args: argparse.Namespace, cfg: Config) -> tuple[Path, str, str, Path | None]:
+    """(log dir, mode, feed, state DB) for ``status`` / ``tui``: ``--log-dir`` as given, else the
+    ``wta run`` default of ``--mode``, else the live or shadow directory with the newer heartbeat
+    (``_default_ops_dir``); mode and feed as given, else those of the latest heartbeat there (else
+    shadow / live); the state DB of that mode and feed (``config.state_db_path``)."""
+    mode = args.mode
+    log_dir = _default_ops_dir(mode, args.log_dir)
+    hb_mode, hb_feed = _feed_of_heartbeat(log_dir)
+    mode = mode or (hb_mode if hb_mode in ("shadow", "live") else "shadow")
+    feed = args.feed or hb_feed or "live"
+    path = state_db_path(cfg, mode, feed)
+    return log_dir, mode, feed, None if path == ":memory:" else Path(path)
+
+
+def cmd_status(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
+    from wta.status import format_status, status_for_config
+
+    log_dir, mode, feed, _db = _ops_paths(args, cfg)
+    st = status_for_config(cfg, time.time(), log_dir=log_dir, pid_dir=Path(args.pid_dir), mode=mode, feed=feed)
+    if args.json:
+        print(canonical_json(st).decode())
+        return EXIT_OK
+    width = args.width or (_console().width if sys.stdout.isatty() else 100)
+    print(mask_secrets(format_status(st, width=width), settings.secret_values()))
+    return EXIT_OK
+
+
+def cmd_tui(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
+    from wta.dashboard import tui
+
+    log_dir, _mode, _feed, state_db = _ops_paths(args, cfg)
+    console = Console(width=args.width) if args.width else None
+    return tui.run(log_dir, state_db, refresh_s=args.refresh, once=args.once, cfg=cfg, console=console)
+
+
+def cmd_plan(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
+    """One analyst cycle (``engine.plan_once``); prints ``{"plan", "analyst", "ai_source", ...}``."""
+    log_dir = run_log_dir("shadow", args.log_dir)
+    try:
+        out = asyncio.run(
+            engine_mod.plan_once(
+                cfg, settings, feed=args.feed, log_dir=log_dir, warmup_s=args.warmup,
+                runtime_overlay=not args.no_runtime_overlay, pinned_keys=_pinned_keys(args),
+                runtime_dir=args.runtime_dir,
+            )
+        )
+    except (LiveGuardError, EngineLockError) as exc:
+        _err(f"{exc} (the running engine's latest plan: wta status)")
+        return EXIT_CANNOT_RUN
+    print(mask_secrets(canonical_json(out).decode(), settings.secret_values()))
+    return EXIT_OK if out.get("plan") is not None else EXIT_FAILED
+
+
+def cmd_alert(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
+    """``wta alert TEXT``: one Telegram message; a no-op (exit 0) without TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID and ``alerts.telegram_enabled``."""
+    from wta.utils.telegram import send_alert_cli
+
+    text = " ".join(args.text).strip()
+    if not text:
+        _err("nothing to send")
+        return EXIT_CANNOT_RUN
+    configured = bool(settings.telegram_bot_token.get_secret_value() and settings.telegram_chat_id.strip())
+    if not (configured and cfg.alerts.telegram_enabled):
+        print("telegram: not configured (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, alerts.telegram_enabled); nothing sent",
+              file=sys.stderr)
+        return EXIT_OK
+    return EXIT_OK if send_alert_cli(settings, text, prefix="[wta]") else EXIT_FAILED
 
 
 # ---------------------------------------------------------------- logs / db / placeholders
@@ -773,6 +917,18 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="P",
         help="synthetic shock size as a fraction (-0.08 = -8 %%) of USDTTMN and every coin mid",
     )
+    p.add_argument(
+        "--no-runtime-overlay",
+        action="store_true",
+        help="do not re-apply the reviewer's <runtime-dir>/latest.yaml at startup",
+    )
+    p.add_argument(
+        "--runtime-dir",
+        default=None,
+        metavar="DIR",
+        help="where the reviewer writes (and startup reads) its overlays "
+             "(default configs/runtime/<account>: live, shadow or shadow_synthetic)",
+    )
 
     p = add("reset-kill", cmd_reset_kill, "clear the kill-switch by hand (writes a reset_kill event)")
     p.add_argument("--reason", required=True, help="why the kill-switch is reset (logged)")
@@ -789,6 +945,40 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="the feed of that engine's account (synthetic runs keep their own state DB)",
     )
+
+    def ops_options(q: argparse.ArgumentParser) -> None:
+        q.add_argument("--mode", choices=("shadow", "live"), default=None,
+                       help="engine mode (default: the latest heartbeat's, else shadow)")
+        q.add_argument("--feed", choices=("live", "synthetic"), default=None,
+                       help="engine feed (default: the latest heartbeat's, else live)")
+        q.add_argument("--log-dir", default=None,
+                       help="engine log directory (default: logs for live, logs/shadow for shadow)")
+
+    p = add("status", cmd_status, "one-screen summary of the engine (latest heartbeat, state DB, plan, AI)")
+    ops_options(p)
+    p.add_argument("--pid-dir", default="run", help="directory of *.pid files (default run)")
+    p.add_argument("--width", type=int, default=None, help="text width (default: the terminal's)")
+    p.add_argument("--json", action="store_true", help="print the status as JSON")
+
+    p = add("tui", cmd_tui, "terminal dashboard (read-only, separate process)")
+    ops_options(p)
+    p.add_argument("--refresh", type=float, default=2.0, help="seconds between refreshes (default 2)")
+    p.add_argument("--once", action="store_true", help="print one frame and exit")
+    p.add_argument("--width", type=int, default=None, help="screen width (default: the terminal's; 200 fits all)")
+
+    p = add("plan", cmd_plan, "ONE analyst cycle on the shadow account's data; prints the plan JSON")
+    p.add_argument("--mode", choices=("shadow",), default="shadow", help="shadow only (nothing is traded)")
+    p.add_argument("--feed", choices=("live", "synthetic"), default="live", help="market data source")
+    p.add_argument("--log-dir", default=None, help="log directory whose llm_cache is used (default logs/shadow)")
+    p.add_argument("--warmup", type=float, default=15.0, help="seconds to wait for the regime books (default 15)")
+    p.add_argument("--no-runtime-overlay", action="store_true", help="ignore the reviewer's <runtime-dir>/latest.yaml")
+    p.add_argument("--runtime-dir", default=None, metavar="DIR",
+                   help="reviewer overlay directory (default configs/runtime/<account>)")
+    _add_overlay_option(p)
+
+    p = add("alert", cmd_alert, "send one Telegram message (no-op without TELEGRAM_* and alerts.telegram_enabled)")
+    p.add_argument("text", nargs="+", help="message text (put it after -- when it starts with a dash)")
+    _add_overlay_option(p)  # scripts/run_forever.sh forwards the wrapped command's --set / --overlay
 
     p = add("logs", None, "log tools")
     logs_sub = p.add_subparsers(dest="logs_command", required=True, metavar="check")

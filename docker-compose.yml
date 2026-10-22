@@ -26,13 +26,26 @@ services:
       WTA_MODE: ${WTA_MODE:-shadow}
     command: ["sh", "-c", "python -m wta run --mode ${WTA_MODE:-shadow} --log-dir logs/${WTA_MODE:-shadow}"]
     healthcheck:
-      # unhealthy when no heartbeat was written in the last 3 minutes (PRD-06 §2 watchdog)
-      test: ["CMD", "python", "-c", "import os,sys,time,glob; f=sorted(glob.glob('logs/*/health-*.jsonl')); sys.exit(0 if f and time.time()-os.path.getmtime(f[-1])<180 else 1)"]
+      # unhealthy when THIS agent (logs/$WTA_MODE, its own --log-dir) wrote no heartbeat in the last
+      # 3 minutes (PRD-06 §2 watchdog); the newest mtime counts, never another mode's directory
+      test: ["CMD", "python", "-c", "import glob,os,sys,time; f=glob.glob('logs/'+os.environ.get('WTA_MODE','shadow')+'/health-*.jsonl'); sys.exit(0 if f and time.time()-max(map(os.path.getmtime,f))<180 else 1)"]
       interval: 60s
       timeout: 10s
       retries: 3
+      start_period: 120s
 
+  # optional second engine next to a live agent: alerts yes, Telegram commands no (only one
+  # engine per bot may poll /status /pause /resume /kill)
   shadow:
     <<: *common
     profiles: ["shadow"]
-    command: ["python", "-m", "wta", "run", "--mode", "shadow", "--log-dir", "logs/shadow"]
+    environment:
+      WTA_MODE: shadow
+    command: ["python", "-m", "wta", "run", "--mode", "shadow", "--log-dir", "logs/shadow",
+              "--set", "alerts.telegram_commands_enabled=false"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import glob,os,sys,time; f=glob.glob('logs/'+os.environ.get('WTA_MODE','shadow')+'/health-*.jsonl'); sys.exit(0 if f and time.time()-max(map(os.path.getmtime,f))<180 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s

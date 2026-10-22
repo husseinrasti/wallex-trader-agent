@@ -172,6 +172,53 @@ def _to_gemini(messages: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, l
     return system, contents
 
 
+# Gemini function declarations take an OpenAPI-3 subset of JSON Schema: unknown keywords such as
+# ``additionalProperties``, ``$defs`` or ``uniqueItems`` make the whole request fail with HTTP 400
+# ("Unknown name ... at tools[0].function_declarations[0].parameters"), and an OBJECT needs at least
+# one property. Only these keywords are sent (a real shadow run hit exactly that 400 on fallback).
+GEMINI_SCHEMA_KEYS = frozenset({
+    "type", "format", "description", "nullable", "enum", "properties", "required", "items", "minimum", "maximum",
+    "minItems", "maxItems", "minLength", "maxLength", "pattern", "anyOf", "title", "minProperties", "maxProperties",
+})
+
+
+def gemini_schema(schema: Any) -> Any:
+    """A JSON-schema tool parameter block reduced to what Gemini's ``functionDeclarations`` accept:
+    unsupported keywords dropped (recursively), ``required`` limited to the listed properties.
+    The model sees the same names, types, enums and bounds; only the strictness flags are gone
+    (our dispatcher still rejects unknown arguments)."""
+    if isinstance(schema, list):
+        return [gemini_schema(s) for s in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key not in GEMINI_SCHEMA_KEYS:
+            continue
+        if key == "properties" and isinstance(value, dict):
+            out[key] = {name: gemini_schema(sub) for name, sub in value.items()}
+        elif key in ("items", "anyOf"):
+            out[key] = gemini_schema(value)
+        else:
+            out[key] = value
+    if isinstance(out.get("required"), list):
+        props = out.get("properties") or {}
+        out["required"] = [r for r in out["required"] if r in props]
+        if not out["required"]:
+            del out["required"]
+    return out
+
+
+def gemini_function(tool: dict[str, Any]) -> dict[str, Any]:
+    """One OpenAI-shaped tool -> a Gemini function declaration (no ``parameters`` for a tool
+    without arguments: Gemini refuses an OBJECT with empty ``properties``)."""
+    decl: dict[str, Any] = {"name": tool["name"], "description": tool.get("description", "")}
+    params = gemini_schema(tool.get("parameters") or {})
+    if isinstance(params, dict) and params.get("properties"):
+        decl["parameters"] = params
+    return decl
+
+
 class GeminiProvider:
     name = "gemini"
 
@@ -192,9 +239,7 @@ class GeminiProvider:
         if system:
             body["systemInstruction"] = system
         if tools:
-            body["tools"] = [{"functionDeclarations": [
-                {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}
-                for t in tools]}]
+            body["tools"] = [{"functionDeclarations": [gemini_function(t) for t in tools]}]
         elif json_mode:
             body["generationConfig"]["responseMimeType"] = "application/json"
         t0 = time.monotonic()

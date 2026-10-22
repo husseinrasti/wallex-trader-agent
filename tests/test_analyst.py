@@ -367,7 +367,8 @@ async def test_invalid_json_then_fixed_on_retry(cfg: Config, tmp_path: Path) -> 
     retry_msgs = provider.calls[1]["messages"]
     assert retry_msgs[-2] == {"role": "assistant", "content": "I think the market is calm."}
     assert retry_msgs[-1]["role"] == "user" and retry_msgs[-1]["content"].startswith("Your JSON was invalid:")
-    assert retry_msgs[-1]["content"].endswith(FIX_JSON.split("\n")[1])
+    assert retry_msgs[-1]["content"].endswith("is closed before `enabled_strategies`.")
+    assert FIX_JSON.split("\n")[1].startswith("Fix the JSON. Return only the corrected JSON object")
     assert analyst.last_record is not None and analyst.last_record["json_retry"] is True
     assert plan.latency_ms == 22  # both calls counted
     assert plan.prompt_hash == provider_key(provider, 0, tmp_path / "c")
@@ -379,6 +380,25 @@ def provider_key(provider: FakeProvider, i: int, cache_dir: Path) -> str:
 
     call = provider.calls[i]
     return cache_key("fake", "fake-model", call["messages"], call["tools"], 0.0)
+
+
+async def test_keys_written_inside_regimes_get_a_targeted_retry(cfg: Config, tmp_path: Path) -> None:
+    """The slip a real model made in a shadow run: ``regimes`` not closed before the other keys."""
+    broken = copy.deepcopy(PLAN_EXAMPLE)
+    for key in ("enabled_strategies", "s1_margin_min_pct", "size_multiplier", "usdt_target_share", "risk_flags",
+                "notes"):
+        broken["regimes"][key] = broken.pop(key)
+
+    def script(messages: Any, tools: Any, n: int) -> Any:
+        return json.dumps(broken) if n == 1 else plan_json()
+
+    provider = FakeProvider(script)
+    analyst = make_analyst(cfg, make_llm(tmp_path / "c", provider))
+    plan = await analyst.run(STATE)
+    assert plan is not None, analyst.last_error
+    retry = provider.calls[1]["messages"][-1]["content"]
+    assert "are inside `regimes`: close `regimes` after SOLUSDT" in retry
+    assert "enabled_strategies, notes, risk_flags, s1_margin_min_pct, size_multiplier, usdt_target_share" in retry
 
 
 async def test_invalid_twice_returns_none(cfg: Config, tmp_path: Path) -> None:
@@ -427,7 +447,7 @@ async def test_tool_loop_executes_tools_and_stops_at_cap(cfg: Config, tmp_path: 
     assert tool_msg["tool_call_id"] == "c1b" and tool_msg["name"] == "get_health"
     assert json.loads(tool_msg["content"]) == HEALTH
     features = json.loads(msgs[3]["content"])
-    assert list(features["symbols"]) == ["BTCUSDT"] and features["symbols"]["BTCUSDT"]["mid"] == "82877.08"
+    assert sorted(features["symbols"]) == ["BTCUSDT", "USDTTMN"] and features["symbols"]["BTCUSDT"]["mid"] == 82877.1
 
     assert plan.tools_used == ["get_features", "get_health"]
     assert plan.tools_source == "local"
@@ -567,11 +587,13 @@ def test_first_user_message_is_deterministic(cfg: Config, tmp_path: Path) -> Non
                          "last_plan", "recent_events"}
     assert data["now_utc"] == "2026-10-22T10:00:00.000Z" and data["last_plan"] is None
     assert data["pnl_summary"] == PNL and data["health"] == HEALTH
-    btc = data["features"]["symbols"]["BTCUSDT"]
-    assert btc == {"mid": "82877.08", "spread_pct": "0.0007", "ret_15m": "-0.004", "ret_1h": "0.009",
-                   "trend_flag": 1}  # compact: only the selected keys, None dropped
-    assert data["features"]["cross"]["BTC"] == {"dev_mid_pct": "0.0011", "dev_zscore": "1.2",
-                                                "edge_tmn_cheap_pct": "-0.002"}
+    features = data["features"]
+    assert features["view"] == "features" and set(features["keys"]) >= {"mid", "spread", "ret_15m", "dev"}
+    btc = features["symbols"]["BTCUSDT"]
+    assert btc == {"mid": 82877.1, "spread": 0.0007, "ret_15m": -0.004, "ret_1h": 0.009,
+                   "trend": 1}  # curated: key fields only, short names, None dropped
+    assert features["cross"]["BTC"] == {"dev": 0.0011, "z": 1.2}  # no lock-in cost -> no net edge
+    assert sorted(features["symbols"]) == ["BTCUSDT", "ETHUSDT", "SOLUSDT", "USDTTMN"]
 
     assert a.user_message(STATE, "move:USDTTMN", T0) != m1
     assert a.user_message(STATE, "scheduled", T0 + 1) != m1

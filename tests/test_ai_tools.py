@@ -20,6 +20,10 @@ from wta.ai.tools import (
     LOCAL_TOOL_SCHEMAS,
     InternalTools,
     ToolDeps,
+    feature_rows,
+    feature_view,
+    is_feature_view,
+    round_sig,
     to_jsonable,
     truncate,
 )
@@ -178,12 +182,97 @@ def test_decimals_and_nested_values_become_strings(tools: InternalTools) -> None
 
 def test_get_features_filters_and_compacts(tools: InternalTools) -> None:
     out = tools.call("get_features", {"symbols": [SYM, "NOPEUSDT"]})
-    assert sorted(out["symbols"]) == [SYM]
-    assert out["symbols"][SYM]["mid"] == "82877.08"
-    assert out["symbols"][SYM]["ema20_15m"] is None
-    assert out["cross"] == {"BTC": {"dev_mid_pct": "-0.00123", "dev_zscore": None}}
-    assert out["dollar"] == {"mid": "101500"}
-    assert list(tools.call("get_features")["symbols"]) == [SYM, "ETHUSDT"]  # all symbols, sorted
+    assert is_feature_view(out) and out["view"] == "features"
+    assert out["ts"] == "2026-10-22T10:00:00.000Z"
+    assert sorted(out["symbols"]) == [SYM]  # USDTTMN is always included, but has no features here
+    # short keys, JSON numbers, None dropped (ema20_15m and bars_15m are not key fields)
+    assert out["symbols"][SYM] == {"mid": 82877.1, "spread": 0.000774, "trend": 1}
+    assert out["cross"] == {"BTC": {"dev": -0.00123}}  # dev_zscore None dropped
+    assert out["unknown_symbols"] == ["NOPEUSDT"]
+    assert "brief_rows" not in out  # asked rows carry every key
+    assert sorted(tools.call("get_features")["symbols"]) == ["BTCUSDT", "ETHUSDT"]  # all symbols
+    # read back under the FeatureSnapshot field names (offline provider, analyst triggers)
+    assert feature_rows(out) == {SYM: {"mid": 82877.1, "spread_pct": 0.000774, "trend_flag": 1}}
+
+
+def test_round_sig_gives_plain_json_numbers() -> None:
+    assert round_sig(Decimal("82877.0812345")) == 82877.1
+    assert round_sig(Decimal("0.000123456789")) == 0.000123457
+    assert round_sig(Decimal("9234567890")) == 9234570000 and isinstance(round_sig(Decimal("9234567890")), int)
+    assert round_sig(Decimal("-0.0040000")) == -0.004
+    assert round_sig(1) == 1 and round_sig(0) == 0 and round_sig(Decimal("0E-10")) == 0
+    for bad in (None, True, "abc", Decimal("NaN"), float("inf")):
+        assert round_sig(bad) is None
+
+
+def _full_snapshot(cfg: Config) -> FeatureSnapshot:
+    """Every key field present for the whole default watchlist and every S1 coin, with long, hard to
+    round values (Decimal divisions): the largest view the engine can produce."""
+    symbols: dict[str, dict[str, Any]] = {}
+    for i, sym in enumerate(cfg.markets.watchlist):
+        mid = Decimal(123456789 + 7919 * i) / 7 if sym.endswith("TMN") else Decimal(98765 + 13 * i) / 7
+        third = Decimal(1) / Decimal(3 + i)
+        symbols[sym] = {
+            "bid": mid * Decimal("0.9995"), "ask": mid * Decimal("1.0005"), "mid": mid,
+            "spread_pct": third / 977, "ret_15m": -third / 71, "ret_1h": third / 53, "ret_24h": -third / 17,
+            "atr_15m_pct": third / 313, "atr_15m_pct_median_24h": third / 317, "ema_gap_pct": -third / 419,
+            "trend_flag": -1, "vol_ratio_15m": third * 7, "book_age_s": Decimal("12.345"),
+            "realized_vol_1h_pct": third / 99, "ema20_15m": mid, "ema60_15m": mid, "bars_15m": 97,
+        }
+    cross = {
+        coin: {"dev_mid_pct": -Decimal(1) / (701 + j), "dev_zscore": -Decimal(13) / (7 + j),
+               "edge_tmn_cheap_pct": -Decimal(1) / (307 + j), "edge_usdt_cheap_pct": -Decimal(1) / (409 + j),
+               "cost_lockin_tmn_cheap": Decimal("0.0043"), "cost_lockin_usdt_cheap": Decimal("0.0043"),
+               "u_mid": Decimal("101250.5"), "dev_samples": 900}
+        for j, coin in enumerate(cfg.strategies.s1_crossbook.coins)
+    }
+    return FeatureSnapshot(ts=float(T0), symbols=symbols, cross=cross, dollar=dict(symbols["USDTTMN"]))
+
+
+def test_default_watchlist_features_fit_the_tool_cap(cfg: Config, fake: Fake) -> None:
+    assert len(cfg.markets.watchlist) == 21 and len(cfg.strategies.s1_crossbook.coins) == 10
+    fake.features = _full_snapshot(cfg)
+    tools = InternalTools(fake.deps(cfg))
+    out = tools.call("get_features")
+    assert size(out) <= cfg.ai.tool_result_max_bytes == 4096
+    assert "truncated" not in out and "omitted_symbols" not in out and "significant_digits" not in out
+    assert sorted(out["symbols"]) == sorted(cfg.markets.watchlist)  # every book, 6 significant digits
+    assert sorted(out["cross"]) == sorted(cfg.strategies.s1_crossbook.coins)
+    full = {"mid", "spread", "ret_15m", "ret_1h", "ret_24h", "atr", "atr_med", "ema_gap", "trend", "vol_x", "age_s"}
+    for sym in ("USDTTMN", "BTCUSDT", "ETHUSDT", "SOLUSDT"):
+        assert set(out["symbols"][sym]) == full
+    assert sorted(out["brief_rows"]) == sorted(set(cfg.markets.watchlist) - {"USDTTMN", "BTCUSDT", "ETHUSDT",
+                                                                            "SOLUSDT"})
+    assert set(out["symbols"]["XRPTMN"]) == {"mid", "spread", "ret_1h", "ret_24h"}
+    assert set(out["cross"]["BTC"]) == {"dev", "z", "net_tmn_cheap", "net_usdt_cheap"}
+    assert out["lockin_cost"] == {"tmn_cheap": 0.0043, "usdt_cheap": 0.0043}
+    btc = fake.features.cross["BTC"]
+    assert out["cross"]["BTC"]["net_tmn_cheap"] == round_sig(btc["edge_tmn_cheap_pct"] - btc["cost_lockin_tmn_cheap"])
+    # the four regime symbols (what the offline provider asks for) are far below the cap
+    regime = tools.call("get_features", {"symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "USDTTMN"]})
+    assert size(regime) < 2048 and sorted(regime["cross"]) == ["BTC", "ETH", "SOL"]
+    # asking for every book (every key) still fits: brief rows first, then fewer digits, never a cut
+    every = tools.call("get_features", {"symbols": list(cfg.markets.watchlist)})
+    assert size(every) <= 4096 and "truncated" not in every and "omitted_symbols" not in every
+    # the analyst's first message (4 x the cap, with the key legend) carries every key of every book
+    first = feature_view(fake.features, cfg.markets.watchlist, max_bytes=4 * 4096, legend=True)
+    assert size(first) <= 4 * 4096 and "brief_rows" not in first and set(first["keys"]) >= full
+
+
+def test_feature_view_degrades_by_dropping_rows_never_by_cutting(cfg: Config) -> None:
+    snap = _full_snapshot(cfg)
+    view = feature_view(snap, max_bytes=2600)
+    assert size(view) <= 2600 and view["significant_digits"] == 4
+    assert view["omitted_symbols"] and set(view["omitted_symbols"]).isdisjoint(view["symbols"])
+    assert {"USDTTMN", "BTCUSDT", "ETHUSDT", "SOLUSDT"} <= set(view["symbols"])  # regime rows are kept
+    assert is_feature_view(view) and not is_feature_view({"symbols": {}}) and not is_feature_view(None)
+
+
+def test_features_without_values_are_listed_not_padded(cfg: Config) -> None:
+    snap = FeatureSnapshot(ts=float(T0), symbols={"BTCUSDT": {"mid": None, "trend_flag": 0}, "ETHUSDT": {}})
+    view = feature_view(snap)
+    assert view["symbols"] == {"BTCUSDT": {"trend": 0}} and view["no_data"] == ["ETHUSDT"]
+    assert "lockin_cost" not in view and view["cross"] == {}
 
 
 @pytest.mark.parametrize(("n", "expected"), [(None, 20), (5, 5), (500, 50), (0, 1), (-3, 1), ("7", 7)])

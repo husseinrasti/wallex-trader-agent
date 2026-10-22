@@ -31,7 +31,8 @@ increase risk beyond them, so focus on judging the market well and explaining it
   that market `trend_up` with confidence ≥ {s3_conf}.
 
 ## What you output
-Return **only** a JSON object (no prose around it) with exactly these keys:
+Return **only** a JSON object (no prose around it) with exactly these keys — close every object and array (in particular
+close `regimes` before `enabled_strategies`) and check that it parses before you answer:
 ```json
 {schema}
 ```

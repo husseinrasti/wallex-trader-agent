@@ -31,11 +31,11 @@ Legend: [x] done and verified · [~] done offline, needs the live API to verify 
 - [x] Half-size live config (`configs/live_halfsize.yaml`, `run --overlay`) + `docs/GO_LIVE_CHECKLIST.md`; tag `v0.3-strategies`
 
 ## Phase 4 — AI layer (PRD-04)
-- [ ] Plan every 5 min in shadow with notes; MCP tools when reachable
-- [ ] Network loss degrades to rules-only
-- [ ] `wta replay` reproduces plans from cache with 0 network calls
-- [ ] Reviewer applies <= 2 bounded changes; config_hash changes
-- [ ] ARCHITECTURE "How AI is used" with a real plan; tag `v0.4-ai`
+- [x] Plan every slow-loop interval in shadow with notes: 15 real OpenRouter plans (gpt-5.4-mini) in 900 s at a 60 s interval (synthetic feed; docs/REPORTS/phase4_acceptance.md). [~] MCP tools on the real feed pending API reachability
+- [x] Provider failure / network loss degrades to rules-only (`llm_ok=false`, no exceptions)
+- [x] Plans replay from the cache with 0 provider calls (`python -m wta.ai.replay`: 15/15 LLM, 6/6 offline). Full engine replay: Phase 5
+- [x] Reviewer applies <= 2 bounded changes; config_hash of later decisions changes (tests + 2 real reviewer journal entries)
+- [x] ARCHITECTURE "How AI is used" with a real plan; tag `v0.4-ai`
 
 ## Phase 5 — Backtest, survey, replay (PRD-05)
 - [ ] Survey report

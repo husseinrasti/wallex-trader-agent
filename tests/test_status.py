@@ -710,8 +710,26 @@ def test_status_for_config(populated: Fixture) -> None:
             "risk": {"fee_budget_pct": "0.02"},
         }
     )
+    # the heartbeat is a shadow engine on the SYNTHETIC feed: its account is shadow_synthetic. The
+    # fixture's state_shadow.sqlite is the real-feed shadow account (paused, open orders): it must
+    # never be shown under the synthetic banner (nor the recorder's market DB)
     st = status_for_config(cfg, NOW, log_dir=populated.log_dir, pid_dir=populated.pid_dir)
-    assert st["sources"]["state_db"] == str(populated.state_db)  # mode "shadow" from the heartbeat
+    expected = populated.root / "data" / "state_shadow_synthetic.sqlite"
+    assert st["engine"]["synthetic"] is True
+    assert st["sources"]["state_db"] is None and st["sources"]["state_db_found"] is False
+    assert st["sources"]["state_db_expected"] == str(expected)
+    assert st["sources"]["account"] == {"mode": "shadow", "feed": "synthetic"}
+    assert st["positions"] == []  # nothing from the real-feed account
+    assert f"details need the engine state db ({expected}: not found)" in format_status(st, width=400)
+
+    populated.state_db.rename(expected)  # now it is the synthetic account's own DB
+    st = status_for_config(cfg, NOW, log_dir=populated.log_dir, pid_dir=populated.pid_dir)
+    assert st["sources"]["state_db"] == str(expected)  # mode and feed from the heartbeat
     assert st["sources"]["market_db"] == str(populated.market_db)
     assert st["equity"]["equity_tmn"] == "5050000"
     assert st["plan"]["model_text"] == OFFLINE_TEXT
+
+    # the live feed keeps the legacy candidates (data.state_sqlite_path of the mode)
+    expected.rename(populated.state_db)
+    st = status_for_config(cfg, NOW, log_dir=populated.log_dir, pid_dir=populated.pid_dir, feed="live")
+    assert st["sources"]["state_db"] == str(populated.state_db)

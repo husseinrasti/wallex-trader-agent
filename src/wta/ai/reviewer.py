@@ -40,7 +40,7 @@ from wta.ai.llm_client import LLMClient, LLMResponse, Route
 from wta.ai.tools import to_jsonable, truncate
 from wta.config import Config, canonical_json, config_hash, get_path, mask_secrets
 from wta.logging_.decision_log import merge_decisions
-from wta.utils.timeutil import Clock, iso, parse_iso
+from wta.utils.timeutil import Clock, iso, parse_iso, utc_day
 
 log = logging.getLogger(__name__)
 
@@ -134,9 +134,11 @@ def reviewer_route(cfg: Config) -> Route:
     return Route(cfg.llm.reviewer.provider, cfg.llm.reviewer.model or "")
 
 
-def editable_paths(cfg: Config) -> list[str]:
-    """Reviewer-editable paths, sorted; forbidden prefixes (risk.* etc.) are never offered."""
-    return sorted(p for p in cfg.llm.reviewer.editable if not p.startswith(FORBIDDEN_PREFIXES))
+def editable_paths(cfg: Config, pinned: Iterable[str] = ()) -> list[str]:
+    """Reviewer-editable paths, sorted; forbidden prefixes (risk.* etc.) and the operator's pinned
+    keys (``--set`` / ``--overlay``) are never offered."""
+    skip = frozenset(pinned)
+    return sorted(p for p in cfg.llm.reviewer.editable if not p.startswith(FORBIDDEN_PREFIXES) and p not in skip)
 
 
 def _num_str(v: Any) -> str:
@@ -376,10 +378,13 @@ class PostTradeReviewer:
         *,
         route: Route | None = None,
         secrets: list[str] | None = None,
+        daily_budget: int | None = None,
     ) -> None:
         """``route=None`` uses the client's primary route with its fallback; pass
         ``reviewer_route(cfg)`` to pin the reviewer model (no fallback then). ``secrets`` are masked
-        in everything the reviewer writes or logs (defence in depth; prompts contain none)."""
+        in everything the reviewer writes or logs (defence in depth; prompts contain none).
+        ``daily_budget``: hourly reviews per UTC day that may reach the model
+        (``ai.max_reviewer_calls_per_day``; None: unlimited); the final review always runs."""
         self.cfg = cfg
         self.llm = llm
         self.config_manager = config_manager
@@ -391,6 +396,8 @@ class PostTradeReviewer:
         self.template = PROMPT_PATH.read_text(encoding="utf-8")
         self.last_result: ReviewResult | None = None
         self._lock = asyncio.Lock()
+        self.daily_budget = daily_budget
+        self._reviews_by_day: dict[str, int] = {}
 
     @property
     def current_cfg(self) -> Config:
@@ -535,7 +542,11 @@ class PostTradeReviewer:
             rs = [str(r) for r in h.get("reasons") or []]
             hc["paused"] += 1 if h.get("paused") else 0
             hc["killed"] += 1 if h.get("killed") else 0
-            stale = (h.get("rest_ok") is False and h.get("ws_ok") is False) or any("stale" in r.lower() for r in rs)
+            # on the synthetic feed rest_ok/ws_ok are always False (neither source runs): only the
+            # engine's own reasons say whether its data were stale (a real review misread that)
+            synthetic = _map(h.get("extra")).get("feed") == "synthetic"
+            stale = any("stale" in r.lower() or "no fresh data" in r.lower() for r in rs) or (
+                not synthetic and h.get("rest_ok") is False and h.get("ws_ok") is False)
             hc["stale"] += 1 if stale else 0
             errs = _dec(h.get("api_errors_1m")) or Decimal(0)
             if errs > 0:
@@ -583,7 +594,7 @@ class PostTradeReviewer:
                              "return an empty `param_suggestions` list)")
             types, max_changes = ["number"], 0
         else:
-            paths = editable_paths(cfg)
+            paths = editable_paths(cfg, getattr(self.config_manager, "pinned", ()))
             tree = cfg.model_dump(mode="json")
             lines = []
             for p in paths:
@@ -612,8 +623,24 @@ class PostTradeReviewer:
     async def run(self, review_input: dict[str, Any]) -> ReviewResult:
         """One hourly review: journal + bounded config changes. Never raises on LLM trouble."""
         async with self._lock:
-            self.last_result = await self._run(review_input, final=False)
+            over = self._over_budget()
+            if over:
+                now = self.clock.now()
+                self.last_result = self._skip(now, config_hash(self.current_cfg), over, False, review_input)
+            else:
+                self.last_result = await self._run(review_input, final=False)
             return self.last_result
+
+    def _over_budget(self) -> str:
+        """Count one review against today's ``daily_budget``; the reason text when it is used up."""
+        if self.daily_budget is None or self.llm is None or getattr(self.llm, "mode", "") == "replay":
+            return ""
+        day = utc_day(self.clock.now())
+        used = self._reviews_by_day.get(day, 0)
+        if used >= self.daily_budget:
+            return f"daily reviewer budget exhausted ({self.daily_budget} reviews on {day} UTC)"
+        self._reviews_by_day = {day: used + 1}
+        return ""
 
     async def run_final(self, review_input: dict[str, Any]) -> ReviewResult:
         """End-of-challenge summary section. Never changes the config (suggestions are ignored)."""

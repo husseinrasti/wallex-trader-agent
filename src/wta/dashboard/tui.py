@@ -940,7 +940,18 @@ def _health_body(snap: DashboardSnapshot, now: float) -> RenderableType:
     g.add_row("REST", _ok_text(h.get("rest_ok")) if h else Text(DASH, style="dim"))
     ws_configured = extra.get("ws") is not None or bool(h.get("ws_ok"))
     g.add_row("WebSocket", _ok_text(h.get("ws_ok")) if h and ws_configured else Text("off", style="dim"))
-    g.add_row("LLM", _ok_text(h.get("llm_ok")))
+    ai = _dict(extra.get("ai"))
+    source = extra.get("ai_source") or ai.get("ai_source")
+    if source == "offline-rules":
+        g.add_row("LLM", Text("offline rules (no LLM key)", style="yellow"))
+    elif source == "disabled":
+        g.add_row("LLM", Text("AI off (rules-only)", style="dim"))
+    else:
+        llm = _ok_text(h.get("llm_ok"))
+        failures = ai.get("llm_consecutive_failures")
+        if h.get("llm_ok") is False and isinstance(failures, int) and failures:
+            llm.append(f" ×{failures}", style="red")
+        g.add_row("LLM", llm)
     mcp = extra.get("mcp_ok")
     if mcp is None and isinstance(extra.get("mcp"), dict):
         mcp = extra["mcp"].get("ok")

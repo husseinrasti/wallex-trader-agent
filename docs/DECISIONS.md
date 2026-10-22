@@ -21,3 +21,12 @@ One line each: date — decision — why.
 - 2026-10-22 — One-shot CLI commands and `check_account.py` use `max_retries=0` and short timeouts — an outage fails in seconds instead of minutes of backoff.
 - 2026-10-22 — MCP client is read-only by construction: default allowlist = the 8 read-only tools; state-changing names are refused even if allowlisted.
 - 2026-10-22 — `check_account.py --probe-order` refuses to run when routing warnings exist (sub-account id missing) unless `--probe-main-wallet`; STOP_LIMIT probe limit price sits on the non-filling side.
+- 2026-10-22 — S1 coins ADA/TRX/LTC/LINK/AVAX added to the watchlist (21 symbols, 63 of 64 WS channels) — S1 trades them but had no books; snapshot rows for them are estimates.
+- 2026-10-22 — Engine state DB per mode and feed (`data/state_{mode}.sqlite`, `_synthetic` suffix for the synthetic feed) — shadow, live and synthetic exercises can never share kv/positions/orders.
+- 2026-10-22 — A lock-in leg 1 is never re-priced or chased; an unfilled leg 2 is given up after `limit_reprice_after_s` and S1 re-decides (fresh loss-limit check) — chasing an edge-less market lost money in a synthetic exercise.
+- 2026-10-22 — `get_features` returns a curated view (short keys, 6 significant digits, None dropped, S1 edges net of fees) — the full snapshot exceeded the 4 kB tool cap and was truncated to unparsable JSON.
+- 2026-10-22 — With an LLM key configured the offline rules provider is never used; provider failure means plan=None (rules-only), visible as `llm_ok=false` — a fallback must never pretend to be an LLM.
+- 2026-10-22 — AI budgets count analyst cycles / reviews (PRD-04 sizes them per cycle); the LLMClient per-request count is only a ceiling.
+- 2026-10-22 — A reviewer config reload waits for the next tick boundary; runtime overlays live per account (`configs/runtime/<account>/latest.yaml`), are re-applied at startup, never in the ai-off ablation, and never override operator `--set`/`--overlay` keys.
+- 2026-10-22 — Only one engine per Telegram bot polls commands (`alerts.telegram_commands_enabled`); commands are operational only (status/pause/resume/kill) — no trading through Telegram.
+- 2026-10-23 — Analyst prompt asks the model to close `regimes` and check that the JSON parses — 5 of 15 first answers in the acceptance run had an unclosed `regimes` object (each fixed by the retry).

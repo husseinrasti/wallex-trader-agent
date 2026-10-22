@@ -224,8 +224,69 @@ does not exist at this commit.
 ## 8. How AI is used
 
 AI decides **parameters within bounds**, never orders. Two LLM roles run in the slow loop; both are
-cached, replayable and logged. Wiring into the engine is pending (§2); everything below is the
-implemented module behaviour.
+cached, replayable and logged. Both are wired into `wta run` (`Engine.enable_ai`, attached by
+`build_engine`; §8.0) — the wiring table in §2 predates it.
+
+### 8.0 Engine integration (`engine.py`, `ai/wiring.py`)
+
+**Which AI source** (`wiring.build_llm`, decided once at startup, named in the `start` event and in
+every heartbeat as `health.extra.ai_source`):
+
+| Condition | `ai_source` | Analyst / Reviewer client |
+|---|---|---|
+| `ai.enabled: false` | `disabled` | none: no analyst, no reviewer, `plan` always None (ablation) |
+| `OPENROUTER_API_KEY` and/or `GEMINI_API_KEY` set | `llm` | `LLMClient` per role: OpenRouter primary (`llm.analyst.model` / `llm.reviewer.model` from `configs/llm.yaml`, which fill from `OPENROUTER_MODEL_FAST` / `OPENROUTER_MODEL_STRONG`), Gemini fallback (`GEMINI_MODEL`); only a Gemini key → Gemini primary; daily budgets `ai.max_analyst_calls_per_day` / `ai.max_reviewer_calls_per_day` |
+| `ai.enabled` and no key | `offline-rules` | `offline_provider.make_offline_llm` — deterministic rules, **not an LLM** (§8.6) |
+
+With a key set the offline provider is never used: a broken key, a timeout or invalid JSON shows as
+`llm_ok=false` and rules-only (or the last fresh plan), never as rules dressed up as a plan.
+`LLMCache` directory (`wiring.llm_cache_dir`): `ai.cache_dir` at its default (`logs/llm_cache`) means
+`<log dir>/llm_cache` of the run — `logs/shadow/llm_cache` for `wta run --mode shadow`,
+`logs/llm_cache` for live, the `--log-dir` of any other run; any other value is used as given. It is
+strict (a miss raises) only in `replay` mode with `ai.replay_strict`. The Wallex MCP client
+(`wiring.build_mcp`: `WALLEX_MCP_URL`, `WALLEX_API_KEY` in `WALLEX_MCP_AUTH_HEADER`,
+`READ_ONLY_ALLOWLIST`) exists on the live feed only; on the synthetic feed, in replay and on any MCP
+failure the analyst uses the `*_local` tools.
+
+**Slow loop** (supervised task `slow_loop`; the fast loop never awaits it): every 5 s
+`analyst.should_run(now, last_run_ts, features, events)` (triggers below); a due cycle captures a
+view (latest `FeatureSnapshot`, bus books, the in-memory 1-minute candles, recent market trades, the
+PnL summary, a ring buffer of the last 50 decision records with outcomes, compact health) so every
+tool answer of the cycle comes from one moment, then `analyst.run` with a whole-cycle timeout.
+A plan → `plans` table + `decisions.jsonl` record `kind="plan"` (`decision_id`
+`d_<ms>_AI_PLAN_<seq>`, stamped with the cycle time; `features` = the analyst record:
+`prompt_hash, model, cached, tools_used, tools_source, latency_ms, clamped, reason, tool_rounds,
+llm_calls, json_retry, usage, ai_source`; `plan_snapshot` = the plan; `notes` = its notes) → atomic
+swap of `engine.plan`; each tick takes the plan once at its start, so a plan never changes half-way
+through a tick. No plan → the last plan stays until it is stale, `llm_consecutive_failures` grows,
+one `ai_degraded` event per outage (`ai_recovered` after it), a Telegram alert at 3 in a row.
+Heartbeat: `llm_ok` (None without an LLM — disabled, offline rules or no cycle yet; False after a
+failed cycle), `health.extra.ai = {ai_source, plan_age_s, plan_model, plan_stale, tools_source,
+llm_consecutive_failures, mcp_ok, last_error, stats, routes, last_review}`.
+
+**Reviewer** (supervised task `reviewer`, every `engine.reviewer_interval_s`, the first one interval
+after the start): the last hour of this run's `decisions` (outcome updates included), `health` and
+`events` files (read in a worker thread) + the PnL summary → `reviewer.run` → `ConfigManager.apply`
+(≤ 2 bounded changes; the operator's pinned `--set` / `--overlay` keys are neither offered nor
+accepted) → `engine.reload_config` at the next tick boundary (S1/S2/S3 config objects, router,
+FeatureEngine, analyst; `risk.*` / `execution.*` differences are refused; a tick suspended on an
+exchange await finishes on the old config, a running analyst cycle keeps the config it started with)
+→ `DecisionLog.set_config_hash`; event `config_change {old_hash, new_hash, diff, rejected,
+overlay_path, source: "reviewer"}`; one section in `<log dir>/journal.md` per review. At startup
+`build_engine` re-applies `<runtime dir>/latest.yaml` (default: the account's own
+`configs/runtime/<mode>` on the live feed, `configs/runtime/<mode>_<feed>` otherwise, like the state
+DB; `wta run --runtime-dir`) — only reviewer-editable paths within bounds, only an overlay whose
+`# meta` header names this account, never with `ai.enabled: false` (the ablation runs on the plain
+config); the operator's `--set` / `--overlay` keys win and their overlay entries are kept in
+`latest.yaml` (`pinned`); the cooldown restarts from the header's `applied_ts` — and the `start`
+event names it (`runtime_overlay: {path, sha256, account, applied_ts, applied, pinned, rejected,
+config_hash_before, config_hash_after}`, `skipped` when not applied); `wta run --no-runtime-overlay`
+skips it.
+
+**One cycle by hand:** `wta plan [--feed live|synthetic]` builds the shadow engine of that feed,
+restores its candles and feature state, waits for the regime books and runs ONE analyst cycle
+(reason `manual`); it prints the plan JSON and stores nothing but the LLM cache and tape (no tick,
+no order, no decision record).
 
 ### 8.1 Regime Analyst (`ai/analyst.py`, `ai/plan_schema.py`, `ai/prompts/analyst.md`)
 
@@ -254,7 +315,7 @@ repeat ≤ ai.analyst_max_tool_rounds (6):
     → appended as assistant tool_calls + role:"tool" messages → next round
 at the cap: "Tool-call limit reached … return only the final JSON plan" (tools off)
 parse PlanOutput (strict, extra keys forbidden); invalid → one "fix the JSON" retry; invalid again → None
-clamp_plan → MarketPlan + audit fields → on_plan callback (designed: `plans` table + decision kind="plan")
+clamp_plan → MarketPlan + audit fields → on_plan (engine: `plans` table + decision kind="plan", §8.0)
 ```
 
 Every intermediate message is part of the next call's cache key, so the whole trajectory replays.
@@ -263,7 +324,7 @@ Every intermediate message is part of the next call's cache key, so the whole tr
 
 | Tool | Source | Returns |
 |---|---|---|
-| `get_features` | engine | per-symbol and cross-book features |
+| `get_features` | engine | the curated `tools.feature_view` (below) |
 | `get_pnl_summary` | engine | equity, drawdown, daily PnL, realized PnL by strategy, fees vs budget, positions |
 | `get_recent_decisions` | engine | last n (≤ 50) compact decisions |
 | `get_health` | engine | data freshness, API errors, paused/killed, flatten phase, time to deadline |
@@ -272,6 +333,18 @@ Every intermediate message is part of the next call's cache key, so the whole tr
 | `wallex_basic_get_market_depth_local`, `…_candle_history_local`, `…_get_latest_trades_local` | bus/store | the same data from our own feed (MCP outage, backtest) |
 
 The plan records `tools_source` = `mcp`, `local` or `none`.
+
+**`get_features` view** (`tools.feature_view`): the full `FeatureSnapshot.compact()` of the
+21-symbol watchlist is ~18 kB, several times the 4 kB tool cap, and a cut JSON is useless to a
+model. The view keeps key fields only, under short names explained in the tool description
+(`mid, spread, ret_15m, ret_1h, ret_24h, atr, atr_med, ema_gap, trend, vol_x, age_s`), JSON numbers
+rounded to 6 significant digits, None values dropped. Without `symbols` the regime symbols get every
+key and the other books `mid, spread, ret_1h, ret_24h` (`brief_rows`); per S1 coin `dev`, `z` and the
+lock-in edges **net of fees** (`net_tmn_cheap`, `net_usdt_cheap`), the fees once under
+`lockin_cost`. The default watchlist with every value present is ~3.8 kB (asserted < 4096 in
+`tests/test_ai_tools.py`); when something does not fit, rows become brief, then digits drop, then rows
+are omitted and named — never a cut. The analyst's first message carries the same view for the whole
+watchlist with every key and the key legend (cap 4 × 4 kB).
 
 **Output and clamping** (`clamp_plan`, deterministic, never raises):
 
@@ -330,12 +403,14 @@ Never editable, enforced twice (allowlist and a hard prefix check): `risk.`, `ex
 `engine.initial_equity`, `engine.challenge`, `engine.flatten`, `ai.replay_strict`, `llm.`.
 
 * **Effects of an accepted change:** a new config object and `config_hash`; overlay files
-  `configs/runtime/config-<UTC stamp>.yaml` and `latest.yaml` (header with old → new hash); event
+  `<runtime dir>/config-<UTC stamp>.yaml` and `latest.yaml`, written atomically (header with old →
+  new hash and a `# meta` line: account, mode, feed, git commit, `applied_ts`); event
   `config_change {old_hash, new_hash, diff, rejected, overlay_path, source: "reviewer"}`.
 * **Journal:** one section per review appended to `logs/journal.md` (hash before → after, the model's
   journal, alerts, applied changes, every rejected suggestion with its reason). An unavailable or
   invalid LLM writes `reviewer skipped: <reason>` and changes nothing.
-* **Gaps:** the engine does not reload config live yet, and a restart does not load `latest.yaml`.
+* **Engine:** accepted changes are reloaded live (`reload_config`) and re-applied at the next start
+  from `latest.yaml` (§8.0).
 
 ### 8.3 Wallex MCP client (`ai/mcp_client.py`)
 
@@ -360,7 +435,13 @@ cache file: <ai.cache_dir>/<sha256>.json = {request, response, ts, latency_ms, u
 
 Keys travel only in HTTP headers and never reach logs or cache files. `CacheMissError` is re-raised
 by the Analyst and the Reviewer: a replay must prove determinism, not degrade silently. MCP tool lists
-and results are taped under `<cache_dir>/mcp_tape/`; in replay the Analyst never contacts MCP.
+and results are taped under `<cache_dir>/mcp_tape/`; in replay the Analyst never contacts MCP. The
+same tape holds every internal tool result and, per plan, the cycle's input (`now`, trigger, the JSON
+state, `config_hash`), so `RegimeAnalyst.replay_cycle(prompt_hash)` re-runs a recorded cycle from the
+cache and the tape alone. `python -m wta.ai.replay --log-dir DIR` does that for every `kind="plan"`
+record of a run (strict cache, no provider object at all — a sentinel counts and refuses any call —
+no MCP) and compares each replayed plan with the recorded `plan_snapshot`. Re-running the recorded
+ticks through the engine (`wta replay`) is the Phase-5 runner (PRD-05).
 
 ### 8.5 Ablation
 
@@ -383,7 +464,9 @@ Used **only** when `ai.enabled` is true and neither `OPENROUTER_API_KEY` nor `GE
   any regime is `chaos`; `usdt_target_share` from the S2 regime table; `s1_margin_min_pct` = config;
 * reviewer: a journal that only counts what it was given, no parameter suggestions.
 
-Model name `offline-rules-v1`, latency 0, no usage; notes and journals start with
+In the engine `ai_source` is `offline-rules`, `llm_ok` stays None (there is no LLM), plan records carry
+`ai_label: "AI: offline rules (no LLM key)"`. Model name `offline-rules-v1`, latency 0, no usage; notes
+and journals start with
 `[offline rules provider — not an LLM]`; status and TUI show `AI: offline rules (no LLM key)`. Output
 depends only on the messages, so it caches and replays exactly. Its plans are **not** evidence of AI
 usage and must not be presented as such.
@@ -396,15 +479,109 @@ flatten. Every order is a strategy or flatten intent that passed the RiskManager
 
 ### 8.8 Real plan example
 
+**Real LLM plan — `openai/gpt-5.4-mini` via OpenRouter — on the SYNTHETIC feed** (not real market
+data: `api.wallex.ir` was unreachable, so the Wallex MCP tools could not be offered; `tools_source`
+is `local`). One `kind="plan"` line of `decisions.jsonl`, verbatim, from the Phase-4 acceptance run
+(a) (`docs/REPORTS/phase4_acceptance.md`): `wta run --mode shadow --feed synthetic --seconds 900`
+with `engine.slow_loop_interval_s=60`, git `8130132` + the uncommitted Phase-4 working tree,
+`config_hash 113103719ae4`; 15 plans in 15 minutes, all 15 reproduced from the LLM cache with zero
+provider calls (`python -m wta.ai.replay`). The state DB was fresh, so an hour of candles did not
+exist yet: `ret_1h`, `ret_24h` and the EMA features were absent, and the model said so in its
+evidence. The plan narrows the envelope (S1 off, `s1_margin_min_pct` 0.002 > config 0.0015); the
+RiskManager still checks every intent.
+
+```json
+{
+  "config_hash": "113103719ae4",
+  "decision_id": "d_1792705552866_AI_PLAN_14",
+  "features": {
+    "ai_source": "llm",
+    "cached": false,
+    "clamped": {},
+    "json_retry": false,
+    "latency_ms": 5271,
+    "llm_calls": 2,
+    "model": "openai/gpt-5.4-mini",
+    "prompt_hash": "49f5610a19280633ecf84033e6187f31c713ff15882a6c9a631ffc33f65daba1",
+    "reason": "scheduled",
+    "tool_rounds": 1,
+    "tools_source": "local",
+    "tools_used": [
+      "get_features",
+      "get_health",
+      "get_pnl_summary"
+    ],
+    "usage": {
+      "completion_tokens": 445,
+      "prompt_tokens": 9847,
+      "total_tokens": 10292
+    }
+  },
+  "git_commit": "8130132b4afb648aaeea6cd47eaf4494ecdcee85",
+  "intent": null,
+  "kind": "plan",
+  "mode": "shadow",
+  "notes": "Books are fresh and healthy, with no API errors or stale symbols. Cross-book lock-in remains unattractive after fees: all net edges are negative, with BTC/ETH/SOL around -0.47% to -0.67% versus a 0.43% round-trip cost floor. The dollar book is flat and the current USDT share is 0.249, so S2 stays at the normal 0.5 target with full size. Drawdown is still tiny, so I keep the plan stable and avoid overreacting.",
+  "order": null,
+  "outcome": null,
+  "plan_snapshot": {
+    "cached": false,
+    "clamped": {},
+    "enabled_strategies": [
+      "S2"
+    ],
+    "latency_ms": 5271,
+    "model": "openai/gpt-5.4-mini",
+    "notes": "Books are fresh and healthy, with no API errors or stale symbols. Cross-book lock-in remains unattractive after fees: all net edges are negative, with BTC/ETH/SOL around -0.47% to -0.67% versus a 0.43% round-trip cost floor. The dollar book is flat and the current USDT share is 0.249, so S2 stays at the normal 0.5 target with full size. Drawdown is still tiny, so I keep the plan stable and avoid overreacting.",
+    "prompt_hash": "49f5610a19280633ecf84033e6187f31c713ff15882a6c9a631ffc33f65daba1",
+    "regimes": {
+      "BTCUSDT": {
+        "confidence": 0.87,
+        "evidence": "trend 0, spread 0.0770%, z -0.162, cross dev +0.0050%",
+        "regime": "range"
+      },
+      "ETHUSDT": {
+        "confidence": 0.92,
+        "evidence": "trend 0, spread 0.0505%, z -0.537, cross dev -0.0088%",
+        "regime": "range"
+      },
+      "SOLUSDT": {
+        "confidence": 0.84,
+        "evidence": "trend 0, spread 0.0951%, z -0.549, cross dev -0.0024%",
+        "regime": "range"
+      },
+      "USDTTMN": {
+        "confidence": 0.98,
+        "evidence": "ret_1h not provided; trend 0, spread 0.0143%, age 0.667s, usdt_share 0.249 vs target 0.5",
+        "regime": "range"
+      }
+    },
+    "risk_flags": [
+      "fresh_books",
+      "s1_unfavorable_lockin",
+      "flat_regime",
+      "small_drawdown"
+    ],
+    "s1_margin_min_pct": "0.002",
+    "size_multiplier": "1",
+    "tools_source": "local",
+    "tools_used": [
+      "get_features",
+      "get_health",
+      "get_pnl_summary"
+    ],
+    "ts": 1792705552.865914,
+    "usdt_target_share": "0.5"
+  },
+  "risk": {},
+  "strategy": "AI",
+  "symbol": "PLAN",
+  "ts": "2026-10-22T21:45:52.865Z"
+}
 ```
-TODO: Real plan example (pasted from logs after the AI layer is wired)
-  - source: one `kind="plan"` line of decisions.jsonl from a shadow run on the real Wallex feed
-  - include: regimes with evidence, enabled_strategies, s1_margin_min_pct, size_multiplier,
-    usdt_target_share, risk_flags, notes, model, prompt_hash, tools_used, tools_source, latency_ms,
-    clamped
-  - state the model, the run (mode, git tag, config_hash) and whether MCP was reachable
-  - must NOT come from the synthetic feed or the offline rules provider
-```
+
+TODO (still open): replace it with a plan from a shadow run on the **real** Wallex feed with the MCP
+server reachable (`tools_source: "mcp"`), naming the run (mode, git tag, config_hash).
 
 ---
 

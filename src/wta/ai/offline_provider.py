@@ -6,8 +6,10 @@ stand-in. It implements the ``Provider`` protocol of ``llm_client.py`` but decid
 
 * **Analyst prompt, tools offered, no tool results yet** -> asks for ``get_features`` (the four
   regime symbols) and ``get_pnl_summary``.
-* **Tool results present, some regime symbol still without features** (``get_features`` output is
-  often cut by the 4 kB tool cap; the complete flat objects are salvaged from the cut JSON) and
+* **Tool results present, some regime symbol still without features** (``get_features`` returns the
+  curated ``feature_view`` — short keys, None dropped, within the 4 kB tool cap — read back through
+  ``tools.feature_rows``; a ``FeatureSnapshot.compact`` dict is read as is, and a size-capped result
+  is salvaged from the cut JSON) and
   ``get_candle_stats`` offered and not asked yet -> asks for ``get_candle_stats`` (15-min bars,
   n=97 so the window return spans exactly 24 h) for the missing symbols.
 * **Otherwise** -> returns a MarketPlan-shaped JSON (the analyst's PlanOutput keys, nothing else):
@@ -38,6 +40,7 @@ from typing import Any
 
 from wta.ai.cache import LLMCache
 from wta.ai.llm_client import LLMClient, LLMResponse, Route, ToolCall
+from wta.ai.tools import feature_rows, is_feature_view
 from wta.config import Config, S2Cfg, Settings
 from wta.strategies.s2_usdtalloc import rule_regime
 from wta.utils.decimalutil import pct
@@ -248,7 +251,12 @@ def _harvest(node: Any, ev: _Evidence, depth: int = 0) -> None:
         _salvage(node["json_prefix"], ev)
         return
     symbols = node.get("symbols")
-    if isinstance(symbols, dict):
+    if is_feature_view(node):  # get_features: short keys -> FeatureSnapshot field names
+        rows = feature_rows(node)
+        for sym in sorted(rows):
+            if _looks_like_features(rows[sym]):
+                ev.features.setdefault(sym.upper(), rows[sym])
+    elif isinstance(symbols, dict):
         for sym in sorted(symbols):
             f = symbols[sym]
             if isinstance(f, dict) and _looks_like_features(f):

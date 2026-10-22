@@ -301,6 +301,19 @@ def test_build_input_is_deterministic_compact_and_windowed(tmp_path: Path, cfg: 
     assert a["portfolio"]["realized_pnl_tmn"] == {"S1": "1250.5", "S3": "-300"}
 
 
+def test_synthetic_heartbeats_are_not_stale_by_their_source_flags(tmp_path: Path, cfg: Config,
+                                                                  sim_clock: SimClock) -> None:
+    """On the synthetic feed rest_ok/ws_ok are always False; only the engine's reasons count (a real
+    LLM review once flagged every synthetic heartbeat as stale)."""
+    t = sim_clock.now()
+    synth = {"feed": "synthetic"}
+    health = [_health(t - 120, rest_ok=False, ws_ok=False, extra=synth),
+              _health(t - 60, rest_ok=False, ws_ok=False, extra=synth, reasons=["synthetic feed: no fresh data"]),
+              _health(t - 30, rest_ok=False, ws_ok=False)]  # a live heartbeat without any source: stale
+    h = make_rig(tmp_path, cfg, sim_clock, []).reviewer.build_input([], [], health, {})["health"]
+    assert (h["records"], h["stale"]) == (3, 2)
+
+
 def test_build_input_empty_is_valid(tmp_path: Path, cfg: Config, sim_clock: SimClock) -> None:
     a = make_rig(tmp_path, cfg, sim_clock, []).reviewer.build_input([], [], [], {})
     assert a["decisions"] == [] and a["pnl_by_strategy"] == {} and a["vetoes_by_code"] == {}
