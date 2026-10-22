@@ -39,7 +39,12 @@ MIXED = {
 
 def _cfg(tmp_path: Path, **extra: Any) -> Config:
     return load_config(
-        overrides={"data.sqlite_path": str(tmp_path / "wta.sqlite"), "data.ws_enabled": False, **extra},
+        overrides={
+            "data.sqlite_path": str(tmp_path / "wta.sqlite"),
+            "data.state_sqlite_path": str(tmp_path / "wta_{mode}.sqlite"),  # the engine's state DB (PRD-03)
+            "data.ws_enabled": False,
+            **extra,
+        },
         env={},
     )
 
@@ -121,7 +126,8 @@ async def test_phase_one_is_maker_first_and_the_state_survives_in_the_store(tmp_
     records = _flatten_records(tmp_path)
     assert {r["intent"]["order_type"] for r in records} == {"LIMIT"}
     assert all(r["intent"]["price"] is None for r in records)  # the OrderManager prices maker-first
-    store = Store.open_readonly(tmp_path / "wta.sqlite")
+    # a synthetic exercise keeps its own paper account (never the real-feed shadow one)
+    store = Store.open_readonly(tmp_path / "wta_shadow_synthetic.sqlite")
     paper = store.kv_get(KV_PAPER)
     store.close()
     assert set(paper["balances"]) >= {"TMN", "BTC"} and paper["trades"]
@@ -213,10 +219,10 @@ def test_the_script_refuses_to_run_while_an_engine_holds_the_account(
 
     script = _load_script()
     monkeypatch.setattr(script, "load_settings", lambda: Settings(_env_file=None))
-    db = tmp_path / "wta.sqlite"
-    held = acquire_engine_lock(str(db))  # a running `wta run` on the same store
+    db = tmp_path / "wta_shadow_synthetic.sqlite"  # the synthetic paper account of the template below
+    held = acquire_engine_lock(str(db))  # a running `wta run --feed synthetic` on the same store
     argv = ["--feed", "synthetic", "--timeout", "5", "--log-dir", str(tmp_path / "logs")]
-    argv += ["--set", f"data.sqlite_path={db}"]
+    argv += ["--set", f"data.state_sqlite_path={tmp_path / 'wta_{mode}.sqlite'}"]  # the lock follows the state DB
     try:
         assert script.main(argv) == 2
         assert "another engine or flatten_now" in capsys.readouterr().err

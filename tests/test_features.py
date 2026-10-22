@@ -492,3 +492,67 @@ def test_candle_cache_invalidation(monkeypatch: pytest.MonkeyPatch, markets: dic
     assert len(calls) == 5
     run(T0 + 900, volume_only)
     assert len(calls) == 5
+
+
+# ---------------------------------------------------------------- review fixes (Phase 3)
+
+
+def test_returns_are_looked_up_by_time_not_by_candle_count(cfg: Config) -> None:
+    """26 h of a flat 1,000 close with every 20th minute missing (5 %): the true 24-h return is 0.
+    Counting 1,440 candles back would reach a 25.3-h-old close (here a different price)."""
+    start = T0 - 26 * 3600
+    candles = [
+        _c(start + 60 * i, x, x, x, x)
+        for i in range(26 * 60 + 1)
+        if i % 20 != 7 or i == 26 * 60
+        for x in [990 if i < 2 * 60 else 1000]  # the first 2 h sat at 990
+    ]
+    f = candle_features(candles, T0 + 60, cfg)
+    assert f["ret_24h"] == 0 and f["ret_1h"] == 0
+    closes = [c.c for c in candles]
+    assert ret(closes, 1440) == D(1000) / D(990) - 1  # the old index-based lookup: +1.01 %
+
+
+def test_a_gap_at_the_reference_time_gives_no_return(cfg: Config) -> None:
+    """No bars between -150 and -30 minutes: there is no close 60 minutes back, so ret_1h is None
+    instead of the close from 180 minutes ago; returns across the gap are not 1-minute moves."""
+    old = _flat_minutes([100] * 31, T0 - 180 * 60)  # -180 .. -150 min at 100
+    new = _flat_minutes([110] * 31, T0 - 30 * 60)  # -30 .. 0 min at 110
+    f = candle_features(old + new, T0 + 60, cfg)
+    assert f["ret_1h"] is None and f["ret_15m"] == 0 and f["ret_1m"] == 0
+    assert fe.ret_by_time(old + new, 3 * 3600) == D("0.1")  # 180 min back exists: +10 %
+    assert f["realized_vol_1h_pct"] == 0  # 30 flat 1-minute returns; the +10 % jump is a gap, not a minute
+
+
+def test_ret_by_time_tolerates_one_missing_bar(cfg: Config) -> None:
+    candles = _flat_minutes([100, 101, 102, 103], T0)
+    del candles[1]  # the bar at T0 + 60 is missing
+    # 2 minutes back from T0 + 180 is T0 + 60 (missing): the bar before (T0) is one bar older -> used
+    assert fe.ret_by_time(candles, 120) == D(103) / D(100) - 1
+    assert fe.ret_by_time(candles, 180) == D(103) / D(100) - 1
+    assert fe.ret_by_time(candles, 240) is None  # nothing at or before T0 - 60
+
+
+def test_a_stalled_book_adds_no_zscore_samples(
+    make_book: BookFactory, markets: dict[str, MarketInfo], cfg: Config
+) -> None:
+    """Review fix: 30 min of a frozen BTCTMN book used to fill the hour with copies of one stale
+    deviation, shrinking the std and letting an ordinary deviation pass z_min."""
+    eng = FeatureEngine(cfg, markets)
+    devs: list[Decimal] = []
+    for i in range(40):  # normal noise, fresh books every 2 s
+        bid = 100000000 + (200000 if i % 3 == 0 else -100000 * (i % 4))
+        devs.append(eng.compute(T0 + 2 * i, _cross_books(make_book, bid, T0 + 2 * i), {}, ["BTCTMN"]).cross["BTC"]["dev_mid_pct"])
+    frozen = _cross_books(make_book, 100000000, T0 + 80)
+    for i in range(41, 400):  # the same three books again and again (also stale after 30 s)
+        f = eng.compute(T0 + 2 * i, frozen, {}, ["BTCTMN"]).cross["BTC"]
+    assert f["dev_samples"] == 41  # 40 noisy samples + the first sample of the frozen books
+    # an unchanged USDTTMN book with fresh coin books still counts (one of the three changed)
+    now = T0 + 900
+    books = {**_cross_books(make_book, 100100000, now), "USDTTMN": frozen["USDTTMN"].model_copy(update={"ts": now - 5})}
+    assert eng.compute(now, books, {}, ["BTCTMN"]).cross["BTC"]["dev_samples"] == 41
+    assert len(eng.state()["BTC"]) == 42
+    # a stale book (older than engine.stale_data_s) never joins the history, even when it changed
+    stale = {**_cross_books(make_book, 100200000, now + 2), "BTCTMN": make_book("BTCTMN", "100200000", "100300000", ts=now - 60)}
+    eng.compute(now + 2, stale, {}, ["BTCTMN"])
+    assert len(eng.state()["BTC"]) == 42

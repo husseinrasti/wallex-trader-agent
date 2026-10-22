@@ -972,3 +972,43 @@ async def test_finish_external_runs_the_full_bookkeeping(build: Callable[..., Ha
     await h.om.finish_external(sell, "EXPIRED", "not found on the exchange", h.books, h.clock.now())
     assert not sell.done and h.ex.count("place") == placed + 1  # the must-finish exit re-crosses
     assert sell.order.req.price == D("94.00") and sell.crossed
+
+
+# ---------------------------------------------------------------- review fix (Phase 3): leg 2 never chases
+
+
+async def test_lockin_leg2_is_never_rechased_below_the_price_s1_checked(build: Callable[..., Harness]) -> None:
+    """Review fix: S1 checks its leg-2 loss limit (0.3 %) at the bid it sells at. The OrderManager
+    used to re-cross an unfilled leg 2 at every new, lower bid (100.00 -> 99.50 -> ... -> 97.00, -3 %)
+    without limit. Now it rests for limit_reprice_after_s and is given up; S1 re-decides next tick."""
+    h = build()
+    pos = await open_position(h)  # 0.5 BTC on BTCUSDT stands in for leg 1
+    leg2 = mk_intent(
+        "d_leg2", side="SELL", qty=str(pos.qty), purpose="leg2", strategy="S1", linked_position_id=pos.id,
+        taker=True, price=D("100.00"), features={"exit_reason": "lockin", "leg2_max_loss_pct": "0.003"},
+    )
+    mo = await h.om.submit(leg2, APPROVE, h.books)
+    assert mo is not None and mo.max_reprices == 0 and pos.meta.get("exit_pending") is True
+    placed = h.ex.count("place")
+    h.set_book("BTCUSDT", "99.50", "100.10")
+    await h.tick(15)
+    assert mo.done and mo.done_reason == "EXPIRED_UNFILLED" and mo.reprices == 0
+    assert h.ex.count("place") == placed  # never re-placed at 99.50
+    assert not pos.meta.get("exit_pending")  # the position is free for S1's next leg 2 (or its stop)
+    out = h.outcome("d_leg2")
+    assert out["purpose"] == "leg2" and out["status"] == "UNFILLED" and "not filled after 0 re-crosses" in out["detail"]
+
+
+async def test_lockin_leg2_ended_by_the_exchange_is_not_recrossed(build: Callable[..., Harness]) -> None:
+    h = build()
+    pos = await open_position(h)
+    leg2 = mk_intent(
+        "d_leg2", side="SELL", qty=str(pos.qty), purpose="leg2", strategy="S1", linked_position_id=pos.id,
+        taker=True, price=D("100.00"), features={"exit_reason": "lockin"},
+    )
+    mo = await h.om.submit(leg2, APPROVE, h.books)
+    assert mo is not None
+    h.ex.orders[mo.client_id].status = "EXPIRED"
+    placed = h.ex.count("place")
+    await h.om.finish_external(mo, "EXPIRED", "not found on the exchange", h.books, h.clock.now())
+    assert mo.done and mo.done_reason == "EXCHANGE_EXPIRED" and h.ex.count("place") == placed

@@ -8,6 +8,10 @@
   trades to the store, and appends a health line every minute to ``logs/recorder-YYYYMMDD.jsonl``.
 * ``run_recorder`` — wires everything together and runs for days: every task is supervised and
   restarted after a backoff, and API outages only cause quiet, capped retries.
+* ``CandleCache``  — the engine's in-memory 1-minute candles per symbol (last 26 h): the fast loop
+  reads candles from memory only, never from SQLite.
+* ``CandleRefresher`` — the engine's candle task (live feed): backfills the cache window in
+  requests of at most one day, then refreshes incrementally every ``candle_poll_interval_s``.
 
 Nothing here ever raises out of a poll loop; errors are counted, logged and retried.
 """
@@ -21,13 +25,14 @@ import logging
 import signal
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterable
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from wta.config import Config, Settings
 from wta.data.store import Store
 from wta.exchange.base import MarketDataBus, WallexAPIError
-from wta.models import BookSnapshot, Trade
+from wta.models import BookSnapshot, Candle, Trade
 from wta.utils.timeutil import Clock, SystemClock, iso, utc_day
 
 log = logging.getLogger(__name__)
@@ -566,3 +571,214 @@ async def run_recorder(
             await _close_quietly(rest)
         log.info("recorder: stopped cleanly (%s)", ", ".join(f"{k}={v}" for k, v in written.items()))
     return written
+
+
+# ---------------------------------------------------------------- engine candles (PRD-03 §2)
+
+CANDLE_CACHE_KEEP_S = 26 * 3600  # 24 h features (ret_24h, ATR median) + 2 h of margin
+DAY_S = 86_400  # one /v1/udf/history request never spans more than this
+
+
+def _bar_seconds(resolution: str) -> int:
+    res = resolution.strip().upper()
+    if res.isdigit():
+        return int(res) * 60
+    return int(res[:-1] or 1) * DAY_S  # "1D", "D"
+
+
+def fill_gaps(candles: list[Candle], bar_s: int) -> list[Candle]:
+    """Time-sorted ``candles`` with each missing bar slot between two bars filled by a flat bar
+    (o = h = l = c = the previous close, v = 0). Bars off the ``bar_s`` grid are kept as they are."""
+    out: list[Candle] = []
+    for c in candles:
+        if out:
+            prev = out[-1]
+            ts = prev.ts + bar_s
+            while ts < c.ts:
+                out.append(
+                    Candle(symbol=prev.symbol, resolution=prev.resolution, ts=ts, o=prev.c, h=prev.c, l=prev.c,
+                           c=prev.c, v=Decimal(0))
+                )
+                prev = out[-1]
+                ts += bar_s
+        out.append(c)
+    return out
+
+
+class CandleCache:
+    """In-memory candles of one resolution per symbol, the last ``keep_s`` seconds (default 26 h).
+
+    The engine's fast loop reads it every tick (``snapshot``); the engine's candle task and the
+    synthetic feed write it (``add``). Bars are keyed by their open time, so a re-fetched or
+    still-forming bar replaces the older copy. Per symbol only the bars within ``keep_s`` of its
+    newest bar are kept (trimmed on every update). Candles of another resolution, or of a symbol
+    outside ``symbols`` (when given), are ignored.
+
+    Reads (``get``/``snapshot``) return new lists in time order with **every bar slot between the
+    first and the newest bar filled**: a minute without a candle (no trades — the UDF history omits
+    such minutes — or a feed/backfill gap) becomes a flat bar at the previous close with volume 0,
+    so features that count bars (15-minute resampling, EMA/ATR) measure time, not trades. Filled
+    bars live only in the read view (rebuilt after a change); ``count``/``summary`` report received
+    bars, and a late real candle simply replaces the filler.
+    """
+
+    def __init__(
+        self,
+        symbols: Iterable[str] | None = None,
+        keep_s: float = CANDLE_CACHE_KEEP_S,
+        resolution: str = "1",
+    ) -> None:
+        self.symbols = None if symbols is None else frozenset(symbols)
+        self.keep_s = keep_s
+        self.resolution = resolution
+        self._bar_s = _bar_seconds(resolution)
+        self._bars: dict[str, dict[int, Candle]] = {}
+        self._sorted: dict[str, list[Candle]] = {}  # sorted view per symbol, rebuilt after a change
+        self.updates = 0  # bars added or replaced since start
+
+    def add(self, candles: Iterable[Candle]) -> int:
+        """Insert or replace bars; returns how many changed."""
+        return len(self.update(candles))
+
+    def update(self, candles: Iterable[Candle]) -> list[Candle]:
+        """Insert or replace bars; returns the bars that were new or different (input order)."""
+        changed: list[Candle] = []
+        for c in candles:
+            if c.resolution != self.resolution or (self.symbols is not None and c.symbol not in self.symbols):
+                continue
+            bars = self._bars.setdefault(c.symbol, {})
+            ts = int(c.ts)
+            if bars.get(ts) == c:
+                continue
+            bars[ts] = c
+            changed.append(c)
+        for sym in sorted({c.symbol for c in changed}):
+            bars = self._bars[sym]
+            cutoff = max(bars) - self.keep_s
+            for ts in [t for t in bars if t < cutoff]:
+                del bars[ts]
+            self._sorted.pop(sym, None)
+        self.updates += len(changed)
+        return changed
+
+    def get(self, symbol: str) -> list[Candle]:
+        view = self._sorted.get(symbol)
+        if view is None:
+            bars = self._bars.get(symbol, {})
+            view = fill_gaps([bars[t] for t in sorted(bars)], self._bar_s)
+            self._sorted[symbol] = view
+        return list(view)
+
+    def snapshot(self, symbols: Iterable[str]) -> dict[str, list[Candle]]:
+        """``{symbol: candles}`` for ``symbols`` (sorted), empty lists for symbols without bars."""
+        return {s: self.get(s) for s in sorted(set(symbols))}
+
+    def latest_ts(self, symbol: str) -> int | None:
+        bars = self._bars.get(symbol)
+        return max(bars) if bars else None
+
+    def count(self, symbol: str) -> int:
+        return len(self._bars.get(symbol, {}))
+
+    def summary(self) -> dict[str, dict[str, int | None]]:
+        """Per symbol: bars held and the first/last bar time (health and the start event)."""
+        out: dict[str, dict[str, int | None]] = {}
+        for sym in sorted(self._bars):
+            bars = self._bars[sym]
+            out[sym] = {
+                "bars": len(bars),
+                "first_ts": min(bars) if bars else None,
+                "last_ts": max(bars) if bars else None,
+            }
+        return out
+
+
+class CandleRefresher(_Poller):
+    """The engine's candle task (live feed): keeps a ``CandleCache`` filled from ``/v1/udf/history``.
+
+    Every round, per symbol: request from the newest cached bar (re-fetched on purpose: it may have
+    been stored while still forming) — or from ``now - keep_s`` when the cache has nothing for the
+    symbol, which makes the first round the startup backfill — up to now, in windows of at most
+    ``max_window_s`` (one UDF day). Every answer goes to ``sink`` (the engine: cache + state DB).
+    A symbol the API rejects (4xx) is skipped for the round; an outage (retryable error) ends the
+    round and the poller's capped backoff applies. It runs as its own supervised task: the fast
+    loop never waits for it and never reads SQLite for candles.
+    """
+
+    name = "engine candle refresher"
+
+    def __init__(
+        self,
+        rest: Any,
+        cache: CandleCache,
+        symbols: Iterable[str],
+        sink: Callable[[list[Candle]], Any] | None = None,
+        interval_s: float = 60,
+        keep_s: float = CANDLE_CACHE_KEEP_S,
+        clock: Clock | None = None,
+        sleep: Sleep = asyncio.sleep,
+        max_backoff_s: float = 300,
+        max_window_s: int = DAY_S,
+    ) -> None:
+        super().__init__(interval_s, max_backoff_s, clock, sleep)
+        if not 0 < max_window_s <= DAY_S:
+            raise ValueError("max_window_s must be in (0, 86400]")
+        self.rest = rest
+        self.cache = cache
+        self.symbols = sorted(set(symbols))
+        self.sink = sink or cache.add
+        self.keep_s = keep_s
+        self.max_window_s = max_window_s
+        self.requests = 0
+        self.rejected = 0
+        self.rounds_done = 0  # complete rounds over every symbol (the first one is the backfill)
+
+    def windows(self, symbol: str, now: float) -> list[tuple[int, int]]:
+        """Consecutive ``(from_ts, to_ts)`` requests for ``symbol`` (each <= ``max_window_s``)."""
+        to_ts = int(now)
+        oldest = int(now - self.keep_s)
+        last = self.cache.latest_ts(symbol)
+        start = oldest if last is None else max(last, oldest)
+        out: list[tuple[int, int]] = []
+        while start < to_ts:
+            end = min(start + self.max_window_s, to_ts)
+            out.append((start, end))
+            start = end
+        return out
+
+    async def poll_once(self) -> int:
+        """One round over every symbol; returns the candles received."""
+        now = self.clock.now()
+        received = 0
+        rejected: list[WallexAPIError] = []
+        for symbol in self.symbols:
+            for from_ts, to_ts in self.windows(symbol, now):
+                self.requests += 1
+                try:
+                    candles = list(
+                        await self.rest.get_candles(symbol, self.cache.resolution, from_ts, to_ts)
+                    )
+                except WallexAPIError as e:
+                    if e.retryable:
+                        raise
+                    self.rejected += 1
+                    rejected.append(e)
+                    log.debug("%s: %s rejected: %s", self.name, symbol, _describe(e))
+                    break  # the next symbol; this one is retried next round
+                if candles:
+                    self.sink(candles)
+                    received += len(candles)
+        if rejected and len(rejected) == len(self.symbols):
+            raise rejected[0]
+        self.rounds_done += 1
+        return received
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "rounds_done": self.rounds_done,
+            "requests": self.requests,
+            "rejected": self.rejected,
+            "errors": self.errors,
+            "consecutive_failures": self.consecutive_failures,
+            "last_ok_ts": self.last_ok_ts,
+        }

@@ -12,6 +12,13 @@ How ``evaluate(intent, ctx)`` works
 * *Hard* checks veto. *Adjust* checks shrink the quantity instead of vetoing. The final
   ``adjusted_qty`` is rounded down to the market step; if it ends below the minimum order, a failed
   ``MIN_NOTIONAL`` check (``"after adjustments: ..."``) is appended at the end.
+* An S1 lock-in leg 1 (``features.cost_model == "lockin"``, a BUY entry) is approved only together
+  with its leg 2: the final quantity is ``lockin_leg_qtys`` of the adjusted one (the coins left after
+  the leg-1 fee, which a BUY pays in the coin, land on a leg-2 step), and leg 2 = those coins rounded
+  down to the leg-2 step, valued at the leg-2 bid, must meet the leg-2 market's minimum order. If it
+  does not (e.g. USDT_BOUNDS shrank leg 1 below what leg 2 needs: 1 USDT is ~5x the 50,000 TMN
+  minimum), a failed ``MIN_NOTIONAL`` check ``"lock-in leg 2 on ..."`` is appended: an approved leg
+  1 whose leg 2 can never be placed would be sold back unhedged at a certain loss.
 * Quantity = ``intent.qty``, else ``intent.notional / ref_price``. ``ref_price`` is the limit price,
   else the price we would cross at (best ask for a BUY, best bid for a SELL). MARKET / STOP_MARKET
   orders always use the opposite best: the exchange ignores a price on them, so a stale ``price``
@@ -95,7 +102,7 @@ from wta.config import Config
 from wta.execution.positions import FIAT, USDT, USDTTMN, Valuation, asset_price_tmn, quote_to_tmn
 from wta.models import D0, BookSnapshot, Intent, MarketInfo, Order, RiskCheck, RiskDecision
 from wta.risk.context import RiskContext
-from wta.utils.decimalutil import D, fmt, pct, quantize_up, round_qty
+from wta.utils.decimalutil import D, fmt, pct, quantize_down, quantize_up, round_qty
 from wta.utils.timeutil import day_start, iso
 
 ENTRY_LIKE = frozenset({"entry", "rebalance"})
@@ -341,10 +348,18 @@ class RiskManager:
         if ev.sized:
             assert ev.market is not None and ev.qty is not None and ev.ref is not None
             adjusted = round_qty(ev.market, ev.qty)
+            leg2 = self._lockin_leg2_market(ev)
+            leg2_qty = D0
+            if leg2 is not None:
+                adjusted, leg2_qty = self._lockin_qtys(ev, leg2, adjusted)
             already_failed = any(c.code == "MIN_NOTIONAL" and not c.passed for c in ev.checks)
-            problem = self._size_problem(ev.market, ev.qty, ev.ref)
+            problem = self._size_problem(ev.market, adjusted, ev.ref)
             if problem and not already_failed:
                 ev.checks.append(_fail("MIN_NOTIONAL", f"after adjustments: {problem}"))
+            elif leg2 is not None and not problem:
+                check = self._check_lockin_leg2(ev, leg2, adjusted, leg2_qty)
+                if check is not None:
+                    ev.checks.append(check)
 
         failed = [c for c in ev.checks if not c.passed]
         return RiskDecision(
@@ -377,6 +392,60 @@ class RiskManager:
             qty=qty,
             sizing_error=why,
             val=ctx.portfolio.valuation(ctx.books),
+        )
+
+    # ------------------------------------------------------------ lock-in leg 2
+
+    @staticmethod
+    def _lockin_leg2_market(ev: _Eval) -> MarketInfo | None:
+        """The leg-2 market of an S1 lock-in leg 1 (a BUY entry of the coin), else None."""
+        it, m = ev.intent, ev.market
+        if m is None or it.features.get("cost_model") != "lockin" or it.side != "BUY" or it.purpose != "entry":
+            return None
+        leg2 = ev.ctx.markets.get(str(it.features.get("leg2_symbol")))
+        if leg2 is None or leg2.symbol == m.symbol or leg2.base != m.base:
+            return None  # an unknown leg 2 already fails EDGE_VS_COST / FEE_BUDGET
+        return leg2
+
+    @staticmethod
+    def _leg1_fee(ev: _Eval) -> Decimal:
+        assert ev.market is not None
+        return ev.market.taker_fee if ev.taker else ev.market.maker_fee
+
+    def _lockin_qtys(self, ev: _Eval, leg2: MarketInfo, adjusted: Decimal) -> tuple[Decimal, Decimal]:
+        """(leg-1 qty, leg-2 qty) for the adjusted lock-in quantity; a reduction is logged."""
+        assert ev.market is not None and ev.qty is not None
+        q1, q2 = lockin_leg_qtys(ev.qty, self._leg1_fee(ev), ev.market, leg2)
+        if q1 < adjusted:
+            ev.checks.append(
+                _ok(
+                    "MIN_NOTIONAL",
+                    f"lock-in: qty {ev.shown(adjusted)} -> {ev.shown(q1)} so that the {ev.market.base} left "
+                    f"after the {pct(self._leg1_fee(ev), 3)} leg-1 fee land on a {leg2.symbol} step "
+                    f"(leg 2 sells {q2})",
+                )
+            )
+        return q1, q2
+
+    def _check_lockin_leg2(
+        self, ev: _Eval, leg2: MarketInfo, q1: Decimal, q2: Decimal
+    ) -> RiskCheck | None:
+        """None when leg 2 can be placed; else the failed MIN_NOTIONAL check (fail closed)."""
+        assert ev.market is not None
+        coin, fee = ev.market.base, self._leg1_fee(ev)
+        book = ev.ctx.books.get(leg2.symbol)
+        bid = book.best_bid if book is not None else None
+        if not bid:
+            return _fail("MIN_NOTIONAL", f"lock-in leg 2: no {leg2.symbol} bid to check that leg 2 can be sold")
+        problem = self._size_problem(leg2, q2, bid)
+        if problem is None:
+            return None
+        adjusted = " after adjustments" if ev.intent.qty is None or q1 != round_qty(ev.market, ev.intent.qty) else ""
+        return _fail(
+            "MIN_NOTIONAL",
+            f"lock-in leg 2 on {leg2.symbol}{adjusted}: buying {q1} {coin} leaves "
+            f"{fmt(q1 * (1 - fee), leg2.step_decimals + 3)} {coin} after the {pct(fee, 3)} leg-1 fee (paid in "
+            f"{coin}); leg 2 would sell {q2} {coin} at bid {bid}: {problem}",
         )
 
     def _size_problem(self, market: MarketInfo, qty: Decimal, ref: Decimal) -> str | None:
@@ -1086,6 +1155,27 @@ class RiskManager:
                     )
                 ]
         return []
+
+
+def lockin_leg_qtys(
+    limit_qty: Decimal, fee: Decimal, leg1: MarketInfo, leg2: MarketInfo
+) -> tuple[Decimal, Decimal]:
+    """(leg-1 qty, leg-2 qty) of an S1 lock-in whose leg 1 may buy at most ``limit_qty``.
+
+    A leg-1 BUY pays its fee in the coin, so it leaves ``qty x (1 - fee)``; leg 2 sells that rounded
+    down to the leg-2 step. Leg 1 buys the smallest leg-1 step multiple whose coins after the fee
+    still cover that leg-2 quantity, so the unhedged remainder stays below one leg-1 step instead of
+    up to a whole leg-2 step. Never above ``limit_qty`` rounded down to the leg-1 step (as
+    ``limit x (1 - fee) >= q2``). Pure; shared by S1 (sizing) and the RiskManager (approval).
+    """
+    net = 1 - fee
+    q1_max = quantize_down(max(limit_qty, D0), leg1.step_decimals)
+    if q1_max <= 0 or net <= 0:
+        return D0, D0
+    q2 = quantize_down(q1_max * net, leg2.step_decimals)
+    if q2 <= 0:
+        return q1_max, D0
+    return min(quantize_up(q2 / net, leg1.step_decimals), q1_max), q2
 
 
 def _usdt_per_unit(market: MarketInfo, side: str, price: Decimal, u_bid: Decimal) -> Decimal:

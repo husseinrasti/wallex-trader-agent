@@ -6,6 +6,10 @@
   not call the strategies at all and passes only the exit intents.
 * One open order per (strategy, symbol); one strategy per symbol at a time (a symbol held or worked by
   another strategy is skipped); per-symbol cooldown after any fill (engine.symbol_cooldown_s).
+  Ownership is ``base.symbol_owners``: an S1 lock-in also owns its leg-2 book for the whole cycle
+  (its position's ``leg2_symbol``, the other book of a working S1 entry BUY, and the
+  ``features.leg2_symbol`` of an entry accepted earlier in the same tick), so no other strategy can
+  rest an order where leg 2 must cross.
   Exits (exit/stop/leg2/flatten) are never filtered: they only reduce what a strategy already holds.
 * Output order is deterministic: exits first, sorted by (strategy id, symbol, intent id); then the
   strategies in id order, each strategy's intents in the order the strategy returned them (a
@@ -18,7 +22,7 @@ from typing import Any
 
 from wta.config import Config
 from wta.models import Intent
-from wta.strategies.base import Strategy, StrategyContext
+from wta.strategies.base import Strategy, StrategyContext, symbol_owners
 
 EXIT_PURPOSES = frozenset({"exit", "stop", "leg2", "flatten"})
 
@@ -29,6 +33,7 @@ class StrategyRouter:
         self.cfg = cfg
         self.last_fill_ts: dict[str, float] = {}
         self.dropped: list[dict[str, Any]] = []  # last tick's filtered intents (for diagnostics)
+        self.dropped_intents: list[tuple[Intent, str]] = []  # the same, as (intent, why) for the decision log
 
     def by_id(self, sid: str) -> Strategy | None:
         return next((s for s in self.strategies if s.id == sid), None)
@@ -38,27 +43,30 @@ class StrategyRouter:
 
     def tick(self, ctx: StrategyContext, exit_intents: list[Intent] | None = None) -> list[Intent]:
         self.dropped = []
+        self.dropped_intents = []
         exits = sorted(exit_intents or [], key=lambda i: (i.strategy, i.symbol, i.id))
         out: list[Intent] = list(exits)
         if ctx.flatten_phase > 0:
             return out
-        # symbol ownership: positions and open orders belong to one strategy each
-        owner: dict[str, str] = {}
-        for p in ctx.portfolio.positions:
-            owner.setdefault(p.symbol, p.strategy)
-        for o in ctx.portfolio.open_orders:
-            owner.setdefault(o.req.symbol, o.req.strategy)
+        # symbol ownership: positions and open orders belong to one strategy each; a lock-in also
+        # owns its leg-2 book (``symbol_owners``)
+        owner = symbol_owners(ctx)
         open_pairs = {(o.req.strategy, o.req.symbol) for o in ctx.portfolio.open_orders}
         for strat in self.strategies:
             for it in strat.on_tick(ctx):
                 why = self._reject(it, owner, open_pairs, ctx.now)
                 if why is not None:
                     self.dropped.append({"intent": it.id, "strategy": it.strategy, "symbol": it.symbol, "why": why})
+                    self.dropped_intents.append((it, why))
                     continue
                 out.append(it)
                 if it.purpose not in EXIT_PURPOSES:
                     owner.setdefault(it.symbol, it.strategy)
                     open_pairs.add((it.strategy, it.symbol))
+                    leg2 = it.features.get("leg2_symbol")
+                    if leg2:  # a lock-in entry: its leg-2 book is reserved from now on
+                        owner.setdefault(str(leg2), it.strategy)
+                        open_pairs.add((it.strategy, str(leg2)))
         return out
 
     def _reject(

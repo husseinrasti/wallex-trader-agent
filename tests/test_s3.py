@@ -592,6 +592,20 @@ def test_symbol_owned_by_another_strategy_is_skipped(cfg: Config, mk: dict[str, 
     assert "held or worked by S1" in strat.diagnostics()["symbols"]["BTCUSDT"]["status"]
 
 
+def test_s1_lockin_leg2_book_is_not_s3s(cfg: Config, mk: dict[str, MarketInfo]) -> None:
+    """Review fix: an S1 lock-in on BTCTMN (its leg 2 not placed yet) owns BTCUSDT for the cycle; an S3
+    BUY resting there would block the leg-2 SELL (SELF_CROSS / never a BUY and a SELL at once)."""
+    lockin = s3_position("BTCTMN", strategy="S1", meta={"mode": "lockin", "leg2_symbol": "BTCUSDT"})
+    strat = s3(cfg)
+    out = strat.on_tick(_two(cfg, mk, port=view(positions=[lockin])))
+    assert [i.symbol for i in out] == ["ETHUSDT"]
+    assert "held or worked by S1 (or reserved for its lock-in leg 2)" in strat.diagnostics()["symbols"]["BTCUSDT"]["status"]
+    # a working S1 entry BUY on BTCTMN reserves BTCUSDT too
+    strat2 = s3(cfg)
+    out2 = strat2.on_tick(_two(cfg, mk, port=view(orders=[open_order("S1", "BTCTMN")])))
+    assert [i.symbol for i in out2] == ["ETHUSDT"]
+
+
 def test_entry_passes_the_strategy_router(cfg: Config, base: StrategyContext) -> None:
     router = StrategyRouter([s3(cfg)], cfg)
     out = router.tick(base)

@@ -2,23 +2,40 @@
 
 Commands::
 
-    config show|hash          resolved config (secrets masked) and its config_hash
+    config show|hash          resolved config (secrets masked) and its config_hash (--overlay too)
     markets                   watchlist market rules from /v1/markets; flags banned symbols
     feed SYMBOL               best bid/ask once per second from the WebSocket or REST, labelled
     record                    market recorder: books, trades and candles into SQLite
     backfill                  historical candles from /v1/udf/history into SQLite
     account                   balances and fees (needs WALLEX_API_KEY)
-    run --mode shadow|live    the engine; live needs --i-understand-live, WTA_LIVE=1 and a clean tree
+    run --mode shadow|live    the engine with S1 + S2 (+ S3 when enabled); live needs --i-understand-live,
+                              WTA_LIVE=1 and a clean tree. State DB per mode and feed:
+                              data.state_sqlite_path (data/state_shadow.sqlite, data/state_live.sqlite,
+                              data/state_shadow_synthetic.sqlite), see below. Logs: --log-dir, default
+                              logs (live) / logs/shadow (shadow), so a shadow run next to live never
+                              writes into the live decision log
+        --overlay FILE            YAML overlay merged over configs/*.yaml (repeatable, in order; --set
+                                  wins), e.g. configs/live_halfsize.yaml; named in the start event
         --feed live|synthetic     market data: Wallex REST/WS (default) or the offline synthetic feed
         --inject-intents FILE     JSONL intents sent through risk -> orders (shadow acceptance tests)
         --paper-balances JSON     starting paper account, e.g. '{"TMN": 3000000, "USDT": 10}'
         --synthetic-shock-at S --synthetic-shock-pct P    one-off synthetic crash (P = -0.08 is -8 %)
-    reset-kill --reason TEXT  clear the kill-switch by hand (writes a reset_kill event)
+    reset-kill --reason TEXT  clear the kill-switch by hand (writes a reset_kill event); --mode
+                              shadow|live and --feed live|synthetic pick the state DB (default: the
+                              one that is killed)
     logs check                validate logs/*.jsonl against their schemas
     db vacuum                 compact the SQLite database
     backtest, replay, report, tui, status, export     later PRDs (exit 3)
 
 Options such as ``--set key=value`` go after the command: ``wta run --mode shadow --set a.b=1``.
+
+Databases: the recorder (``record``/``backfill``) writes market data to ``data.sqlite_path``; the
+engine (``run``, ``reset-kill``, ``scripts/flatten_now.py``) keeps its state in the per-mode state
+DB ``data.state_sqlite_path`` with ``{mode}`` replaced (by ``shadow``, ``live``, or
+``shadow_synthetic`` on the synthetic feed), so shadow, synthetic and live never share state. A
+``--set data.sqlite_path=DIR/x.sqlite`` alone derives the state DB from it
+(``DIR/x.state_{mode}.sqlite``); ``--set data.state_sqlite_path=...`` sets it directly (without
+``{mode}``, ``.<mode>`` is inserted before the suffix).
 
 Exit codes: 0 ok · 1 a check failed (banned watchlist symbol, invalid logs, API refused)
 · 2 cannot run (API unreachable, live guard, bad arguments) · 3 not implemented yet.
@@ -46,7 +63,7 @@ from rich.console import Console
 from rich.table import Table
 
 from wta import engine as engine_mod
-from wta.config import Config, Settings, load_config, load_settings, mask_secrets
+from wta.config import Config, Settings, load_config, load_settings, mask_secrets, parse_overrides
 from wta.data.collector import RestPoller, default_ws_factory, recordable_symbols, run_recorder
 from wta.data.store import Store
 from wta.engine import (
@@ -55,9 +72,11 @@ from wta.engine import (
     parse_paper_balances,
     request_kill_reset,
     run_engine,
+    state_db_path,
 )
 from wta.exchange.base import MarketDataBus, WallexAPIError
 from wta.exchange.wallex_rest import WallexREST
+from wta.execution.reconcile import KV_FLAGS
 from wta.logging_.checker import check_logs, scan_for_secrets
 from wta.logging_.decision_log import EventsLog
 from wta.models import BookSnapshot, MarketInfo
@@ -125,6 +144,44 @@ def _watchlist_file(path: Path) -> list[str]:
     """The ``watchlist:`` list of a markets YAML file (e.g. ``configs/markets.yaml``)."""
     data = yaml.safe_load(path.read_text()) or {}
     return [str(s).upper() for s in data.get("watchlist") or []]
+
+
+def overlay_pairs(tree: Any, prefix: str = "") -> dict[str, Any]:
+    """A YAML overlay as dotted ``--set`` pairs: ``{"risk": {"max_order_pct_equity": 0.125}}`` ->
+    ``{"risk.max_order_pct_equity": 0.125}``. Mappings are walked (deep merge: keys the overlay
+    does not name keep their value); anything else, lists included, replaces the value."""
+    if not isinstance(tree, dict):
+        raise ValueError(f"{prefix or 'overlay'}: expected a mapping of config keys")
+    out: dict[str, Any] = {}
+    for key, value in tree.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict) and value:
+            out.update(overlay_pairs(value, path))
+        elif not isinstance(value, dict):
+            out[path] = value
+    return out
+
+
+def load_cli_config(overrides: list[str] | None, overlays: list[str] | None = None) -> Config:
+    """``configs/*.yaml`` + YAML overlays (in order) + ``--set`` overrides (last, they win).
+
+    The overlays are merged the way ``load_config(runtime_overlay=...)`` merges one file (deep
+    merge of mappings); several files apply in the order given.
+    """
+    if not overlays:
+        return load_config(overrides)
+    pairs: dict[str, Any] = {}
+    for path in overlays:
+        try:
+            tree = yaml.safe_load(Path(path).read_text()) or {}
+        except yaml.YAMLError as exc:
+            raise ValueError(f"overlay {path}: not valid YAML ({_one_line(exc)})") from None
+        try:
+            pairs.update(overlay_pairs(tree))
+        except ValueError as exc:
+            raise ValueError(f"overlay {path}: {exc}") from None
+    pairs.update(parse_overrides(overrides))
+    return load_config(pairs)
 
 
 def _secret_fields(settings: Settings) -> dict[str, str]:
@@ -431,6 +488,8 @@ def _run_options(args: argparse.Namespace) -> dict[str, Any] | str:
     options: dict[str, Any] = {}
     if args.feed != "live":
         options["feed"] = args.feed
+    if args.overlay:
+        options["overlays"] = [str(p) for p in args.overlay]
     if args.inject_intents:
         try:
             options["injected"] = load_injected_intents(args.inject_intents)
@@ -466,7 +525,7 @@ def cmd_run(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
                 settings,
                 args.mode,
                 seconds=args.seconds,
-                log_dir=args.log_dir,
+                log_dir=run_log_dir(args.mode, args.log_dir),
                 i_understand_live=args.i_understand_live,
                 allow_dirty=args.allow_dirty,
                 **options,
@@ -475,6 +534,50 @@ def cmd_run(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
     except (LiveGuardError, EngineLockError) as exc:
         _err(str(exc))
         return EXIT_CANNOT_RUN
+
+
+def run_log_dir(mode: str, given: str | None) -> str:
+    """``--log-dir`` of ``wta run``: as given, else ``logs`` for live and ``logs/shadow`` for shadow
+    (the ``make shadow`` layout): a shadow engine next to live never appends to the live logs."""
+    if given:
+        return given
+    return "logs" if mode == "live" else "logs/shadow"
+
+
+def _killed_state_db(cfg: Config, mode: str | None, feed: str | None = None) -> Path | None | int:
+    """The engine state DB to reset: ``mode``'s (and ``feed``'s), else the one that is killed among
+    live, shadow and shadow on the synthetic feed.
+
+    Returns the path, None when no candidate is killed, or an exit code after an error message.
+    """
+    accounts = [("live", "live"), ("shadow", "live"), ("shadow", "synthetic")]  # live trades the live feed only
+    accounts = [(m, f) for m, f in accounts if (mode is None or m == mode) and (feed is None or f == feed)]
+    paths = list(dict.fromkeys(Path(state_db_path(cfg, m, f)) for m, f in accounts))
+    existing = [p for p in paths if p.exists()]
+    if not existing:
+        where = " or ".join(str(p) for p in paths)
+        _err(f"no engine state database at {where} (nothing was ever killed there)")
+        return EXIT_FAILED
+    killed: list[Path] = []
+    for path in existing:
+        try:
+            store = Store.open_readonly(path)
+            try:
+                flags = store.kv_get(KV_FLAGS) or {}
+            finally:
+                store.close()
+        except sqlite3.Error as exc:
+            _err(f"cannot read {path}: {exc}")
+            return EXIT_FAILED
+        if flags.get("killed"):
+            killed.append(path)
+    if len(killed) > 1:
+        _err(
+            f"the kill-switch is active in {' and '.join(map(str, killed))}: pass --mode shadow|live "
+            "(and --feed live|synthetic)"
+        )
+        return EXIT_CANNOT_RUN
+    return killed[0] if killed else None
 
 
 def cmd_reset_kill(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
@@ -487,10 +590,13 @@ def cmd_reset_kill(args: argparse.Namespace, cfg: Config, settings: Settings) ->
     if kill_file.exists():
         _err(f"the kill file {kill_file} is present: remove it first, or the engine kills again at once")
         return EXIT_FAILED
-    path = Path(cfg.data.sqlite_path)
-    if not path.exists():
-        _err(f"no database at {path} (nothing was ever killed there)")
-        return EXIT_FAILED
+    found = _killed_state_db(cfg, args.mode, args.feed)
+    if isinstance(found, int):
+        return found
+    if found is None:
+        print("kill-switch is not active (engine_flags.killed is false): nothing to reset")
+        return EXIT_OK
+    path = found
     clock = SystemClock()
     events = EventsLog(Path(args.log_dir), clock, settings.secret_values())
     store = Store(path)
@@ -563,6 +669,17 @@ def _placeholder(name: str) -> Handler:
 # ---------------------------------------------------------------- parser
 
 
+def _add_overlay_option(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--overlay",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="YAML overlay merged over configs/*.yaml, repeatable (e.g. configs/live_halfsize.yaml); "
+        "--set still wins",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     # allow_abbrev=False everywhere: an acknowledgement such as --i-understand-live must be typed in
     # full, never matched from a prefix like --i.
@@ -593,8 +710,10 @@ def build_parser() -> argparse.ArgumentParser:
         "show", parents=[common], help="resolved config, masked settings and hash", allow_abbrev=False
     )
     show.add_argument("--full", action="store_true", help="also list every banned symbol")
+    _add_overlay_option(show)
     show.set_defaults(handler=cmd_config_show)
     config_hash = config_sub.add_parser("hash", parents=[common], help="config_hash only", allow_abbrev=False)
+    _add_overlay_option(config_hash)
     config_hash.set_defaults(handler=cmd_config_hash)
 
     p = add("markets", cmd_markets, "watchlist market rules from /v1/markets; exit 1 if a symbol is banned")
@@ -623,10 +742,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = add("run", cmd_run, "run the engine (shadow by default)")
     p.add_argument("--mode", choices=("shadow", "live"), default="shadow")
+    _add_overlay_option(p)
     p.add_argument("--i-understand-live", action="store_true", help="required for --mode live")
     p.add_argument("--allow-dirty", action="store_true", help="allow live mode on a dirty git tree (dev only)")
     p.add_argument("--seconds", type=float, default=None, help="stop after this many seconds")
-    p.add_argument("--log-dir", default="logs", help="JSONL log directory (default logs)")
+    p.add_argument(
+        "--log-dir", default=None, help="JSONL log directory (default: logs for live, logs/shadow for shadow)"
+    )
     p.add_argument(
         "--feed",
         choices=("live", "synthetic"),
@@ -655,6 +777,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("reset-kill", cmd_reset_kill, "clear the kill-switch by hand (writes a reset_kill event)")
     p.add_argument("--reason", required=True, help="why the kill-switch is reset (logged)")
     p.add_argument("--log-dir", default="logs", help="JSONL log directory of the engine (default logs)")
+    p.add_argument(
+        "--mode",
+        choices=("shadow", "live"),
+        default=None,
+        help="the engine whose state DB is reset (default: the one that is killed)",
+    )
+    p.add_argument(
+        "--feed",
+        choices=("live", "synthetic"),
+        default=None,
+        help="the feed of that engine's account (synthetic runs keep their own state DB)",
+    )
 
     p = add("logs", None, "log tools")
     logs_sub = p.add_subparsers(dest="logs_command", required=True, metavar="check")
@@ -699,7 +833,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_CANNOT_RUN
     _setup_logging(args.log_level)
     try:
-        cfg = load_config(args.set)
+        cfg = load_cli_config(args.set, getattr(args, "overlay", None))
     except (ValueError, OSError, yaml.YAMLError) as exc:  # pydantic's ValidationError is a ValueError
         _err(f"invalid configuration: {_describe_error(exc)}")
         return EXIT_CANNOT_RUN

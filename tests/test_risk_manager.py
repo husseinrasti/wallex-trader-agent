@@ -38,6 +38,7 @@ from wta.risk.manager import (
     increases_exposure,
     is_entry_like,
     is_taker,
+    lockin_leg_qtys,
     min_notional,
     ref_price,
     round_trip_cost,
@@ -1268,3 +1269,64 @@ def test_a_limit_that_crosses_the_book_is_a_taker(world: World, rm: RiskManager)
     d = rm.evaluate(crossing, world.ctx(books=world.books(BTCUSDT=book)))
     assert not chk(d, "BEST_LEVEL_QTY").detail.startswith("n/a")
     assert "taker BTCUSDT" in chk(d, "EDGE_VS_COST").detail
+
+
+# ---------------------------------------------------------------- review fixes (Phase 3): lock-in leg 2
+
+
+def test_lockin_leg1_shrunk_below_what_leg2_can_sell_is_vetoed(world: World, rm: RiskManager) -> None:
+    """Review fix (critical): USDT share 65 % (S2's trend_up target) leaves room for 250,000 TMN of
+    lock-in cycle, so USDT_BOUNDS cuts 0.000045 BTC to 0.000011 (242,220 TMN on BTCTMN, well above
+    its 50,000 TMN minimum). After the 0.3 % fee paid in BTC only 0.000010967 BTC are held and leg 2
+    could sell 0.000010 x 82,500 = 0.825 USDT < 1 USDT: the entry is vetoed instead of approved (it
+    would have been sold back unhedged at a certain loss)."""
+    ctx = world.ctx(balances={"TMN": "1750000", "USDT": "12.186"})  # 65.0 % USDT of ~5.0M TMN
+    d = rm.evaluate(_lockin_qty("0.000045"), ctx)
+    assert chk(d, "USDT_BOUNDS").passed and "adjusted qty 0.000045 -> 0.000011" in chk(d, "USDT_BOUNDS").detail
+    assert not d.approved and d.failed_codes == ["MIN_NOTIONAL"]
+    assert d.veto_reason is not None and d.veto_reason.startswith("MIN_NOTIONAL: lock-in leg 2 on BTCUSDT after adjustments")
+    assert "leaves 0.000010967 BTC after the 0.300% leg-1 fee (paid in BTC); leg 2 would sell 0.000010 BTC" in d.veto_reason
+    assert "notional 0.000010 x 82500.00 = 0.8250 USDT < min 1.0000 USDT" in d.veto_reason
+    # with more room (49 % USDT) the same entry passes, leg 2 included
+    ok = rm.evaluate(_lockin_qty("0.000045"), world.ctx(balances={"TMN": "2500000", "USDT": "9"}))
+    assert ok.approved, ok.veto_reason
+
+
+def test_lockin_leg2_minimum_counts_the_coin_fee_without_any_adjustment(world: World, rm: RiskManager) -> None:
+    # 0.000013 BTC: 1.07 USDT gross on BTCUSDT, but 0.000012961 after the fee -> 0.000012 = 0.99 USDT
+    d = rm.evaluate(_lockin_qty("0.000013"), world.ctx())
+    assert d.failed_codes == ["MIN_NOTIONAL"]
+    assert d.veto_reason is not None and "lock-in leg 2 on BTCUSDT: buying 0.000013 BTC" in d.veto_reason
+    assert rm.evaluate(_lockin_qty("0.000014"), world.ctx()).approved  # 0.000013 x 82,500 = 1.07 USDT
+
+
+def test_lockin_qty_is_landed_on_a_leg2_step(world: World, rm: RiskManager) -> None:
+    """A coarser leg-2 step: 0.00004 BTC leaves 0.00003988 after the fee, leg 2 (5 decimals) sells
+    0.00003; 0.000031 BTC already cover that, so the RiskManager buys no coins leg 2 cannot sell."""
+    markets = {**world.markets, "BTCUSDT": world.markets["BTCUSDT"].model_copy(update={"step_decimals": 5})}
+    d = rm.evaluate(_lockin_qty("0.00004"), world.ctx(markets=markets))
+    assert d.approved, d.veto_reason
+    assert d.adjusted_qty == D("0.000031")
+    note = [c for c in d.checks[len(CHECK_CODES):] if c.code == "MIN_NOTIONAL"]
+    assert note and note[0].passed and "lock-in: qty 0.000040 -> 0.000031" in note[0].detail
+    assert lockin_leg_qtys(D("0.00004"), D("0.003"), markets["BTCTMN"], markets["BTCUSDT"]) == (
+        D("0.000031"), D("0.00003"),
+    )
+    # an S1 lock-in qty sized by the same rule is never changed
+    assert rm.evaluate(_lockin_qty("0.000031"), world.ctx(markets=markets)).adjusted_qty == D("0.000031")
+
+
+def test_lockin_leg_qtys_properties(world: World) -> None:
+    btc_tmn, btc_usdt = world.markets["BTCTMN"], world.markets["BTCUSDT"]
+    rng = random.Random(7)
+    for _ in range(500):
+        limit = D(rng.randint(1, 10_000)) / D(10**6)
+        fee = D(rng.choice(["0.003", "0.0025", "0.001", "0.0013"]))
+        q1, q2 = lockin_leg_qtys(limit, fee, btc_tmn, btc_usdt)
+        assert q1 <= limit and q1 == round_qty(btc_tmn, q1)
+        assert q2 == round_qty(btc_usdt, q1 * (1 - fee))  # leg 2 = what is held, rounded down
+        assert q1 * (1 - fee) - q2 < btc_tmn.step  # unhedged below one leg-1 step
+
+
+def _lockin_qty(qty: str) -> Intent:
+    return _lockin("0.0058", taker=True).model_copy(update={"qty": D(qty)})

@@ -54,7 +54,13 @@ from typing import Any
 
 from wta.config import S3Cfg
 from wta.models import Intent, MarketInfo, MarketPlan, Position
-from wta.strategies.base import BaseStrategy, StrategyContext, plan_enabled, plan_size_multiplier
+from wta.strategies.base import (
+    BaseStrategy,
+    StrategyContext,
+    plan_enabled,
+    plan_size_multiplier,
+    symbol_owners,
+)
 from wta.utils.decimalutil import D, check_min_notional, fmt, pct, quantize_down, round_price, round_qty
 
 ZERO = Decimal(0)
@@ -160,14 +166,13 @@ class S3Momentum(BaseStrategy):
 
     @staticmethod
     def _owner(ctx: StrategyContext, sym: str) -> str | None:
-        """Another strategy holding or working ``sym`` (the router would drop our intent)."""
-        for p in sorted(ctx.portfolio.positions, key=lambda p: p.id):
-            if p.symbol == sym and p.strategy != S3Momentum.id:
-                return p.strategy
-        for o in sorted(ctx.portfolio.open_orders, key=lambda o: o.client_id):
-            if o.req.symbol == sym and o.req.strategy != S3Momentum.id:
-                return o.req.strategy
-        return None
+        """Another strategy holding or working ``sym`` (the router would drop our intent).
+
+        The router's rule (``symbol_owners``): also an S1 lock-in's leg-2 book, which must stay
+        free for the leg-2 SELL while the cycle lasts.
+        """
+        owner = symbol_owners(ctx).get(sym)
+        return owner if owner is not None and owner != S3Momentum.id else None
 
     def _plan(self, ctx: StrategyContext) -> MarketPlan | None:
         return ctx.plan_fresh() if self.ai_enabled else None
@@ -239,7 +244,7 @@ class S3Momentum(BaseStrategy):
             return None
         owner = self._owner(ctx, sym)
         if owner is not None:
-            ev["status"] = f"breakout, but {sym} is held or worked by {owner}"
+            ev["status"] = f"breakout, but {sym} is held or worked by {owner} (or reserved for its lock-in leg 2)"
             return None
         if mult <= 0:
             ev["status"] = "breakout, but the plan size multiplier is 0"

@@ -16,7 +16,11 @@ every row of the transaction pending (rolled back, retried by the next flush).
 
 Replay inputs (PRD-05): ``engine_books`` holds every order book the engine actually used in a fast
 tick (all levels, deduplicated by ``(symbol, ts)``) and ``ticks`` one row per fast tick with the
-book timestamps it saw, both tagged with the engine ``mode``. Replay feeds them back tick by tick.
+book timestamps it saw, both tagged with the engine ``mode``. ``engine_candles`` is the append-only
+arrival log of the engine's 1-minute candle cache: every new or changed bar with a sequence number
+``seq`` (monotonic per state DB). A tick row carries the ``candle_seq`` its candle snapshot was
+taken at, so a replay rebuilds exactly the candles that tick saw (``candles`` keeps only the latest
+version of a bar: a re-fetched, still-forming bar overwrites it). Replay feeds them back tick by tick.
 
 Every price/quantity/money value is stored as TEXT (``str(Decimal)``) and comes back as an exact
 ``Decimal``. Books are compact JSON: ``[["price", "qty"], ...]`` limited to ``depth_levels``.
@@ -63,6 +67,9 @@ CREATE TABLE IF NOT EXISTS engine_books(
     ts REAL, mode TEXT, symbol TEXT, source TEXT, bids_json TEXT, asks_json TEXT
 );
 CREATE TABLE IF NOT EXISTS ticks(ts REAL, mode TEXT, json TEXT);
+CREATE TABLE IF NOT EXISTS engine_candles(
+    seq INTEGER, mode TEXT, symbol TEXT, resolution TEXT, ts INTEGER, o TEXT, h TEXT, l TEXT, c TEXT, v TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_books_symbol_ts ON books(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trades(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_candles_symbol_ts ON candles(symbol, ts);
@@ -71,6 +78,7 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_plans_ts ON plans(ts);
 CREATE INDEX IF NOT EXISTS idx_engine_books_mode_ts ON engine_books(mode, ts);
 CREATE INDEX IF NOT EXISTS idx_ticks_mode_ts ON ticks(mode, ts);
+CREATE INDEX IF NOT EXISTS idx_engine_candles_mode_seq ON engine_candles(mode, seq);
 """
 
 TABLES = (
@@ -87,10 +95,11 @@ TABLES = (
     "kv",
     "engine_books",
     "ticks",
+    "engine_candles",
 )
 # the time column of each table (for time_range) and which tables have a symbol column
 _TS_COLUMN = {t: "ts" for t in TABLES} | {"orders": "updated_ts", "positions": "updated_ts", "kv": "updated_ts"}
-_SYMBOL_TABLES = frozenset({"books", "trades", "candles", "engine_books"})
+_SYMBOL_TABLES = frozenset({"books", "trades", "candles", "engine_books", "engine_candles"})
 
 _SQL_BOOK = "INSERT INTO books(ts, symbol, source, bids_json, asks_json) VALUES (?, ?, ?, ?, ?)"
 _SQL_TRADE = "INSERT INTO trades(ts, symbol, price, qty, side) VALUES (?, ?, ?, ?, ?)"
@@ -112,6 +121,10 @@ _SQL_ENGINE_BOOK = (
     "INSERT INTO engine_books(ts, mode, symbol, source, bids_json, asks_json) VALUES (?, ?, ?, ?, ?, ?)"
 )
 _SQL_TICK = "INSERT INTO ticks(ts, mode, json) VALUES (?, ?, ?)"
+_SQL_ENGINE_CANDLE = (
+    "INSERT INTO engine_candles(seq, mode, symbol, resolution, ts, o, h, l, c, v)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
 
 # If the disk keeps failing, keep at most this many unwritten rows in memory (oldest dropped).
 MAX_PENDING_ROWS = 100_000
@@ -403,6 +416,12 @@ class Store:
         """One fast tick of the engine (replay input), e.g. ``{"ts": ..., "book_ts": {symbol: ts}}``."""
         self._enqueue("ticks", _SQL_TICK, (ts, mode, _log_json(data)))
 
+    def add_engine_candle(self, candle: Candle, mode: str, seq: int) -> None:
+        """One arrival in the engine's candle cache (replay input; see the module docstring)."""
+        c = candle
+        params = (seq, mode, c.symbol, c.resolution, int(c.ts), str(c.o), str(c.h), str(c.l), str(c.c), str(c.v))
+        self._enqueue("engine_candles", _SQL_ENGINE_CANDLE, params)
+
     def kv_get(self, key: str, default: Any = None) -> Any:
         self._before_read()
         row = self._conn.execute("SELECT json FROM kv WHERE key = ?", (key,)).fetchone()
@@ -482,6 +501,30 @@ class Store:
             f"SELECT json FROM ticks WHERE mode = ?{where} ORDER BY ts, rowid", [mode, *params]
         )
         return (json.loads(text) for (text,) in cur)
+
+    def iter_engine_candles(self, mode: str, to_seq: int | None = None) -> Iterator[tuple[int, Candle]]:
+        """``(seq, candle)`` arrivals in the engine's candle cache of ``mode``, in arrival order, up to
+        ``to_seq`` (inclusive): applied to an empty ``CandleCache`` they give a tick's candles back."""
+        self._before_read()
+        sql = "SELECT seq, symbol, resolution, ts, o, h, l, c, v FROM engine_candles WHERE mode = ?"
+        params: list[Any] = [mode]
+        if to_seq is not None:
+            sql += " AND seq <= ?"
+            params.append(to_seq)
+        cur = self._conn.execute(sql + " ORDER BY seq, rowid", params)
+        return (
+            (
+                seq,
+                Candle(symbol=sym, resolution=res, ts=ts, o=Decimal(o), h=Decimal(h), l=Decimal(lo), c=Decimal(c),
+                       v=Decimal(v)),
+            )
+            for seq, sym, res, ts, o, h, lo, c, v in cur
+        )
+
+    def max_engine_candle_seq(self, mode: str) -> int:
+        self._before_read()
+        row = self._conn.execute("SELECT MAX(seq) FROM engine_candles WHERE mode = ?", (mode,)).fetchone()
+        return 0 if row is None or row[0] is None else int(row[0])
 
     def iter_trades(
         self, symbol: str, from_ts: float | None = None, to_ts: float | None = None

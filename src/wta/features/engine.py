@@ -12,10 +12,19 @@ Conventions (see PRD-03):
   ``edge_tmn_cheap_pct = bid(XUSDT) * bid(USDTTMN) / ask(XTMN) - 1`` (buy TMN book, sell USDT book);
   ``edge_usdt_cheap_pct = bid(XTMN) / (ask(XUSDT) * ask(USDTTMN)) - 1`` (buy USDT book, sell TMN book).
 * 15-minute features use completed 15-minute bars resampled from 1-minute candles.
+* Lagged returns are looked up **by time**, not by candle count: ``ret_Xm`` compares the newest close
+  with the close of the last 1-minute bar at or before ``newest bar - X min`` (None when that bar is
+  missing or more than one bar older), so a minute without a candle never stretches ``ret_24h`` to
+  25 h. ``realized_vol_1h_pct`` uses only consecutive 1-minute bars of the last hour.
+* ``dev_zscore`` history: a deviation is added only when all three books are fresh
+  (``engine.stale_data_s``) and at least one of them changed since the last sample, so a stalled
+  feed does not fill the hour with copies of one stale deviation (which would shrink the std and
+  inflate z). The current deviation is still scored against the clean history.
 """
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -28,6 +37,7 @@ from wta.utils.decimalutil import D
 USDTTMN = "USDTTMN"
 ZERO = Decimal(0)
 ONE = Decimal(1)
+BAR_S = 60  # 1-minute candles
 
 
 # ---------------------------------------------------------------- small math helpers
@@ -101,9 +111,30 @@ def median(values: list[Decimal]) -> Decimal | None:
 
 
 def ret(closes: list[Decimal], lag: int) -> Decimal | None:
+    """Return over ``lag`` *bars* (index based; candle features use ``ret_by_time``)."""
     if len(closes) <= lag or closes[-1 - lag] == 0:
         return None
     return closes[-1] / closes[-1 - lag] - ONE
+
+
+def ret_by_time(candles: list[Candle], lag_s: float, bar_s: int = BAR_S) -> Decimal | None:
+    """Close-to-close return over ``lag_s`` seconds of time-sorted ``candles``.
+
+    The reference is the last bar with ``ts <= newest.ts - lag_s``; None when there is none, when it
+    is more than one bar older than that target (a gap: the return would span a longer horizon), or
+    when its close is 0.
+    """
+    if not candles:
+        return None
+    last = candles[-1]
+    target = last.ts - lag_s
+    i = bisect_right([c.ts for c in candles], target) - 1
+    if i < 0:
+        return None
+    ref = candles[i]
+    if ref.ts < target - bar_s or ref.c == 0:
+        return None
+    return last.c / ref.c - ONE
 
 
 # ---------------------------------------------------------------- feature sets
@@ -139,13 +170,18 @@ def candle_features(candles_1m: list[Candle], now: float, cfg: Config) -> dict[s
     s3 = cfg.strategies.s3_momentum
     out: dict[str, Any] = {}
     one = sorted(candles_1m, key=lambda c: c.ts)
-    closes = [c.c for c in one]
-    out["ret_1m"] = ret(closes, 1)
-    out["ret_5m"] = ret(closes, 5)
-    out["ret_15m"] = ret(closes, 15)
-    out["ret_1h"] = ret(closes, 60)
-    out["ret_24h"] = ret(closes, 1440)
-    rets = [closes[i] / closes[i - 1] - ONE for i in range(max(1, len(closes) - 60), len(closes)) if closes[i - 1]]
+    out["ret_1m"] = ret_by_time(one, 60)
+    out["ret_5m"] = ret_by_time(one, 5 * 60)
+    out["ret_15m"] = ret_by_time(one, 15 * 60)
+    out["ret_1h"] = ret_by_time(one, 3600)
+    out["ret_24h"] = ret_by_time(one, 86400)
+    # 1-minute returns of the last hour, between consecutive bars only (a gap is not a 1-minute move)
+    start = one[-1].ts - 3600 if one else 0
+    rets = [
+        cur.c / prev.c - ONE
+        for prev, cur in zip(one, one[1:], strict=False)
+        if cur.ts > start and cur.ts - prev.ts == BAR_S and prev.c
+    ]
     ms = mean_std(rets) if len(rets) >= 10 else None
     out["realized_vol_1h_pct"] = ms[1] * D(60).sqrt() if ms else None
 
@@ -278,6 +314,8 @@ class FeatureEngine:
         self.cfg = cfg
         self.markets = markets
         self._dev_hist: dict[str, deque[tuple[float, Decimal]]] = {}
+        # per coin: the (TMN, USDT, USDTTMN) book timestamps of the last sample taken
+        self._dev_books: dict[str, tuple[float, float, float]] = {}
         # candle features only change when a 1-minute candle changes or a 15m bar completes
         self._candle_cache: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
 
@@ -317,18 +355,29 @@ class FeatureEngine:
             cf = cross_features(coin, books, self.markets, self.cfg, now)
             if cf is None:
                 continue
-            cf.update(self._zscore(coin, now, cf["dev_mid_pct"]))
+            cf.update(self._zscore(coin, now, cf["dev_mid_pct"], self._sample_books(coin, books, now)))
             snap.cross[coin] = cf
         return snap
 
-    def _zscore(self, coin: str, now: float, dev: Decimal) -> dict[str, Any]:
+    def _sample_books(self, coin: str, books: dict[str, BookSnapshot], now: float) -> bool:
+        """True when this tick's deviation may join the z-score history: all three books fresh and
+        at least one of them new since the last sample (``cross_features`` checked they exist)."""
+        stamps = (books[f"{coin}TMN"].ts, books[f"{coin}USDT"].ts, books[USDTTMN].ts)
+        limit = self.cfg.engine.stale_data_s
+        if any(now - ts > limit for ts in stamps) or self._dev_books.get(coin) == stamps:
+            return False
+        self._dev_books[coin] = stamps
+        return True
+
+    def _zscore(self, coin: str, now: float, dev: Decimal, sample: bool = True) -> dict[str, Any]:
         window = self.cfg.strategies.s1_crossbook.dev_window_s
         hist = self._dev_hist.setdefault(coin, deque())
         while hist and hist[0][0] < now - window:
             hist.popleft()
         prior = [v for _, v in hist]
         ms = mean_std(prior) if len(prior) >= 30 else None
-        hist.append((now, dev))
+        if sample:
+            hist.append((now, dev))
         if ms is None or ms[1] == 0:
             return {"dev_mean_1h": ms[0] if ms else None, "dev_std_1h": ms[1] if ms else None, "dev_zscore": None,
                     "dev_samples": len(prior)}
@@ -337,7 +386,10 @@ class FeatureEngine:
     # ------------------------------------------------------------ persistence (replay)
 
     def state(self) -> dict[str, Any]:
+        """``{coin: [[ts, dev], ...]}`` (the book stamps of the last sample are not kept: after a
+        restart the first fresh sample is always taken)."""
         return {c: [[t, str(v)] for t, v in h] for c, h in sorted(self._dev_hist.items())}
 
     def load_state(self, state: dict[str, Any] | None) -> None:
         self._dev_hist = {c: deque((float(t), D(v)) for t, v in rows) for c, rows in (state or {}).items()}
+        self._dev_books = {}

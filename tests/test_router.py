@@ -17,7 +17,7 @@ import pytest
 from wta.config import Config, load_config
 from wta.features.engine import FeatureSnapshot
 from wta.models import Intent, Order, OrderRequest, Position, Purpose
-from wta.strategies.base import BaseStrategy, PortfolioView, StrategyContext
+from wta.strategies.base import BaseStrategy, PortfolioView, StrategyContext, symbol_owners
 from wta.strategies.router import EXIT_PURPOSES, StrategyRouter
 from wta.utils.ids import make_client_id
 
@@ -310,3 +310,56 @@ def test_load_empty_state_and_by_id(cfg: Config) -> None:
     assert all(s.loaded is None for s in strats)
     assert router.by_id("S2") is strats[2]
     assert router.by_id("S9") is None
+
+
+# ---------------------------------------------------------------- review fix: lock-in leg-2 book
+
+
+def _markets() -> dict[str, Any]:
+    from wta.exchange.markets import load_markets_snapshot
+
+    return load_markets_snapshot()
+
+
+def _lockin_entry(n: int = 1) -> Intent:
+    return _intent("S1", "BTCTMN", n).model_copy(update={"features": {"cost_model": "lockin", "leg2_symbol": "BTCUSDT"}})
+
+
+def test_same_tick_lockin_entry_reserves_its_leg2_book(cfg: Config) -> None:
+    """S1 decides a TMN-cheap lock-in on BTCTMN (leg 2 sells on BTCUSDT) in the same tick as S3 wants
+    to BUY BTCUSDT: S3's order would rest where leg 2 must cross, so it is dropped."""
+    s1 = FakeStrategy("S1", [_lockin_entry()])
+    s3 = FakeStrategy("S3", [_intent("S3", "BTCUSDT", 1)])
+    router = StrategyRouter([s1, s3], cfg)
+    assert _ids(router.tick(_ctx(cfg))) == [s1.intents[0].id]
+    assert [(d["strategy"], d["symbol"], d["why"]) for d in router.dropped] == [("S3", "BTCUSDT", "symbol owned by S1")]
+
+
+def test_open_lockin_position_owns_its_leg2_book(cfg: Config) -> None:
+    """Leg 1 filled, leg 2 not placed yet (vetoed / retried): BTCUSDT stays S1's for the cycle."""
+    pos = _position("S1", "BTCTMN").model_copy(update={"meta": {"mode": "lockin", "leg2_symbol": "BTCUSDT"}})
+    leg2 = _intent("S1", "BTCUSDT", 2, "leg2", linked=pos.id)
+    s1 = FakeStrategy("S1", [leg2])
+    s3 = FakeStrategy("S3", [_intent("S3", "BTCUSDT", 1)])
+    router = StrategyRouter([s1, s3], cfg)
+    assert _ids(router.tick(_ctx(cfg, positions=(pos,)))) == [leg2.id]  # S1's own leg 2 passes
+    assert router.dropped[0]["why"] == "symbol owned by S1"
+    # a revert position (same book only) reserves nothing
+    revert = pos.model_copy(update={"meta": {"mode": "revert"}})
+    router2 = StrategyRouter([FakeStrategy("S3", [_intent("S3", "BTCUSDT", 1)])], cfg)
+    assert len(router2.tick(_ctx(cfg, positions=(revert,)))) == 1
+
+
+def test_working_s1_entry_reserves_the_coins_other_book(cfg: Config) -> None:
+    ctx = _ctx(cfg, orders=(_order("S1", "BTCTMN"),))
+    ctx.markets = _markets()
+    s3 = FakeStrategy("S3", [_intent("S3", "BTCUSDT", 1), _intent("S3", "ETHUSDT", 2)])
+    router = StrategyRouter([s3], cfg)
+    assert _ids(router.tick(ctx)) == [s3.intents[1].id]
+    assert router.dropped[0]["symbol"] == "BTCUSDT" and router.dropped[0]["why"] == "symbol owned by S1"
+    owners = symbol_owners(ctx)
+    assert owners == {"BTCTMN": "S1", "BTCUSDT": "S1"}
+    # another strategy's direct holding wins over the reservation
+    held = _ctx(cfg, positions=(_position("S3", "BTCUSDT"),), orders=(_order("S1", "BTCTMN"),))
+    held.markets = _markets()
+    assert symbol_owners(held) == {"BTCTMN": "S1", "BTCUSDT": "S3"}

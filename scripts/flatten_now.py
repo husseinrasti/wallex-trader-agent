@@ -1,7 +1,7 @@
 """Flatten the account to 100 % TMN now (PRD-02 §7; ``make flatten``).
 
     python scripts/flatten_now.py                                   # paper account of the store
-    python scripts/flatten_now.py --feed synthetic --paper-balances '{"TMN": 1000000, "USDT": 5}'
+    python scripts/flatten_now.py --feed synthetic --paper-balances '{"TMN": 1000000, "USDT": 5}'  # own account
     WTA_LIVE=1 python scripts/flatten_now.py --i-understand-live     # the real account
 
 It runs the engine's own flatten routine (``FlattenManager`` -> ``RiskManager`` ->
@@ -22,8 +22,12 @@ Paper (default): the account is the store's kv ``paper_state`` (what the shadow 
 ``WTA_LIVE=1`` in the environment, an API key and a clean git tree (``wta.safety``).
 
 Two processes must never trade the same account (paper or real): the engine's account lock
-(``<sqlite_path>.engine.lock``) refuses to run while ``wta run`` (or another flatten_now) holds it —
-stop the engine first (exit 2 otherwise). Live flattening does not need ``CHALLENGE_END_UTC``.
+(``<state db>.engine.lock``, next to the state DB ``data/state_{shadow,live}.sqlite``) refuses to
+run while ``wta run`` (or another flatten_now) holds it — stop the engine first (exit 2 otherwise).
+The paper account is the one the shadow engine left in ``data/state_shadow.sqlite``; with
+``--feed synthetic`` it is the synthetic exercise's own ``data/state_shadow_synthetic.sqlite``
+(synthetic prices never touch the real-feed paper account).
+Live flattening does not need ``CHALLENGE_END_UTC``.
 Every order has a decision record in ``--log-dir`` like any engine order.
 """
 

@@ -24,11 +24,21 @@ Lifecycle (§4.2), driven by ``poll(books, now)``
     price = (avg_new x filled_new - avg_old x filled_old) / qty, fee = fee_new - fee_old.
   * A maker LIMIT not filled after ``limit_reprice_after_s`` is canceled and the remaining logical
     quantity re-placed at the new top, at most ``limit_max_reprices`` times (flatten:
-    ``flatten_max_reprices``). After that, exit/stop/leg2/flatten orders cross the spread and keep
+    ``flatten_max_reprices``). After that, exit/stop/flatten orders cross the spread and keep
     re-crossing at the new opposite best every ``limit_reprice_after_s`` until filled;
     entry/rebalance orders are canceled and given up (``EXPIRED_UNFILLED``).
+  * An S1 lock-in leg 2 (purpose ``leg2``) is never re-priced or re-crossed here: S1 checked its
+    loss limit (``leg2_max_loss_pct``) at the price it chose, and chasing a falling bid would sell
+    the hedge at any price. An unfilled leg 2 rests until ``limit_reprice_after_s`` and is then
+    given up (``EXPIRED_UNFILLED``; also when the exchange ends it); S1 re-emits the unhedged
+    remainder on its next tick at the then best bid, re-checking the loss limit, and degrades the
+    cycle to revert mode (protective stop) once the limit is reached.
   * Taker orders re-cross at the new opposite best (entries at most ``limit_max_reprices`` times,
-    closing orders until filled).
+    closing orders until filled, except leg 2 below).
+  * An S1 lock-in leg 1 (entry with ``features.cost_model == "lockin"``) is never re-priced or
+    re-crossed: its edge was computed at its own limit price, and chasing a market that moved away
+    buys at a price where the lock-in may be a loss. It rests at that price until
+    ``limit_reprice_after_s`` and is then given up (``EXPIRED_UNFILLED``); S1 decides again.
   * Hard cap: entry/rebalance orders older than ``limit_cancel_after_s`` (from the first
     placement) are canceled (``EXPIRED_UNFILLED``).
   * A remainder below the exchange minimum ends the order (``DUST_REMAINDER``).
@@ -131,8 +141,9 @@ from wta.utils.timeutil import Clock
 
 log = logging.getLogger(__name__)
 
-GIVE_UP_PURPOSES = frozenset({"entry", "rebalance", "probe"})  # never cross the spread to finish
-CROSS_PURPOSES = frozenset({"exit", "stop", "leg2", "flatten"})  # must finish: cross after the reprices
+# never cross the spread to finish (leg 2: S1 re-decides with its loss limit, see the module docstring)
+GIVE_UP_PURPOSES = frozenset({"entry", "rebalance", "probe", "leg2"})
+CROSS_PURPOSES = frozenset({"exit", "stop", "flatten"})  # must finish: cross after the reprices
 STOP_TYPES = frozenset({"STOP_LIMIT", "STOP_MARKET"})
 STOP_POLL_FACTOR = 5  # resting stops are polled every 5 x poll_interval_s
 NOT_FOUND_POLLS = 3  # consecutive "unknown order" answers before an order counts as not placed
@@ -782,7 +793,7 @@ class OrderManager:
         Runs exactly what happens when the manager sees an order end by itself (``_after_terminal``
         -> ``_finish``): a dead server stop hands its position to the software stop, ``exit_pending``
         is cleared, the outcome is written, a filled entry gets its protective stop, and a
-        must-finish order (exit/stop/leg2/flatten) re-crosses its remainder instead of dropping it.
+        must-finish order (exit/stop/flatten) re-crosses its remainder instead of dropping it.
         Events go to the next ``poll`` result.
         """
         if mo.done:
@@ -1473,6 +1484,10 @@ class OrderManager:
         return req, attempt
 
     def _max_reprices(self, intent: Intent) -> int:
+        if intent.purpose == "entry" and intent.features.get("cost_model") == "lockin":
+            return 0  # a lock-in leg 1 never chases the market (module docstring)
+        if intent.purpose == "leg2":
+            return 0  # nor does leg 2: S1 re-checks its loss limit before every placement
         return self.ex.flatten_max_reprices if intent.purpose == "flatten" else self.ex.limit_max_reprices
 
     def _initial_price(self, intent: Intent, market: MarketInfo, book: BookSnapshot | None) -> Decimal | None:

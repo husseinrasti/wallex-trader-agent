@@ -307,7 +307,9 @@ async def test_drawdown_kill_cancels_entries_flattens_and_reset_kill_resumes(
         },
         {**TOO_SMALL, "at_s": 20, "qty": "1", "reason": "entry while killed"},
     ]
-    rig = await make_rig(tmp_path, injected=inject_file(tmp_path, *rows))
+    # the rig's store is the file the CLI resolves for shadow (``{mode}`` -> shadow)
+    cfg = make_cfg(tmp_path, **{"data.sqlite_path": str(tmp_path / "wta.shadow.sqlite")})
+    rig = await make_rig(tmp_path, cfg=cfg, injected=inject_file(tmp_path, *rows))
     await rig.tick(3)  # entry filled + stop placed; resting BTCTMN entry placed
     assert len(rig.engine.portfolio.positions) == 1
     resting = [m for m in rig.engine.order_manager.live() if m.symbol == "BTCTMN"]
@@ -344,7 +346,6 @@ async def test_drawdown_kill_cancels_entries_flattens_and_reset_kill_resumes(
     monkeypatch.setattr(cli, "load_settings", lambda: Settings(_env_file=None))
     monkeypatch.setattr(engine_mod, "KILL_FILE", tmp_path / "KILL")
     rig.store.flush()
-    db = rig.engine.cfg.data.sqlite_path
     argv = [
         "reset-kill",
         "--reason",
@@ -352,7 +353,7 @@ async def test_drawdown_kill_cancels_entries_flattens_and_reset_kill_resumes(
         "--log-dir",
         str(rig.logs),
         "--set",
-        f"data.sqlite_path={db}",
+        f"data.state_sqlite_path={tmp_path / 'wta.{mode}.sqlite'}",  # reset-kill works on the engine's state DB
     ]
     assert cli.main(argv) == 0
     await rig.tick()
@@ -662,12 +663,18 @@ async def test_run_engine_wires_paper_exchange_and_the_synthetic_feed(tmp_path: 
     health = list(iter_family(tmp_path / "logs", "health", strict=True))
     assert health and all(h["extra"]["feed"] == "synthetic" for h in health)
     assert health[-1]["equity_tmn"] is not None and health[-1]["reasons"] == []
-    store = Store.open_readonly(tmp_path / "wta.sqlite")
+    state_db = tmp_path / "wta.state_shadow_synthetic.sqlite"  # synthetic data: its own account
+    assert start["strategies"] == ["S1", "S2"] and start["state_db"] == str(state_db)
+    # the engine state lives in the per-mode state DB derived from data.sqlite_path (PRD-03 wiring)
+    assert not (tmp_path / "wta.sqlite").exists()
+    store = Store.open_readonly(state_db)
     counts = store.counts()
-    assert store.kv_get(KV_PAPER)["balances"]["TMN"]["free"] == "5000000"
+    tmn = store.kv_get(KV_PAPER)["balances"]["TMN"]
     store.close()
+    # S2's initial allocation may already lock (or spend) TMN for USDT; nothing else trades
+    assert 0 < D(tmn["free"]) + D(tmn["locked"]) <= D("5000000")
     assert counts["equity"] >= 1 and counts["ticks"] >= 5 and counts["engine_books"] >= 5
-    assert counts["candles"] >= 5  # synthetic candles go to the store
+    assert counts["candles"] >= 5  # synthetic candles go to the state DB (and the candle cache)
     assert check_logs(tmp_path / "logs").ok
 
 
@@ -774,8 +781,8 @@ def test_cli_reset_kill_needs_a_reason_and_refuses_while_the_kill_file_exists(
     monkeypatch.setattr(cli, "load_settings", lambda: Settings(_env_file=None))
     kill_file = tmp_path / "KILL"
     monkeypatch.setattr(engine_mod, "KILL_FILE", kill_file)
-    db = tmp_path / "wta.sqlite"
-    common = ["--log-dir", str(tmp_path / "logs"), "--set", f"data.sqlite_path={db}"]
+    db = tmp_path / "wta.shadow.sqlite"  # the shadow state DB of the template below
+    common = ["--log-dir", str(tmp_path / "logs"), "--set", f"data.state_sqlite_path={tmp_path / 'wta.{mode}.sqlite'}"]
     assert cli.main(["reset-kill", *common]) == 2  # --reason is required
     assert cli.main(["reset-kill", "--reason", "  ", *common]) == 2
     assert cli.main(["reset-kill", "--reason", "x", *common]) == 1  # no database yet

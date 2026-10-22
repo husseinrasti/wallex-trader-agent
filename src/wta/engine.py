@@ -12,7 +12,10 @@ Startup (PRD-02 §5), in ``startup()``: the ``start`` event (``reason`` = ``rest
 holds earlier engine state, else ``fresh``) -> ``startup_restore`` (peak equity, day-start equity,
 fees, order counters, realized PnL, kill/pause/flatten flags, open positions and live orders; a
 restart resets none of them) -> a pending manual kill reset is applied -> the startup reconcile
-against the exchange -> a ``restart`` event with both summaries. Then the loops start.
+against the exchange -> a ``restart`` event with both summaries. Then the loops start. If the
+restore raises (e.g. ``database is locked``), nothing is ever persisted from that process state —
+not by the ticks, not by ``shutdown()`` — because defaults (``killed=False``, no peak, empty strategy
+and feature state) would overwrite the saved rows; the next tick runs the whole startup again.
 ``run()`` starts the market-data tasks *before* ``startup()`` and waits (at most
 ``engine.stale_data_s``) for the books the reconcile needs (USDTTMN and the symbols of our
 positions and orders): every fill or close it books is valued in TMN, never at 0. If they do not
@@ -37,11 +40,69 @@ Fast tick (every ``engine.fast_loop_interval_s``, PRD-02 §8), in ``tick(now)``:
    count paper fills twice: the exchange has them, the OrderManager applies them again.)
 5. Intents, each through ``risk.evaluate`` -> ``order_manager.submit``: exits of positions
    (software stops, targets, time stops), flatten SELLs (deadline phases or kill-switch),
-   strategy intents from ``intent_sources`` (none by default: the "S0 no-op strategy"; PRD-03
-   plugs strategies in) and acceptance-test intents injected from a JSONL file.
+   strategy intents (below), intents from ``intent_sources`` (tests/tools) and acceptance-test
+   intents injected from a JSONL file.
 6. Scheduler: reconcile every ``reconcile_interval_s`` and after an API error burst; an equity row
-   every ``equity_row_interval_s``; kv state (portfolio, flags, orders, paper exchange) whenever it
-   changed; the books and tick used (replay inputs, ``engine_books`` / ``ticks`` tables).
+   every ``equity_row_interval_s``; kv state (portfolio, flags, orders, paper exchange, strategy
+   and feature state) whenever it changed; the books and tick used (replay inputs,
+   ``engine_books`` / ``ticks`` tables).
+
+Strategies (PRD-03; ``strategies`` = S1 + S2 always, S3 when ``strategies.s3_momentum.enabled``),
+inside step 5 of every tick, after the order poll and the balance refresh:
+
+a. ``FeatureEngine.compute(now, books, candles, watchlist)`` (every tick, so the cross-book
+   deviation history behind ``dev_zscore`` is sampled evenly) and a ``PortfolioView``; together with
+   the markets, the plan (``plan``: None until the AI layer is wired, always None with
+   ``ai.enabled: false``), the config, ``engine.rng_seed`` and the flatten phase they form the
+   tick's ``StrategyContext``. One id counter per tick is shared by the PositionManager exits and
+   every strategy intent, so decision ids never collide.
+b. Hooks, with that context, before ``on_tick``: every ``FillEvent`` of the poll goes to the
+   strategy that owns the order (``on_fill(fill, position, ctx)``; ``position`` is the position
+   after the fill, the closed position's last state when the fill closed it, or None for fills
+   without a position such as S2 rebalances), every finished order to ``on_order_done`` with its
+   *logical* fill (``ManagedOrder.logical_filled`` across all re-placements). The router notes
+   every fill (symbol cooldown). Hook intents (S1 leg 2 or its degrade stop) go through risk ->
+   submit at once, in the same tick. After positions close, ``prune`` drops their strategy state.
+c. ``router.tick(ctx, exits)`` (the PositionManager exits first, then S1 -> S2 -> S3, filtered for
+   one strategy per symbol, one open order per (strategy, symbol) and the symbol cooldown) ->
+   ``router.apply_cooldown`` -> risk -> submit. The portfolio view is rebuilt after the hook
+   intents, so ``on_tick`` sees the orders they placed. Every decision record of a strategy batch
+   carries ``FeatureSnapshot.compact`` of the symbols the intent used (``features.books_used``) and
+   the plan snapshot. An intent the router drops gets a ``no_trade`` record (repeats suppressed
+   like vetoes).
+d. Not asked while killed, in a flatten phase, during a manual flatten (``flatten_now``) or before a
+   deferred startup reconcile (Phase-2 semantics): exits and flatten orders only. Hooks are still
+   delivered (bookkeeping); intents they return are dropped then (S1 returns none in a flatten
+   phase anyway and retries leg 2 on its next tick).
+e. Each heartbeat puts compact diagnostics into ``health.extra.strategies``: S1 per coin
+   edge / cost / need / why-no-trade plus the engine's opportunity-tick counters, S2 target /
+   current / status, S3 status.
+
+Candles: ``candles`` (``CandleCache``) holds the last 26 h of 1-minute candles per watchlist
+symbol in memory (missing minutes read as flat bars); the fast loop never queries SQLite for
+candles. It is loaded from the state DB at startup (per symbol the bars within 26 h of its newest
+stored bar: the cache's own trim rule). Feed ``live``: a supervised ``CandleRefresher`` task
+backfills the window through ``rest.get_candles`` in requests of at most one day and refreshes
+every ``data.candle_poll_interval_s``. Feed ``synthetic``: ``SyntheticFeed.on_candle`` ->
+``ingest_candles``. Either way every new or changed bar goes into the state DB twice: ``candles``
+(latest version, for the next startup) and the append-only ``engine_candles`` with a sequence
+number. Each tick takes its candle snapshot together with its book snapshot, at the start of the
+tick, and its ``ticks`` row records ``candle_seq``: a replay applies the ``engine_candles`` rows
+with ``seq <= candle_seq`` to an empty ``CandleCache`` and gets exactly the candles the tick's
+features were computed from (a refresh that lands during the tick's awaits is in the next tick).
+
+State DB per mode and feed: the engine's store is ``state_db_path(cfg, mode, feed)`` —
+``data.state_sqlite_path`` with ``{mode}`` replaced (default ``data/state_shadow.sqlite`` /
+``data/state_live.sqlite``; ``data/state_shadow_synthetic.sqlite`` on the synthetic feed; a path
+without ``{mode}`` gets ``.<mode>`` inserted before its suffix), so a shadow run, a synthetic
+exercise and the live account never share kv state, positions, orders, equity or candles. The
+recorder keeps ``data.sqlite_path``. When only ``data.sqlite_path`` is overridden (``--set``, e.g.
+``make shadow-synth``) and ``data.state_sqlite_path`` is left at its default, the state DB is
+derived from it: ``<dir>/<stem>.state_{mode}.sqlite`` (``data/shadow_synth.sqlite`` ->
+``data/shadow_synth.state_shadow.sqlite``), so a separate market DB still means a separate
+account, per mode, and never the default ``data/state_shadow.sqlite``. kv keys ``strategy_state`` (``router.state()``, every tick it changed) and
+``feature_state`` (``FeatureEngine.state()``, at most every ``FEATURE_STATE_EVERY_S`` and at
+shutdown: it holds an hour of deviation samples) are restored at startup.
 
 Guardian rules the engine adds on top of the RiskManager:
 
@@ -63,8 +124,12 @@ Guardian rules the engine adds on top of the RiskManager:
   are canceled with it (the operator decided to resume, not to keep selling).
 
 Persistence: one fast tick is **one SQLite commit** (``Store.transaction``): orders, fills,
-positions and the kv state (portfolio, flags, orders, paper exchange) always move together, so a
-crash restores the state as of the end of a tick. Exceptions: right before an order is sent the
+positions and the kv state (portfolio, flags, orders, paper exchange, strategy state; the feature
+state when it is due) always move together, so a crash restores the state as of the end of a tick
+(the z-score history may miss up to ``FEATURE_STATE_EVERY_S`` of samples, which barely moves an
+hour-long mean). A strategy that raises crashes the tick like any engine bug (``safe_tick``
+counts it; a storm kills and flattens): a broken strategy must not keep trading, and unhedged S1
+coins must not be left alone. Exceptions: right before an order is sent the
 OrderManager's write-ahead record is committed together with the kv state of that moment
 (``_checkpoint``), and the kill-switch commits at once. A failing commit is logged, its rows stay
 pending and the next tick retries them: storage trouble never counts as a tick crash.
@@ -73,8 +138,8 @@ Stopping: a stop (signal, ``--seconds``, flatten complete) never interrupts a ti
 flight would be lost. The fast loop ends between two ticks and ``run()`` waits for it before the
 other tasks are cancelled.
 
-One process per account: ``build_engine`` takes an exclusive lock next to the SQLite file
-(``<sqlite_path>.engine.lock``), so ``wta run`` and ``scripts/flatten_now.py`` can never trade the
+One process per account: ``build_engine`` takes an exclusive lock next to the state DB
+(``<state db>.engine.lock``), so ``wta run`` and ``scripts/flatten_now.py`` can never trade the
 same account (or paper account) at once. Live mode also refuses to start without
 ``engine.challenge_end_utc`` (``CHALLENGE_END_UTC``): without it the mandatory flatten to 100 % TMN
 before the end would never run.
@@ -93,6 +158,7 @@ performance: the ``start`` event and every heartbeat say so.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import json
 import logging
@@ -112,13 +178,20 @@ try:  # POSIX only; without it (Windows) the one-engine-per-account lock is skip
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
-from wta.config import ROOT, Config, Settings, mask_secrets
-from wta.data.collector import RestPoller, make_rest
+from wta.config import ROOT, Config, DataCfg, Settings, mask_secrets
+from wta.data.collector import CANDLE_CACHE_KEEP_S, CandleCache, CandleRefresher, RestPoller, make_rest
 from wta.data.store import Store
 from wta.exchange.base import Exchange, MarketDataBus, WallexAPIError
 from wta.exchange.paper import PaperExchange
 from wta.execution.order_manager import OrderManager, PollResult
-from wta.execution.positions import CLOSING_PURPOSES, FIAT, USDTTMN, PortfolioState, PositionManager
+from wta.execution.positions import (
+    CLOSING_PURPOSES,
+    FIAT,
+    USDTTMN,
+    ClosedPosition,
+    PortfolioState,
+    PositionManager,
+)
 from wta.execution.reconcile import (
     KV_FLAGS,
     KV_ORDER_MANAGER,
@@ -127,13 +200,31 @@ from wta.execution.reconcile import (
     ReconcileReport,
     startup_restore,
 )
+from wta.features.engine import FeatureEngine, FeatureSnapshot
 from wta.logging_.decision_log import DecisionLog, EventsLog, OrdersLog
 from wta.logging_.health_log import HealthLog
-from wta.models import Balance, BookSnapshot, HealthRecord, Intent, MarketInfo, OrderType, Purpose, Side
+from wta.models import (
+    D0,
+    Balance,
+    BookSnapshot,
+    Candle,
+    HealthRecord,
+    Intent,
+    MarketInfo,
+    MarketPlan,
+    OrderType,
+    Purpose,
+    Side,
+)
 from wta.risk.context import Deadline, EngineFlags, RecentIntent, RiskContext
 from wta.risk.flatten import FlattenManager, cancel_at_flatten_start, flatten_phase_transitions
 from wta.risk.manager import RiskEvent, RiskManager
 from wta.safety import LiveGuardError, check_live_guard, deadline_guard_reason, tree_is_dirty
+from wta.strategies.base import PortfolioView, Strategy, StrategyContext
+from wta.strategies.router import StrategyRouter
+from wta.strategies.s1_crossbook import S1CrossBook
+from wta.strategies.s2_usdtalloc import S2USDTAlloc
+from wta.strategies.s3_momentum import S3Momentum
 from wta.utils import gitinfo
 from wta.utils.decimalutil import D, pct
 from wta.utils.ids import OUR_PREFIXES, strategy_prefix
@@ -155,8 +246,66 @@ KILL_FILE = ROOT / "KILL"  # create it to kill the running engine
 VETO_REPEAT_S = 60.0  # identical vetoes of the same intent are logged at most this often
 FEEDS = ("live", "synthetic")
 SYNTHETIC_NOTE = "synthetic market data: an offline exercise of the engine, never evidence of performance"
+KV_STRATEGY = "strategy_state"  # StrategyRouter.state(): router + every strategy (replay / restart)
+KV_FEATURES = "feature_state"  # FeatureEngine.state(): the rolling cross-book deviation history
+FEATURE_STATE_EVERY_S = 60.0  # the feature state is ~one hour of samples: saved at most this often
+CANDLE_RESOLUTION = "1"
+ROUTER_DROPS_SHOWN = 10  # router drops listed in a heartbeat
+S1_COIN_KEYS = (  # S1 diagnostics per coin that a heartbeat carries
+    "edge_tmn_cheap_pct",
+    "cost_tmn_cheap_pct",
+    "need_tmn_cheap_pct",
+    "edge_usdt_cheap_pct",
+    "cost_usdt_cheap_pct",
+    "need_usdt_cheap_pct",
+    "dev_mid_pct",
+    "dev_zscore",
+    "dev_samples",
+    "why_no_trade",
+    "decision",
+)
 
 IntentSource = Callable[[RiskContext], list[Intent]]
+
+
+def state_db_path(cfg: Config, mode: str, feed: str = "live") -> str:
+    """The engine's state DB for ``mode`` and ``feed`` (see "State DB per mode" in the module docstring).
+
+    The account label is ``mode`` on the live feed and ``{mode}_{feed}`` otherwise (``shadow`` vs
+    ``shadow_synthetic``): synthetic prices never touch the real-feed shadow account, its candles or
+    its z-score history. ``data.state_sqlite_path`` with ``{mode}`` replaced by that label; a path
+    without ``{mode}`` gets it inserted before the suffix (``x/state.sqlite`` ->
+    ``x/state.shadow.sqlite``), so shadow and live can never share a file. Left at its default while
+    ``data.sqlite_path`` is overridden, it is derived from the market DB instead:
+    ``<dir>/<stem>.state_{mode}.sqlite``. ``:memory:`` stays in memory.
+    """
+    label = mode if feed == "live" else f"{mode}_{feed}"
+    template = cfg.data.state_sqlite_path
+    default_state = str(DataCfg.model_fields["state_sqlite_path"].default)
+    default_market = str(DataCfg.model_fields["sqlite_path"].default)
+    if template == default_state and cfg.data.sqlite_path != default_market:
+        if cfg.data.sqlite_path == ":memory:":
+            return ":memory:"
+        market = Path(cfg.data.sqlite_path)
+        template = str(market.parent / f"{market.stem}.state_{{mode}}.sqlite")
+    if template == ":memory:":
+        return template
+    if "{mode}" not in template:
+        path = Path(template)
+        return str(path.with_name(f"{path.stem}.{label}{path.suffix}"))
+    return template.replace("{mode}", label)
+
+
+def default_strategies(cfg: Config) -> list[Strategy]:
+    """S1 and S2 always (each checks its own ``enabled`` flag every tick, so its diagnostics still
+    report why it is idle); S3 only when ``strategies.s3_momentum.enabled``."""
+    out: list[Strategy] = [
+        S1CrossBook(cfg.strategies.s1_crossbook),
+        S2USDTAlloc(cfg.strategies.s2_usdtalloc),
+    ]
+    if cfg.strategies.s3_momentum.enabled:
+        out.append(S3Momentum(cfg.strategies.s3_momentum, ai_enabled=cfg.ai.enabled))
+    return out
 
 
 class EngineLockError(RuntimeError):
@@ -456,9 +605,12 @@ class Engine:
     ``rest`` is the market-data client polled by ``RestPoller`` (``get_all_depth``/``get_depth``);
     ``ws`` and ``synthetic`` are feeds with ``async run(stop_event)``. ``exchange`` (with
     ``markets``) turns trading on; without it the engine only monitors data (PRD-01).
-    ``intent_sources`` are callables ``(RiskContext) -> list[Intent]`` asked every tick
-    (strategies, PRD-03); ``injected`` are acceptance-test intents. ``clock`` is wrapped in a
-    ``TickClock`` (unless it is one already) for everything but the market-data feeds.
+    ``strategies`` (PRD-03; ``build_engine`` passes ``default_strategies(cfg)``) run through a
+    ``StrategyRouter`` every tick; without them (the default here, e.g. Phase-2 tests) no strategy
+    runs. ``intent_sources`` are callables ``(RiskContext) -> list[Intent]`` asked every tick
+    (tests, tools); ``injected`` are acceptance-test intents. ``overlays`` only label the start
+    event (the config is already merged). ``clock`` is wrapped in a ``TickClock`` (unless it is one
+    already) for everything but the market-data feeds.
     """
 
     def __init__(
@@ -483,6 +635,8 @@ class Engine:
         intent_sources: list[IntentSource] | None = None,
         injected: list[InjectedIntent] | None = None,
         kill_file: Path | None = KILL_FILE,
+        strategies: list[Strategy] | None = None,
+        overlays: list[str] | None = None,
     ) -> None:
         self.cfg = cfg
         self.settings = settings
@@ -544,6 +698,7 @@ class Engine:
         self._error_samples: deque[tuple[float, int]] = deque()
         self._last_stale_warning = float("-inf")
         self._started = False
+        self._restored = False  # startup_restore + strategy/feature state loaded (see ``startup``)
         self._shut_down = False
 
         # trading components (None in monitoring-only mode)
@@ -573,6 +728,34 @@ class Engine:
         self._reconcile_reason: str | None = None  # an unscheduled reconcile is due (API error burst)
         self._startup_reconcile_due = False  # deferred: the books it needs were not there at startup
         self.lock: IO[str] | None = None  # one engine per account (build_engine); released by aclose()
+        self.overlays = list(overlays or [])
+
+        # strategies (PRD-03): None without strategies (monitoring, Phase-2 style engines)
+        self.router: StrategyRouter | None = None
+        self.features: FeatureEngine | None = None
+        if exchange is not None and strategies:
+            self.router = StrategyRouter(list(strategies), cfg)
+            self.features = FeatureEngine(cfg, self.markets)
+        self.plan: MarketPlan | None = None  # latest validated plan (AI layer, a later phase)
+        self.strategies_enabled = True  # False during a manual flatten (flatten_now)
+        self.strategy_status = "not started"
+        self.last_features: FeatureSnapshot | None = None
+        self.s1_stats: dict[str, dict[str, Any]] = {}  # per coin: evaluated / opportunity ticks
+        self._feature_state_ts = float("-inf")
+        self.candles = CandleCache(self.watchlist, keep_s=CANDLE_CACHE_KEEP_S, resolution=CANDLE_RESOLUTION)
+        self._candle_seq = 0  # arrivals in ``candles`` (engine_candles.seq), monotonic per state DB
+        self._tick_candles: dict[str, list[Candle]] | None = None  # this tick's candle snapshot
+        self._tick_candle_seq: int | None = None
+        self.candle_refresher: CandleRefresher | None = None
+        if exchange is not None and feed == "live" and callable(getattr(rest, "get_candles", None)):
+            self.candle_refresher = CandleRefresher(
+                rest,
+                self.candles,
+                self.watchlist,
+                sink=self.ingest_candles,
+                interval_s=cfg.data.candle_poll_interval_s,
+                clock=self.clock.base,  # real time, like the other market-data tasks
+            )
         if exchange is not None:
             self.decision_log = DecisionLog(
                 self.log_dir, mode, self.git_commit, self.config_hash, clock, self._secrets
@@ -635,6 +818,8 @@ class Engine:
             data_jobs["ws"] = lambda: self.ws.run(self._stop)
         if self.synthetic is not None:
             data_jobs["synthetic"] = lambda: self.synthetic.run(self._stop)
+        if self.candle_refresher is not None:
+            data_jobs["candles"] = self.candle_refresher.run
         loop_jobs: dict[str, Callable[[], Awaitable[Any]]] = {
             "fast_loop": self._fast_loop,
             "heartbeat": self._heartbeat_loop,
@@ -719,13 +904,22 @@ class Engine:
         )
         if not self.trading:
             return {"restored": False}
-        with self.clock.frozen(now):
-            restore = await startup_restore(
-                self.store, self.portfolio, self.flags, self.positions, self.order_manager, now
-            )
-            await self._restore_after_kill_reset(now)
-            self._last_day_start_ts = self.portfolio.day_start_ts
-            await self._seed_balances(now)
+        try:
+            with self.clock.frozen(now):
+                restore = await startup_restore(
+                    self.store, self.portfolio, self.flags, self.positions, self.order_manager, now
+                )
+                restore.update(self._restore_strategies(now))
+                await self._restore_after_kill_reset(now)
+                self._last_day_start_ts = self.portfolio.day_start_ts
+                await self._seed_balances(now)
+        except BaseException:
+            # nothing is persisted and nothing trades on half-restored defaults: the next tick
+            # (or run) tries the whole startup again
+            self._started = False
+            log.exception("engine: state restore failed; nothing is persisted until it succeeds")
+            raise
+        self._restored = True
         wait_s = self.cfg.engine.stale_data_s if books_wait_s is None else books_wait_s
         books = await self._startup_books(wait_s) if wait_for_books else self._snapshot()
         now = self.clock.now()
@@ -751,6 +945,30 @@ class Engine:
                 )
             self._persist(now, force=True)
         return summary
+
+    def _restore_strategies(self, now: float) -> dict[str, Any]:
+        """Startup: candles of the last 26 h from the state DB into the cache, then the strategy and
+        feature state saved in kv (``strategy_state`` / ``feature_state``)."""
+        out: dict[str, Any] = {}
+        bars = 0
+        for symbol in self.watchlist:
+            latest = self.store.latest_candle_ts(symbol, CANDLE_RESOLUTION)
+            if latest is None:
+                continue
+            got = self.store.load_candles(symbol, CANDLE_RESOLUTION, from_ts=latest - CANDLE_CACHE_KEEP_S)
+            bars += self.candles.add(got)
+        out["candles_loaded"] = bars
+        self._candle_seq = self.store.max_engine_candle_seq(self.mode)
+        out["candle_seq"] = self._candle_seq
+        if self.router is None or self.features is None:
+            return out
+        strategy_state = self.store.kv_get(KV_STRATEGY)
+        feature_state = self.store.kv_get(KV_FEATURES)
+        self.router.load_state(strategy_state)
+        self.features.load_state(feature_state)
+        out["strategy_state"] = strategy_state is not None
+        out["feature_state"] = feature_state is not None
+        return out
 
     def _missing_books(self, books: dict[str, BookSnapshot]) -> list[str]:
         """Books the reconcile needs to value fills in TMN: USDTTMN and the symbols of our
@@ -786,6 +1004,10 @@ class Engine:
             "git_dirty": self.git_dirty,
             "git_tag": self.git_tag,
             "config_hash": self.config_hash,
+            "overlays": list(self.overlays),
+            "state_db": self.store.path,
+            "strategies": [s.id for s in self.router.strategies] if self.router is not None else [],
+            "rules_only": self.current_plan(self.clock.now()) is None,  # no fresh plan: rules-only defaults
             "markets_source": self.markets_source or None,
             "trading": self.trading,
             "exchange": getattr(self.exchange, "name", None),
@@ -815,7 +1037,9 @@ class Engine:
             self.write_heartbeat(now)
         except Exception:
             log.exception("engine: final heartbeat failed")
-        if self.trading:
+        if self.trading and not self._restored:
+            log.error("engine: the state was never restored from %s: nothing persisted at shutdown", self.store.path)
+        elif self.trading:
             try:
                 with self.store.transaction():
                     self._persist(now, force=True)
@@ -963,7 +1187,7 @@ class Engine:
         self._bookkeeping(now)
         if not self.trading:
             return
-        if not self._started:
+        if not self._restored:  # also after a failed startup: never trade or persist on defaults
             await self.startup()
         with self.clock.frozen(now), self.store.transaction(raise_errors=False):
             try:
@@ -982,6 +1206,9 @@ class Engine:
             # for the rest of the tick (``wta reset-kill`` writes the same database)
             await self._poll_kill_reset(now)
         books = self._snapshot()
+        if self.router is not None:  # candles are snapshotted with the books (replay: candle_seq)
+            self._tick_candles = self.candles.snapshot(self.watchlist)
+            self._tick_candle_seq = self._candle_seq
         self._record_inputs(books, now)  # first: a tick that crashes later is still replayable
         if self.paper is not None:
             self.paper.on_tick(now, books)
@@ -999,7 +1226,7 @@ class Engine:
         self._after_poll(result, now)
         await self._refresh_balances(now, books)
         self._note_flatten_before()
-        await self._intents(ctx)
+        await self._intents(ctx, result)
         await self._scheduled(ctx)
 
     def _bookkeeping(self, now: float) -> None:
@@ -1044,6 +1271,7 @@ class Engine:
             cfg=self.cfg,
             flags=self.flags,
             deadline=self.deadline,
+            plan=self.current_plan(now),
             recent_intents=self.recent_intents,
             api_consecutive_errors=self._api_consecutive_errors(),
         )
@@ -1316,18 +1544,26 @@ class Engine:
             phase = max(phase, manual)
         return phase
 
-    async def _intents(self, ctx: RiskContext) -> None:
-        """Exits, flatten, strategies and injected intents -> risk -> orders (in this order)."""
+    async def _intents(self, ctx: RiskContext, result: PollResult | None = None) -> None:
+        """Exits (+ strategies), flatten, intent sources and injected intents -> risk -> orders.
+
+        Without strategies the exits go out first exactly as in Phase 2; with them the exits are
+        part of the strategy step (hook intents, then ``router.tick(ctx, exits)``).
+        """
         now, books = ctx.now, ctx.books
         # forget vetoes not repeated for a while (kept 2 windows, so a due repeat still finds its count)
         self._veto_memo = {k: v for k, v in self._veto_memo.items() if now - v[0] < 2 * VETO_REPEAT_S}
         over = self.flags.flatten_phase >= 3
+        exits: list[Intent] = []
         if not over and self.flags.flatten_phase < 2:
             exits = self.positions.check_exits(
                 books, now, software_stops=not self.cfg.execution.use_server_side_stops
             )
-            await self._process(exits, ctx)
         phase = self._flatten_phase(now)
+        if self.router is None:
+            await self._process(exits, ctx)
+        else:
+            await self._strategy_step(ctx, result or PollResult(), exits, phase)
         if phase:
             if self.manual_flatten is not None and self.manual_flatten.get("start_ts") is None:
                 self.manual_flatten["start_ts"] = now
@@ -1349,12 +1585,23 @@ class Engine:
         return [x.to_intent(now) for x in due]
 
     async def _process(
-        self, intents: list[Intent], ctx: RiskContext, *, suppress_repeats: bool = True
+        self,
+        intents: list[Intent],
+        ctx: RiskContext,
+        *,
+        suppress_repeats: bool = True,
+        snapshot: FeatureSnapshot | None = None,
     ) -> None:
-        """risk.evaluate -> order_manager.submit for each intent; balances re-read after placements."""
+        """risk.evaluate -> order_manager.submit for each intent; balances re-read after placements.
+
+        ``snapshot`` (strategy batches): the decision record's ``features`` become the compact
+        feature snapshot of the symbols the intent used, and the plan snapshot is attached.
+        """
+        plan = self.current_plan(ctx.now) if snapshot is not None else None
+        plan_snapshot = plan.model_dump(mode="json") if plan is not None else None
         for intent in intents:
             decision = self.risk.evaluate(intent, self._risk_view(ctx, intent))
-            features: dict[str, Any] | None = None
+            features = self._decision_features(intent, snapshot) if snapshot is not None else None
             if not decision.approved and suppress_repeats:
                 key = (
                     intent.strategy,
@@ -1369,9 +1616,12 @@ class Engine:
                     self._veto_memo[key] = (memo[0], memo[1] + 1)
                     continue
                 if memo is not None and memo[1]:
-                    features = {**intent.features, "veto_repeats_suppressed": memo[1]}
+                    features = {**(features if features is not None else intent.features),
+                                "veto_repeats_suppressed": memo[1]}
                 self._veto_memo[key] = (ctx.now, 0)
-            placed = await self.order_manager.submit(intent, decision, ctx.books, features=features)
+            placed = await self.order_manager.submit(
+                intent, decision, ctx.books, features=features, plan_snapshot=plan_snapshot
+            )
             if decision.approved:
                 self.recent_intents.append(
                     RecentIntent(ctx.now, intent.strategy, intent.symbol, intent.side, intent.purpose)
@@ -1400,6 +1650,279 @@ class Engine:
         freed = Balance(asset=pos.base, free=bal.free + release, locked=bal.locked - release)
         view = dataclasses.replace(port, balances={**port.balances, pos.base: freed})
         return dataclasses.replace(ctx, portfolio=view)
+
+    # ------------------------------------------------------------ strategies (PRD-03)
+
+    def current_plan(self, now: float | None = None) -> MarketPlan | None:
+        """The plan in force at ``now`` (default: the clock): ``plan`` (set by the AI layer once it
+        is wired) while it is fresh (``now - plan.ts <= ai.plan_stale_s``, the same rule as
+        ``StrategyContext.plan_fresh``), never one while ``ai.enabled`` is false. None = rules-only
+        defaults, so a decision record's ``plan_snapshot`` is always the envelope the strategies used."""
+        if not self.cfg.ai.enabled or self.plan is None:
+            return None
+        t = self.clock.now() if now is None else now
+        return self.plan if t - self.plan.ts <= self.cfg.ai.plan_stale_s else None
+
+    def _strategy_block(self) -> str | None:
+        """Why the strategies are not asked this tick (None: they are)."""
+        if not self.strategies_enabled:
+            return "manual flatten: no strategy runs"
+        if self.flags.flatten_phase >= 3:
+            return "challenge over: no orders"
+        if self.flags.killed:
+            return f"killed ({self.flags.kill_reason}): exits and flatten only"
+        if self.flags.flatten_phase:
+            return f"flatten phase {self.flags.flatten_phase}: exits and flatten only"
+        if self._startup_reconcile_due:
+            return "waiting for the deferred startup reconcile"
+        return None
+
+    async def _strategy_step(
+        self, ctx: RiskContext, result: PollResult, exits: list[Intent], phase: int
+    ) -> None:
+        """Steps a-d of "Strategies" in the module docstring."""
+        assert self.router is not None
+        now = ctx.now
+        block = self._strategy_block()
+        self.strategy_status = block or "active"
+        for ev in result.fills:
+            self.router.note_fill(ev.fill.symbol, ev.fill.ts)
+        seq = [len(exits)]  # check_exits numbered its intents 1..n: strategies continue from there
+        sctx = self._strategy_context(ctx, phase, seq)
+        hook_intents = self._deliver_hooks(result, sctx)
+        if result.closed:
+            self._prune_strategies()
+        if block is not None:
+            if hook_intents:
+                log.info(
+                    "engine: %d hook intent(s) not sent (%s): %s",
+                    len(hook_intents), block, ", ".join(i.id for i in hook_intents),
+                )
+            await self._process(exits, ctx)
+            return
+        if hook_intents:
+            kept, dropped = self.router.apply_cooldown(hook_intents, now)
+            self._log_router_drops(
+                [(i, d["why"]) for i in hook_intents for d in dropped if d["intent"] == i.id], sctx.features, now
+            )
+            await self._process(kept, ctx, snapshot=sctx.features)
+            sctx.portfolio = self._portfolio_view(ctx.books)  # on_tick sees what the hooks placed
+        intents = self.router.tick(sctx, exits)
+        kept, dropped = self.router.apply_cooldown(intents, now)
+        drops = list(self.router.dropped_intents)
+        drops += [(i, d["why"]) for i in intents for d in dropped if d["intent"] == i.id]
+        self._log_router_drops(drops, sctx.features, now)
+        self._note_s1_stats(now)
+        await self._process(kept, ctx, snapshot=sctx.features)
+
+    def _strategy_context(self, ctx: RiskContext, phase: int, seq: list[int]) -> StrategyContext:
+        """The tick's ``StrategyContext`` (features are computed here, once per tick)."""
+        assert self.features is not None
+        candles = self._tick_candles if self._tick_candles is not None else self.candles.snapshot(self.watchlist)
+        snap = self.features.compute(ctx.now, ctx.books, candles, self.watchlist)
+        self.last_features = snap
+        return StrategyContext(
+            now=ctx.now,
+            books=ctx.books,
+            features=snap,
+            candles={(s, CANDLE_RESOLUTION): c for s, c in candles.items()},
+            markets=self.markets,
+            portfolio=self._portfolio_view(ctx.books),
+            plan=self.current_plan(ctx.now),
+            cfg=self.cfg,
+            rng_seed=self.cfg.engine.rng_seed,
+            flatten_phase=phase,
+            seq=seq,
+        )
+
+    def _portfolio_view(self, books: dict[str, BookSnapshot]) -> PortfolioView:
+        """Read-only portfolio numbers for the strategies.
+
+        Equity is the latest usable valuation (else the last usable one): a book missing for a
+        moment must not halve the sizes. The RiskManager pauses entries on such an anomaly anyway.
+        """
+        p = self.portfolio
+        val = p.last_valuation
+        if val is not None and val.usable:
+            equity = val.equity_tmn
+        elif p.last_complete_equity_tmn is not None:
+            equity = p.last_complete_equity_tmn
+        else:
+            equity = val.equity_tmn if val is not None else D0
+        dollar = books.get(USDTTMN)
+        return PortfolioView(
+            equity_tmn=equity,
+            free={a: b.free for a, b in sorted(p.balances.items())},
+            total={a: b.total for a, b in sorted(p.balances.items())},
+            positions=tuple(p.positions[k] for k in sorted(p.positions)),
+            open_orders=tuple(o for _, o in sorted(p.open_orders.items()) if not o.is_terminal),
+            usdt_share=p.usdt_share,
+            coin_exposure_pct=p.coin_exposure_pct,
+            u_bid=dollar.best_bid if dollar is not None else None,
+        )
+
+    def _deliver_hooks(self, result: PollResult, sctx: StrategyContext) -> list[Intent]:
+        """``on_fill`` for every fill and ``on_order_done`` for every finished order of the poll,
+        each to the strategy that owns the order (by the intent's strategy id)."""
+        assert self.router is not None
+        out: list[Intent] = []
+        for ev in result.fills:
+            strat = self.router.by_id(ev.managed.intent.strategy)
+            if strat is None:
+                continue
+            res = ev.result
+            position = res.position if isinstance(res, ClosedPosition) else res
+            out.extend(strat.on_fill(ev.fill, position, sctx))
+        for mo in result.done:
+            strat = self.router.by_id(mo.intent.strategy)
+            if strat is None:
+                continue
+            # the logical order: every placement's fills (a re-placed order's current placement
+            # alone may show none although an earlier one filled)
+            order = mo.order.model_copy(
+                update={"filled_qty": mo.logical_filled, "avg_price": mo.avg_price, "fee_paid": mo.logical_fee}
+            )
+            out.extend(strat.on_order_done(order, sctx))
+        return out
+
+    def _prune_strategies(self) -> None:
+        """After positions closed: strategies with a ``prune`` forget the cycles of closed positions."""
+        if self.router is None:
+            return
+        for strat in self.router.strategies:
+            prune = getattr(strat, "prune", None)
+            if callable(prune):
+                prune(
+                    {
+                        str(p.meta.get("entry_decision_id") or p.id)
+                        for p in self.portfolio.positions.values()
+                        if p.strategy == strat.id
+                    }
+                )
+
+    def _decision_features(self, intent: Intent, snap: FeatureSnapshot) -> dict[str, Any]:
+        """``FeatureSnapshot.compact`` for the intent's symbol and ``features.books_used`` (and the
+        cross-book features of their coins)."""
+        used = intent.features.get("books_used")
+        symbols = {intent.symbol}
+        if isinstance(used, (list, tuple, set)):
+            symbols.update(str(s) for s in used)
+        elif isinstance(used, str) and used:
+            symbols.add(used)
+        coins = {self.markets[s].base for s in symbols if s in self.markets} & set(snap.cross)
+        return snap.compact(symbols=sorted(symbols), coins=sorted(coins))
+
+    def _log_router_drops(self, drops: list[tuple[Intent, str]], snap: FeatureSnapshot, now: float) -> None:
+        """A ``no_trade`` record per intent the router dropped (same intent and reason again within
+        ``VETO_REPEAT_S``: counted, not logged)."""
+        plan = self.current_plan(now)
+        for intent, why in drops:
+            key = ("router", intent.strategy, intent.symbol, intent.side, intent.purpose, why)
+            memo = self._veto_memo.get(key)
+            if memo is not None and now - memo[0] < VETO_REPEAT_S:
+                self._veto_memo[key] = (memo[0], memo[1] + 1)
+                continue
+            features = self._decision_features(intent, snap)
+            if memo is not None and memo[1]:
+                features["veto_repeats_suppressed"] = memo[1]
+            self._veto_memo[key] = (now, 0)
+            self.decision_log.record(
+                kind="no_trade",
+                decision_id=intent.id,
+                strategy=intent.strategy,
+                symbol=intent.symbol,
+                features=features,
+                plan_snapshot=plan.model_dump(mode="json") if plan is not None else None,
+                intent=intent,
+                notes=f"dropped by the strategy router: {why}; not sent to the RiskManager",
+            )
+
+    def _note_s1_stats(self, now: float) -> None:
+        """Per coin: ticks S1 evaluated and ticks a lock-in edge reached its need (edge >= cost +
+        margin on either side), plus the best excess seen (health and the shadow report)."""
+        s1 = self.router.by_id(S1CrossBook.id) if self.router is not None else None
+        if s1 is None:
+            return
+        coins = s1.diagnostics().get("coins") or {}
+        for coin in sorted(coins):
+            d = coins[coin] or {}
+            excess: Decimal | None = None
+            for side in ("tmn_cheap", "usdt_cheap"):
+                edge, need = d.get(f"edge_{side}_pct"), d.get(f"need_{side}_pct")
+                if edge is None or need is None:
+                    continue
+                try:
+                    x = D(edge) - D(need)
+                except (InvalidOperation, ValueError, TypeError):
+                    continue
+                excess = x if excess is None else max(excess, x)
+            if excess is None:
+                continue
+            st = self.s1_stats.setdefault(
+                coin, {"evaluated": 0, "opportunity_ticks": 0, "best_excess_pct": None, "last_opportunity_ts": None}
+            )
+            st["evaluated"] += 1
+            if excess >= 0:
+                st["opportunity_ticks"] += 1
+                st["last_opportunity_ts"] = now
+            best = st["best_excess_pct"]
+            if best is None or excess > D(best):
+                st["best_excess_pct"] = str(excess.quantize(Decimal("0.0000001")))
+
+    def ingest_candles(self, candles: list[Candle]) -> int:
+        """Candles from the candle task or the synthetic feed: into the in-memory cache and, the
+        ones that changed, into the state DB (replay input). Never raises: a feed must not die on
+        a storage hiccup (the cache is updated either way)."""
+        changed = self.candles.update(candles)
+        if changed:
+            try:
+                self.store.upsert_candles(changed)
+                for c in changed:
+                    self._candle_seq += 1
+                    self.store.add_engine_candle(c, self.mode, self._candle_seq)
+            except (sqlite3.Error, RuntimeError):
+                log.exception("engine: could not store %d candles (kept in memory)", len(changed))
+        return len(changed)
+
+    def strategy_health(self, now: float | None = None) -> dict[str, Any] | None:
+        """Compact strategy diagnostics for ``health.extra.strategies`` (None without strategies).
+
+        ``plan`` is the plan in force (fresh, ``current_plan``); a plan that exists but is stale
+        shows as ``plan_stale`` (its ts) with ``plan`` None: the strategies run rules-only then."""
+        if self.router is None:
+            return None
+        t = self.clock.now() if now is None else now
+        plan = self.current_plan(t)
+        out: dict[str, Any] = {
+            "status": self.strategy_status,
+            "plan": None
+            if plan is None
+            else {
+                "ts": plan.ts,
+                "model": plan.model,
+                "enabled_strategies": list(plan.enabled_strategies),
+                "size_multiplier": str(plan.size_multiplier),
+            },
+            "router_dropped": [dict(d) for d in self.router.dropped[:ROUTER_DROPS_SHOWN]],
+        }
+        if plan is None and self.cfg.ai.enabled and self.plan is not None:
+            out["plan_stale"] = {"ts": self.plan.ts, "age_s": round(t - self.plan.ts, 3)}
+        for strat in self.router.strategies:
+            diag = copy.deepcopy(strat.diagnostics() or {})
+            if strat.id == S1CrossBook.id:
+                coins = diag.get("coins") or {}
+                compact_coins: dict[str, Any] = {}
+                for coin in sorted(coins):
+                    d = coins[coin] or {}
+                    compact_coins[coin] = {k: d[k] for k in S1_COIN_KEYS if k in d}
+                    if coin in self.s1_stats:
+                        compact_coins[coin]["stats"] = dict(self.s1_stats[coin])
+                diag["coins"] = compact_coins
+            elif strat.id == S3Momentum.id:
+                symbols = diag.get("symbols") or {}
+                diag["symbols"] = {s: (symbols[s] or {}).get("status") for s in sorted(symbols)}
+            out[strat.id] = diag
+        return out
 
     def _check_flatten_complete(self, ctx: RiskContext, trigger: str) -> None:
         """Log ``flatten`` / ``complete`` once per episode; flatten_now stops the engine then."""
@@ -1439,6 +1962,7 @@ class Engine:
         self._last_reconcile_ts = now
         self.last_reconcile = report.summary()
         self.portfolio.refresh(books, now)
+        self._prune_strategies()  # positions the reconcile closed
         if report.errors:
             log.warning("engine: reconcile (%s) errors: %s", reason, "; ".join(report.errors))
         return report
@@ -1459,31 +1983,44 @@ class Engine:
         )
 
     def _record_inputs(self, books: dict[str, BookSnapshot], now: float) -> None:
-        """Replay inputs: each book used (new (symbol, ts) only) and one row for this tick."""
+        """Replay inputs: each book used (new (symbol, ts) only) and one row for this tick (with
+        ``candle_seq``, the candle arrivals in this tick's candle snapshot, when strategies run)."""
         for symbol, book in sorted(books.items()):
             if self._stored_book_ts.get(symbol) != book.ts:
                 self.store.add_engine_book(book, self.mode)
                 self._stored_book_ts[symbol] = book.ts
-        self.store.add_tick(
-            now, self.mode, {"ts": now, "book_ts": {s: b.ts for s, b in sorted(books.items())}}
-        )
+        row: dict[str, Any] = {"ts": now, "book_ts": {s: b.ts for s, b in sorted(books.items())}}
+        if self.router is not None:
+            row["candle_seq"] = self._tick_candle_seq
+        self.store.add_tick(now, self.mode, row)
 
     def _persist(self, now: float, force: bool = False) -> None:
-        """kv state that changed since the last write (portfolio, flags, orders, paper exchange)."""
+        """kv state that changed since the last write (portfolio, flags, orders, paper exchange,
+        strategies; the feature state at most every ``FEATURE_STATE_EVERY_S``). A no-op until the
+        state was restored: defaults must never overwrite the saved state."""
+        if not self._restored:
+            return
         states: dict[str, Any] = {
             KV_PORTFOLIO: self.portfolio.to_state(),
             KV_FLAGS: self.flags.to_state(),
             KV_ORDER_MANAGER: self.order_manager.to_state(),
         }
+        if self.router is not None:
+            states[KV_STRATEGY] = self.router.state()
         for key, value in states.items():
             self._kv_if_changed(key, value, value, now, force)
         if self.paper is not None:
             state = self.paper.state()
             comparable = {k: v for k, v in state.items() if k != "tick"}  # the tick counter always moves
             self._kv_if_changed(KV_PAPER, state, comparable, now, force)
+        if self.features is not None and (force or now - self._feature_state_ts >= FEATURE_STATE_EVERY_S):
+            self._feature_state_ts = now
+            state = self.features.state()
+            self._kv_if_changed(KV_FEATURES, state, state, now, force)
 
     def _persist_flags(self, now: float) -> None:
-        self._kv_if_changed(KV_FLAGS, self.flags.to_state(), self.flags.to_state(), now, force=True)
+        if self._restored:
+            self._kv_if_changed(KV_FLAGS, self.flags.to_state(), self.flags.to_state(), now, force=True)
 
     def _checkpoint(self, now: float) -> None:
         """Commit now, also inside the tick's transaction, with the kv state of this moment (the
@@ -1510,6 +2047,7 @@ class Engine:
         are left. ``flatten_report`` holds the balances and equity before and after.
         """
         self.intent_sources = []
+        self.strategies_enabled = False
         self.manual_flatten = {"phase1_s": float(phase1_s), "start_ts": None}
 
     def _note_flatten_before(self) -> None:
@@ -1627,6 +2165,13 @@ class Engine:
             )
             if self.paper is not None:
                 extra["paper_tick"] = self.paper.tick_count
+            strategies = self.strategy_health(now)
+            if strategies is not None:
+                extra["strategies"] = strategies
+            extra["candles"] = {
+                "bars": {s: self.candles.count(s) for s in self.watchlist},
+                "refresher": self.candle_refresher.stats() if self.candle_refresher is not None else None,
+            }
         return HealthRecord(
             ts=iso(now),
             mode=self.mode,
@@ -1691,18 +2236,24 @@ async def build_engine(
     allow_dirty: bool = False,
     kill_file: Path | None = KILL_FILE,
     require_deadline: bool = True,
+    strategies: list[Strategy] | None = None,
+    overlays: list[str] | None = None,
 ) -> Engine:
-    """Build a trading engine: markets, store, data feed and exchange (paper or Wallex).
+    """Build a trading engine: markets, state DB, data feed, exchange (paper or Wallex), strategies.
 
     * markets: ``load_markets(rest)`` (``/v1/markets`` + fees, else the offline snapshot). Live mode
       refuses the snapshot.
-    * feed ``live``: REST poller (+ WebSocket when enabled); ``synthetic``: the deterministic offline
-      feed seeded with the snapshot's reference mids/spreads, candles into the store.
+    * store: the state DB of ``mode`` and ``feed`` (``state_db_path``); shadow, synthetic and live
+      never share one.
+    * feed ``live``: REST poller (+ WebSocket when enabled) and the candle refresher;
+      ``synthetic``: the deterministic offline feed seeded with the snapshot's reference
+      mids/spreads, its candles into the engine's cache and the state DB.
     * shadow: ``PaperExchange`` on the bus books; its state is restored from kv ``paper_state``
       (``paper_balances`` only seed a store without one). live: the Wallex REST client, only after
       the live guard (``wta.safety``) passed — and, with ``require_deadline`` (everything but
       ``flatten_now``), only with a challenge end time in the future.
-    * one engine per account: the lock ``<sqlite_path>.engine.lock`` (``EngineLockError`` when
+    * strategies: ``default_strategies(cfg)`` unless given (``[]``: none).
+    * one engine per account: the lock ``<state db>.engine.lock`` (``EngineLockError`` when
       another engine or flatten_now holds it); ``Engine.aclose()`` releases it.
     * clock: wrapped in a ``TickClock`` for the engine and the paper exchange; the data feeds keep
       the real one.
@@ -1727,7 +2278,8 @@ async def build_engine(
     if synthetic_shock is not None and feed != "synthetic":
         raise ValueError("a synthetic shock needs --feed synthetic")
     tick_clock = clock if isinstance(clock, TickClock) else TickClock(base_clock)
-    lock = acquire_engine_lock(str(cfg.data.sqlite_path))
+    state_path = state_db_path(cfg, mode, feed)
+    lock = acquire_engine_lock(state_path)
     try:
         return await _build_engine(
             cfg,
@@ -1743,6 +2295,9 @@ async def build_engine(
             allow_dirty=allow_dirty,
             kill_file=kill_file,
             lock=lock,
+            state_path=state_path,
+            strategies=default_strategies(cfg) if strategies is None else strategies,
+            overlays=overlays,
         )
     except BaseException:
         release_engine_lock(lock)
@@ -1764,6 +2319,9 @@ async def _build_engine(
     allow_dirty: bool,
     kill_file: Path | None,
     lock: IO[str] | None,
+    state_path: str,
+    strategies: list[Strategy],
+    overlays: list[str] | None,
 ) -> Engine:
     """``build_engine`` after its guards, holding the account lock."""
     from wta.data.synthetic import SyntheticFeed, SyntheticParams
@@ -1778,7 +2336,7 @@ async def _build_engine(
             "refusing to start live mode: /v1/markets is unreachable (only the offline snapshot)"
         )
     store = Store(
-        cfg.data.sqlite_path,
+        state_path,
         flush_interval_s=cfg.data.store_flush_interval_s,
         flush_rows=cfg.data.store_flush_rows,
         depth_levels=cfg.data.depth_levels_stored,
@@ -1810,7 +2368,7 @@ async def _build_engine(
             reference_spreads=ref["spreads"],
             clock=clock.base,
             params=params,
-            on_candle=store.upsert_candles,
+            on_candle=None,  # set to Engine.ingest_candles below (cache + state DB)
         )
     exchange: Exchange
     if mode == "shadow":
@@ -1848,7 +2406,11 @@ async def _build_engine(
         synthetic=synthetic,
         injected=injected,
         kill_file=kill_file,
+        strategies=strategies,
+        overlays=overlays,
     )
+    if synthetic is not None:
+        synthetic.on_candle = engine.ingest_candles
     engine.lock = lock
     return engine
 
@@ -1868,11 +2430,13 @@ async def run_engine(
     injected: list[InjectedIntent] | None = None,
     paper_balances: dict[str, Decimal] | None = None,
     synthetic_shock: tuple[float, float] | None = None,
+    overlays: list[str] | None = None,
 ) -> int:
     """Build the trading engine (``build_engine``) and run it until stopped.
 
     ``mode="live"`` runs the live guards (``wta.safety``) before anything is built or started and
-    raises ``LiveGuardError`` when one fails.
+    raises ``LiveGuardError`` when one fails. ``overlays`` (the ``--overlay`` files already merged
+    into ``cfg``) are named in the start event next to the config hash.
     """
     if mode == "live":
         check_live_guard(i_understand_live, allow_dirty, settings)
@@ -1887,6 +2451,7 @@ async def run_engine(
         synthetic_shock=synthetic_shock,
         i_understand_live=i_understand_live,
         allow_dirty=allow_dirty,
+        overlays=overlays,
     )
     try:
         await engine.run(stop_event, seconds, handle_signals=handle_signals)

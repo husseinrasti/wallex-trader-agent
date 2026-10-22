@@ -247,7 +247,8 @@ NO_LIVE_FLAGS = {"i_understand_live": False, "allow_dirty": False}
 
 def test_run_defaults_to_shadow(use_settings, engine_calls) -> None:
     assert cli.main(["run", "--seconds", "5"]) == 0
-    assert engine_calls == [{"mode": "shadow", "seconds": 5.0, "log_dir": "logs", **NO_LIVE_FLAGS}]
+    # shadow logs go to logs/shadow by default, so they never mix with a live engine's logs/
+    assert engine_calls == [{"mode": "shadow", "seconds": 5.0, "log_dir": "logs/shadow", **NO_LIVE_FLAGS}]
 
 
 def test_run_live_without_flags_exits_2(use_settings, engine_calls, monkeypatch, capsys) -> None:
