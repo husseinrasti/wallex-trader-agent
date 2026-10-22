@@ -14,7 +14,7 @@ Legend: [x] done and verified · [~] done offline, needs the live API to verify 
 - [~] `python -m wta feed BTCUSDT` implemented (WS Centrifugo + REST fallback, tested against a local WS server)
 - [~] `scripts/check_account.py` report saved (`docs/REPORTS/api_probe.md`: API unreachable); `--probe-order` must be run by the operator
 - [x] `python -m wta logs check` validates `logs/` (exit 0)
-- [ ] Tag `v0.1-core` pushed
+- [x] Tag `v0.1-core` pushed
 
 ## Phase 2 — Risk & execution (PRD-02)
 - [ ] `make shadow` >= 1 h with a no-op strategy
