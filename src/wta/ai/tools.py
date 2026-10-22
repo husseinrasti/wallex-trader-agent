@@ -42,8 +42,16 @@ def truncate(obj: Any, max_bytes: int = 4096) -> Any:
         cand = trim(data, keep)
         if len(canonical_json(cand)) <= max_bytes:
             return cand
-    raw = canonical_json(data).decode()[: max_bytes - 40]
-    return {"truncated": True, "json_prefix": raw}
+    # The prefix is re-encoded as a JSON string (quotes/backslashes escaped, multi-byte UTF-8), so
+    # shrink it until the wrapper itself fits; each dropped char frees >= 1 byte, so this converges.
+    text = canonical_json(data).decode()
+    cut = max(0, max_bytes - 40)
+    while True:
+        wrapper = {"truncated": True, "json_prefix": text[:cut]}
+        excess = len(canonical_json(wrapper)) - max_bytes
+        if excess <= 0 or cut == 0:
+            return wrapper
+        cut = max(0, cut - excess)
 
 
 # JSON schemas in the OpenAI "function" shape ({name, description, parameters}).

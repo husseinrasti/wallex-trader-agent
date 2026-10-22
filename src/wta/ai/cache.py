@@ -64,7 +64,8 @@ class LLMCache:
         """Atomic write (tmp file + rename) so a crash never leaves a half-written entry."""
         self.dir.mkdir(parents=True, exist_ok=True)
         data = canonical_json(entry)
-        fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=".tmp-", suffix=".json")
+        # ".tmp" suffix: a temp file orphaned by a hard kill must never look like a "*.json" entry
+        fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=".tmp-", suffix=".tmp")
         try:
             with os.fdopen(fd, "wb") as fh:
                 fh.write(data)
