@@ -17,18 +17,18 @@ Legend: [x] done and verified · [~] done offline, needs the live API to verify 
 - [x] Tag `v0.1-core` pushed
 
 ## Phase 2 — Risk & execution (PRD-02)
-- [ ] `make shadow` >= 1 h with a no-op strategy
-- [ ] Injected intents produce complete decision records
-- [ ] Simulated drawdown >= 5 % -> kill -> flatten; `reset-kill` works
-- [ ] `scripts/flatten_now.py` (paper) converts a mixed portfolio to TMN
-- [ ] Restart keeps peak equity, daily PnL, fees, open positions
-- [ ] Tag `v0.2-risk-exec`
+- [x] Shadow >= 1 h with the no-op strategy: 3700 s synthetic-feed soak, 62 heartbeats, 0 errors, `logs check` OK (live-feed run pending API access)
+- [x] Injected intents produce complete decision records (docs/REPORTS/phase2_acceptance.md run b)
+- [x] Simulated drawdown >= 5 % -> kill -> flatten; `reset-kill` works (run c, synthetic shock -8 %)
+- [x] `scripts/flatten_now.py` (paper) converts a mixed portfolio to TMN (run d)
+- [x] Restart keeps peak equity, daily PnL, fees, open positions (run e + tests)
+- [x] Tag `v0.2-risk-exec`
 
 ## Phase 3 — Strategies (PRD-03)
-- [ ] Shadow >= 4 h with S1+S2
-- [ ] `docs/STRATEGY.md`
-- [ ] S1 cycle + S2 rebalance decision records pass `logs check`
-- [ ] Half-size live config + go-live checklist prepared; tag `v0.3-strategies`
+- [ ] Shadow >= 4 h with S1+S2 (synthetic feed run scheduled after the AI wiring; live feed pending API access)
+- [x] `docs/STRATEGY.md` (evidence sections TODO until data exists)
+- [x] S1 cycle + S2 rebalance decision records pass `logs check` (docs/REPORTS/phase3_acceptance.md, tests/test_strategies_engine.py)
+- [x] Half-size live config (`configs/live_halfsize.yaml`, `run --overlay`) + `docs/GO_LIVE_CHECKLIST.md`; tag `v0.3-strategies`
 
 ## Phase 4 — AI layer (PRD-04)
 - [ ] Plan every 5 min in shadow with notes; MCP tools when reachable
