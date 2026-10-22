@@ -1,0 +1,50 @@
+{
+  "result": {
+    "trades": [
+      {
+        "symbol": "BTCTMN",
+        "quantity": "0.000800",
+        "price": "22106074058",
+        "sum": "17684859.2464",
+        "fee": "0.0000024",
+        "feeAsset": "BTC",
+        "feeCoefficient": "0.003",
+        "makerFeeCoefficient": "0.0025",
+        "takerFeeCoefficient": "0.003",
+        "isBuyer": true,
+        "clientOrderId": "EX_BTCTMN_1792663260000_C3D4",
+        "timestamp": 1792663262000
+      },
+      {
+        "symbol": "BTCTMN",
+        "quantity": "0.001200",
+        "price": "22100000000",
+        "sum": "26520000",
+        "fee": "0.000003",
+        "feeAsset": "BTC",
+        "feeCoefficient": "0.0025",
+        "makerFeeCoefficient": "0.0025",
+        "takerFeeCoefficient": "0.003",
+        "isBuyer": true,
+        "clientOrderId": "EX_BTCTMN_1792663260000_C3D4",
+        "timestamp": "2026-10-22T10:01:00Z"
+      },
+      {
+        "symbol": "USDTTMN",
+        "quantity": "4.00",
+        "price": "266760",
+        "sum": "1067040",
+        "fee": "2667.6",
+        "feeAsset": "TMN",
+        "feeCoefficient": "0.0025",
+        "makerFeeCoefficient": "0.0025",
+        "takerFeeCoefficient": "0.003",
+        "isBuyer": false,
+        "clientOrderId": "S2_USDTTMN_1792663300000_E5F6",
+        "timestamp": 1792663330
+      }
+    ]
+  },
+  "message": "The operation was successful",
+  "success": true
+}

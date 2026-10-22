@@ -1,0 +1,10 @@
+{
+  "result": {
+    "BTCTMN": {"makerFeeRate": "0.0025", "takerFeeRate": "0.003", "recent_days_sum": 0},
+    "BTCUSDT": {"makerFeeRate": "0.001", "takerFeeRate": "0.0013", "recent_days_sum": 0},
+    "USDTTMN": {"makerFeeRate": "0.0025", "takerFeeRate": "0.003", "recent_days_sum": 0},
+    "ETHUSDT": {"makerFeeRate": "0.0008", "takerFeeRate": "0.0011", "recent_days_sum": "1520.5"}
+  },
+  "message": "The operation was successful",
+  "success": true
+}

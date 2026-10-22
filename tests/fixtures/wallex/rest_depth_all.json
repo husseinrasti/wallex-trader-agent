@@ -1,0 +1,37 @@
+{
+  "result": {
+    "BTCTMN": {
+      "ask": [
+        {"price": "22106074058", "quantity": 0.004512, "sum": "99742606.15"},
+        {"price": "22110000000", "quantity": 0.12, "sum": "2653200000"}
+      ],
+      "bid": [
+        {"price": "22075699081", "quantity": 0.0102, "sum": "225172130.63"},
+        {"price": "22070000000", "quantity": 0.25, "sum": "5517500000"}
+      ]
+    },
+    "BTCUSDT": {
+      "ask": [
+        {"price": "82909.16", "quantity": 0.0215, "sum": "1782.55"},
+        {"price": "82912.00", "quantity": 0.4, "sum": "33164.80"}
+      ],
+      "bid": [
+        {"price": "82845.00", "quantity": 0.0331, "sum": "2742.17"},
+        {"price": "82840.55", "quantity": 0.18, "sum": "14911.30"}
+      ]
+    },
+    "USDTTMN": {
+      "ask": [
+        {"price": "266758", "quantity": 1520.44, "sum": "405585454"},
+        {"price": "266760", "quantity": 9000, "sum": "2400840000"}
+      ],
+      "bid": [
+        {"price": "266720", "quantity": 2210.1, "sum": "589477872"},
+        {"price": "266700", "quantity": 0, "sum": "0"}
+      ]
+    },
+    "DEADTMN": {"ask": [], "bid": []}
+  },
+  "message": "The operation was successful",
+  "success": true
+}

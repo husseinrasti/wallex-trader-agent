@@ -19,7 +19,7 @@ Side = Literal["BUY", "SELL"]
 OrderStatus = Literal["NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "REJECTED", "EXPIRED", "UNKNOWN"]
 TERMINAL_STATUSES: frozenset[str] = frozenset({"FILLED", "CANCELED", "REJECTED", "EXPIRED"})
 Purpose = Literal["entry", "exit", "stop", "rebalance", "flatten", "leg2", "probe"]
-BookSource = Literal["ws", "rest", "replay", "backtest"]
+BookSource = Literal["ws", "rest", "replay", "backtest", "synthetic"]  # synthetic = offline demo feed
 Regime = Literal["range", "trend_up", "trend_down", "chaos"]
 DecisionKind = Literal["intent", "veto", "order", "plan", "outcome", "no_trade", "event"]
 ExitReason = Literal["target", "stop", "time_stop", "lockin", "flatten", "kill", "manual_reset", "regime_flip"]

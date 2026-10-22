@@ -1,0 +1,124 @@
+{
+  "result": {
+    "symbols": {
+      "BTCTMN": {
+        "symbol": "BTCTMN",
+        "baseAsset": "BTC",
+        "baseAssetPrecision": 6,
+        "quoteAsset": "TMN",
+        "quotePrecision": 0,
+        "enName": "Bitcoin",
+        "enBaseAsset": "Bitcoin",
+        "enQuoteAsset": "Toman",
+        "stepSize": 6,
+        "tickSize": 0,
+        "minQty": 0.000001,
+        "minNotional": 50000,
+        "isMarketTypeEnable": true,
+        "stats": {
+          "bidPrice": "22075699081",
+          "askPrice": "22106074058",
+          "24h_ch": 1.21,
+          "7d_ch": -0.84,
+          "24h_volume": "12.384511",
+          "24h_quoteVolume": "273501245889",
+          "24h_highPrice": "22300000000",
+          "24h_lowPrice": "21800000000",
+          "lastPrice": "22090000000",
+          "lastQty": "0.001200",
+          "lastTradeSide": "SELL",
+          "bidVolume": "0.251000",
+          "askVolume": "0.310200",
+          "bidCount": 41,
+          "askCount": 52,
+          "direction": {"SELL": 48, "BUY": 52}
+        },
+        "createdAt": "2018-11-28T08:46:36.000000Z"
+      },
+      "BTCUSDT": {
+        "symbol": "BTCUSDT",
+        "baseAsset": "BTC",
+        "baseAssetPrecision": 6,
+        "quoteAsset": "USDT",
+        "quotePrecision": 2,
+        "enName": "Bitcoin",
+        "stepSize": 6,
+        "tickSize": 2,
+        "minQty": 0.000001,
+        "minNotional": 1,
+        "isMarketTypeEnable": true,
+        "stats": {
+          "bidPrice": "82845.00",
+          "askPrice": "82909.16",
+          "24h_ch": 0.95,
+          "lastPrice": "82877.10",
+          "24h_volume": "3.124400"
+        },
+        "createdAt": "2019-03-02T10:12:00.000000Z"
+      },
+      "USDTTMN": {
+        "symbol": "USDTTMN",
+        "baseAsset": "USDT",
+        "baseAssetPrecision": 2,
+        "quoteAsset": "TMN",
+        "quotePrecision": 0,
+        "enName": "Tether",
+        "stepSize": 2,
+        "tickSize": 0,
+        "minQty": 0.01,
+        "minNotional": 50000,
+        "isMarketTypeEnable": true,
+        "stats": {
+          "bidPrice": "266720",
+          "askPrice": "266758",
+          "24h_ch": 2.44,
+          "lastPrice": "266740"
+        },
+        "createdAt": "2018-11-28T08:46:36.000000Z"
+      },
+      "SOLTMN": {
+        "symbol": "SOLTMN",
+        "baseAsset": "SOL",
+        "baseAssetPrecision": 2,
+        "quoteAsset": "TMN",
+        "quotePrecision": 0,
+        "enName": "Solana",
+        "stepSize": 2,
+        "tickSize": 0,
+        "minQty": 0.01,
+        "minNotional": 50000,
+        "isMarketTypeEnable": false,
+        "stats": {
+          "bidPrice": "28000019",
+          "askPrice": "28105486",
+          "lastPrice": "28050000"
+        },
+        "createdAt": "2021-08-14T07:00:00.000000Z"
+      },
+      "ETHUSDT": {
+        "symbol": "ETHUSDT",
+        "baseAsset": "ETH",
+        "quoteAsset": "USDT",
+        "enName": "Ethereum",
+        "stepSize": "4",
+        "tickSize": "0.01",
+        "minQty": "0.0001",
+        "minNotional": "1",
+        "isMarketTypeEnable": "true",
+        "stats": {"bidPrice": "2439.51", "askPrice": "2440.37", "lastPrice": "2440.00"}
+      },
+      "XRPTMN": {
+        "symbol": "XRPTMN",
+        "baseAsset": "XRP",
+        "quoteAsset": "TMN",
+        "enName": "Ripple",
+        "stepSize": 1,
+        "tickSize": 0,
+        "minQty": 0.1,
+        "stats": {"bidPrice": "640010", "askPrice": "641500", "lastPrice": "640900"}
+      }
+    }
+  },
+  "message": "The operation was successful",
+  "success": true
+}

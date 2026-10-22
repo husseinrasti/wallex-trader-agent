@@ -1,0 +1,11 @@
+{
+  "result": {
+    "latestTrades": [
+      {"symbol": "BTCTMN", "quantity": "0.001200", "price": "22090000000", "sum": "26508000", "isBuyOrder": true, "timestamp": "2026-10-22T10:00:05Z"},
+      {"symbol": "BTCTMN", "quantity": "0.000450", "price": "22101000000", "sum": "9945450", "isBuyOrder": false, "timestamp": "2026-10-22T10:00:03.500000Z"},
+      {"symbol": "BTCTMN", "quantity": "0.010000", "price": "22088000000", "sum": "220880000", "isBuyOrder": true, "timestamp": "2026-10-22T09:59:58Z"}
+    ]
+  },
+  "message": "The operation was successful",
+  "success": true
+}

@@ -1,0 +1,74 @@
+{
+  "result": {
+    "markets": [
+      {
+        "symbol": "BTCTMN",
+        "base_asset": "BTC",
+        "quote_asset": "TMN",
+        "en_base_asset": "Bitcoin",
+        "price": "22090000000",
+        "change_24h": "1.21",
+        "volume_24h": "12.384511",
+        "amount_precision": 6,
+        "price_precision": 0,
+        "is_spot": true,
+        "is_margin": false,
+        "is_tmn_based": true,
+        "is_usdt_based": false,
+        "is_new": false,
+        "is_zero_fee": false,
+        "created_at": "2018-11-28T08:46:36.000000Z"
+      },
+      {
+        "symbol": "BTCUSDT",
+        "base_asset": "BTC",
+        "quote_asset": "USDT",
+        "en_base_asset": "Bitcoin",
+        "price": "82877.10",
+        "change_24h": "0.95",
+        "volume_24h": "3.124400",
+        "amount_precision": 6,
+        "price_precision": 2,
+        "is_spot": true,
+        "is_margin": false,
+        "is_tmn_based": false,
+        "is_usdt_based": true,
+        "is_new": false,
+        "is_zero_fee": false,
+        "created_at": "2019-03-02T10:12:00.000000Z"
+      },
+      {
+        "symbol": "USDTTMN",
+        "base_asset": "USDT",
+        "quote_asset": "TMN",
+        "en_base_asset": "Tether",
+        "price": "266740",
+        "change_24h": "2.44",
+        "volume_24h": "1840012.55",
+        "amount_precision": 2,
+        "price_precision": 0,
+        "is_spot": true,
+        "is_margin": false,
+        "is_tmn_based": true,
+        "is_usdt_based": false,
+        "is_new": false,
+        "is_zero_fee": false,
+        "created_at": "2018-11-28T08:46:36.000000Z"
+      },
+      {
+        "symbol": "BTCUSDTPERP",
+        "base_asset": "BTC",
+        "quote_asset": "USDT",
+        "price": "82880.00",
+        "amount_precision": 3,
+        "price_precision": 1,
+        "is_spot": false,
+        "is_margin": true,
+        "is_tmn_based": false,
+        "is_usdt_based": true
+      }
+    ]
+  },
+  "message": "The operation was successful",
+  "success": true
+}

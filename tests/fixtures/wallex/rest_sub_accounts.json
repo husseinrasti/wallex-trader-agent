@@ -1,0 +1,15 @@
+{
+  "result": [
+    {
+      "userId": 1048576,
+      "title": "Wallex trading challenge",
+      "clientId": "c0ffee00-1111-2222-3333-444455556666",
+      "isActive": true,
+      "type": "trading_bot_trade",
+      "isSuspend": false,
+      "createdAt": "2026-10-20T08:00:00Z"
+    }
+  ],
+  "message": "The operation was successful",
+  "success": true
+}

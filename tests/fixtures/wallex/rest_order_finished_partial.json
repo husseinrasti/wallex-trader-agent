@@ -1,0 +1,40 @@
+{
+  "result": {
+    "symbol": "USDTTMN",
+    "type": "LIMIT",
+    "side": "SELL",
+    "clientOrderId": "S2_USDTTMN_1792663300000_E5F6",
+    "transactTime": 1792663300000,
+    "price": "266760",
+    "origQty": "10.00",
+    "executedSum": "1067040",
+    "executedQty": "4.00",
+    "executedPrice": "266760",
+    "sum": "2667600",
+    "executedPercent": 40,
+    "status": "FINISHED",
+    "active": false,
+    "fee": "2667.6",
+    "fills": [
+      {
+        "fee": "2667.6",
+        "feeAsset": "TMN",
+        "feeCoefficient": "0.0025",
+        "isBuyer": false,
+        "makerFeeCoefficient": "0.0025",
+        "price": "266760",
+        "quantity": "4.00",
+        "sum": "1067040",
+        "symbol": "USDTTMN",
+        "takerFeeCoefficient": "0.003",
+        "timestamp": "2026-10-22T10:02:10Z"
+      }
+    ],
+    "stopPrice": null,
+    "stopPriceCondition": null,
+    "created_at": "2026-10-22T10:01:40Z",
+    "updated_at": "2026-10-22T10:03:00Z"
+  },
+  "message": "The operation was successful",
+  "success": true
+}

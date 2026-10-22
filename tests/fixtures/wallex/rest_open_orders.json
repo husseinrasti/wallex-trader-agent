@@ -1,0 +1,53 @@
+{
+  "result": {
+    "additionalProp1": [
+      {
+        "symbol": "BTCUSDT",
+        "type": "LIMIT",
+        "side": "BUY",
+        "clientOrderId": "S1_BTCUSDT_1792663200000_A1B2",
+        "transactTime": 1792663200123,
+        "price": "82845.00",
+        "origQty": "0.000150",
+        "executedSum": "0",
+        "executedQty": "0",
+        "executedPrice": "0",
+        "sum": "12.4267500",
+        "executedPercent": 0,
+        "status": "NEW",
+        "active": true,
+        "fee": "0",
+        "fills": [],
+        "created_at": "2026-10-22T10:00:00.123Z",
+        "updated_at": "2026-10-22T10:00:00.123Z"
+      }
+    ],
+    "additionalProp2": [
+      {
+        "symbol": "SOLTMN",
+        "type": "STOP_LIMIT",
+        "side": "SELL",
+        "clientOrderId": "abcXYZ123",
+        "transactTime": 1792650000000,
+        "price": "27000000",
+        "origQty": "1.50",
+        "executedSum": "0",
+        "executedQty": "0",
+        "executedPrice": "0",
+        "sum": "40500000",
+        "executedPercent": 0,
+        "status": "NEW",
+        "active": true,
+        "fee": "0",
+        "fills": [],
+        "stopPrice": "27100000",
+        "stopPriceCondition": "LESS_THAN_OR_EQUAL",
+        "created_at": "2026-10-22T06:20:00Z",
+        "updated_at": "2026-10-22T06:20:00Z"
+      }
+    ],
+    "additionalProp3": []
+  },
+  "message": "The operation was successful",
+  "success": true
+}

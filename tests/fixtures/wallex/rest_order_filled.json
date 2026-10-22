@@ -1,0 +1,53 @@
+{
+  "result": {
+    "symbol": "BTCTMN",
+    "type": "LIMIT",
+    "side": "BUY",
+    "clientOrderId": "EX_BTCTMN_1792663260000_C3D4",
+    "transactTime": 1792663260000,
+    "price": "22106074058",
+    "origQty": "0.002000",
+    "executedSum": "44204859.2464",
+    "executedQty": "0.002000",
+    "executedPrice": "22102429623.2",
+    "sum": "44212148.116",
+    "executedPercent": 100,
+    "status": "FILLED",
+    "active": false,
+    "fee": "0.0000054",
+    "fills": [
+      {
+        "fee": "0.000003",
+        "feeAsset": "BTC",
+        "feeCoefficient": "0.0025",
+        "isBuyer": true,
+        "makerFeeCoefficient": "0.0025",
+        "price": "22100000000",
+        "quantity": "0.001200",
+        "sum": "26520000",
+        "symbol": "BTCTMN",
+        "takerFeeCoefficient": "0.003",
+        "timestamp": "2026-10-22T10:01:00Z"
+      },
+      {
+        "fee": "0.0000024",
+        "feeAsset": "BTC",
+        "feeCoefficient": "0.003",
+        "isBuyer": true,
+        "makerFeeCoefficient": "0.0025",
+        "price": "22106074058",
+        "quantity": "0.000800",
+        "sum": "17684859.2464",
+        "symbol": "BTCTMN",
+        "takerFeeCoefficient": "0.003",
+        "timestamp": "2026-10-22T10:01:02Z"
+      }
+    ],
+    "stopPrice": null,
+    "stopPriceCondition": null,
+    "created_at": "2026-10-22T10:01:00Z",
+    "updated_at": "2026-10-22T10:01:02Z"
+  },
+  "message": "The operation was successful",
+  "success": true
+}

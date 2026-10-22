@@ -1,0 +1,9 @@
+{
+  "result": {
+    "TMN": {"symbol": "TMN", "total": "5000000", "freeze": "250000", "available": "4750000", "stats": {"usdt_value": "18.74"}},
+    "USDT": {"symbol": "USDT", "total": "1.25", "freeze": "0", "available": "1.25", "stats": {"usdt_value": "1.25"}},
+    "BTC": {"symbol": "BTC", "total": "0.000150", "freeze": "0.000150", "available": "0", "stats": {"usdt_value": "12.43"}}
+  },
+  "message": "The operation was successful",
+  "success": true
+}

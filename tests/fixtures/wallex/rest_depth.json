@@ -1,0 +1,16 @@
+{
+  "result": {
+    "ask": [
+      {"price": "22106074058", "quantity": 0.004512, "sum": "99742606.15"},
+      {"price": "22110000000", "quantity": 0.12, "sum": "2653200000"},
+      {"price": "22125000000", "quantity": 0.031, "sum": "685875000"}
+    ],
+    "bid": [
+      {"price": "22075699081", "quantity": 0.0102, "sum": "225172130.63"},
+      {"price": "22070000000", "quantity": 0.25, "sum": "5517500000"},
+      {"price": "22050000000", "quantity": 0.5, "sum": "11025000000"}
+    ]
+  },
+  "message": "The operation was successful",
+  "success": true
+}

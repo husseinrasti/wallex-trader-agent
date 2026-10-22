@@ -25,7 +25,7 @@ def _git(*args: str) -> str | None:
 def get() -> dict[str, object]:
     """``{"commit": str, "dirty": bool, "tag": str | None}`` (cached for the process lifetime)."""
     commit = _git("rev-parse", "HEAD") or "unknown"
-    status = _git("status", "--porcelain", "--untracked-files=no")
+    status = _git("status", "--porcelain")  # untracked (non-ignored) files count as dirty
     dirty = bool(status) if status is not None else True
     tag = _git("describe", "--tags", "--exact-match", "HEAD")
     return {"commit": commit, "dirty": dirty, "tag": tag or None}

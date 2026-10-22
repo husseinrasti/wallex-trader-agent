@@ -1,0 +1,12 @@
+{
+  "result": {
+    "balances": {
+      "TMN": {"asset": "TMN", "faName": "Toman", "fiat": true, "value": "5000000", "locked": "250000", "is_dust": false},
+      "USDT": {"asset": "USDT", "faName": "Tether", "fiat": false, "value": "1.25000000", "locked": "0.00000000", "is_dust": false},
+      "BTC": {"asset": "BTC", "faName": "Bitcoin", "fiat": false, "value": "0.000150", "locked": "0.000150", "is_dust": false},
+      "ETH": {"asset": "ETH", "faName": "Ethereum", "fiat": false, "value": "0", "locked": "0", "is_dust": true}
+    }
+  },
+  "message": "The operation was successful",
+  "success": true
+}

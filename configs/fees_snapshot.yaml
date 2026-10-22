@@ -1,0 +1,6 @@
+# Fee snapshot from GET /v1/account/fee (Overview §2): used by backtests and offline runs so they
+# need no API access. Live runs refresh fees from the API at startup.
+default_by_quote:
+  TMN:  {maker: "0.0025", taker: "0.003"}
+  USDT: {maker: "0.001",  taker: "0.0013"}
+symbols: {}

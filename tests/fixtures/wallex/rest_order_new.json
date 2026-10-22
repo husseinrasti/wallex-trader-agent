@@ -1,0 +1,26 @@
+{
+  "result": {
+    "symbol": "BTCUSDT",
+    "type": "LIMIT",
+    "side": "BUY",
+    "clientOrderId": "S1_BTCUSDT_1792663200000_A1B2",
+    "transactTime": 1792663200123,
+    "price": "82845.00",
+    "origQty": "0.000150",
+    "executedSum": "0",
+    "executedQty": "0",
+    "executedPrice": "0",
+    "sum": "12.4267500",
+    "executedPercent": 0,
+    "status": "NEW",
+    "active": true,
+    "fee": "0",
+    "fills": [],
+    "stopPrice": null,
+    "stopPriceCondition": null,
+    "created_at": "2026-10-22T10:00:00.123Z",
+    "updated_at": "2026-10-22T10:00:00.123Z"
+  },
+  "message": "The operation was successful",
+  "success": true
+}

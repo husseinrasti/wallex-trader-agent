@@ -13,7 +13,7 @@ import re
 
 # strategy prefixes we generate: S1/S2/S3 strategies, FL flatten, EX generic exit, PR api probe
 OUR_PREFIXES = ("S1", "S2", "S3", "FL", "EX", "PR")
-CLIENT_ID_RE = re.compile(r"^(S1|S2|S3|FL|EX|PR)_[A-Z0-9]{2,20}_\d{13}_[A-Z0-9]{4}$")
+CLIENT_ID_RE = re.compile(r"^(S1|S2|S3|FL|EX|PR)_[A-Z0-9]{2,18}_\d{13}_[A-Z0-9]{4}$")
 
 
 def _h(*parts: object, n: int = 4) -> str:
@@ -32,7 +32,8 @@ def strategy_prefix(strategy: str) -> str:
 def make_client_id(strategy: str, symbol: str, ts: float, decision_id: str, attempt: int = 0) -> str:
     ts_ms = int(round(ts * 1000))
     cid = f"{strategy_prefix(strategy)}_{symbol.upper()}_{ts_ms:013d}_{_h(decision_id, attempt)}"
-    assert len(cid) <= 40, cid
+    if len(cid) > 40:
+        raise ValueError(f"client_id too long ({len(cid)} > 40): {cid}")
     return cid
 
 
