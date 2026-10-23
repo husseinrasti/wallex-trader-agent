@@ -250,6 +250,10 @@ class AICfg(_Cfg):
     tool_result_max_bytes: int = 4096
     cache_dir: str = "logs/llm_cache"
     replay_strict: bool = True
+    # After the one 'fix the JSON' retry, lift top-level plan keys the model wrote inside `regimes` back to the
+    # top level (logged as `repaired` in the plan record; the result is still validated and clamped). The default
+    # is False so configs recorded before the flag existed replay exactly; configs/default.yaml turns it on.
+    repair_plan_nesting: bool = False
 
 
 class AlertsCfg(_Cfg):
@@ -443,8 +447,18 @@ def _json_default(o: Any) -> Any:
     raise TypeError(f"not JSON serialisable: {type(o)}")
 
 
+# Fields added after runs were recorded, with the value that reproduces the old behaviour. While a field
+# holds that legacy value it is left out of the hash, so a recorded config keeps its exact hash (and its
+# replay stays exact); any other value is hashed normally.
+HASH_LEGACY_DEFAULTS: dict[tuple[str, str], Any] = {("ai", "repair_plan_nesting"): False}
+
+
 def config_hash(cfg: Config) -> str:
-    return hashlib.sha256(canonical_json(cfg.model_dump(mode="json"))).hexdigest()[:12]
+    tree = cfg.model_dump(mode="json")
+    for (section, key), legacy in HASH_LEGACY_DEFAULTS.items():
+        if tree.get(section, {}).get(key, legacy) == legacy:
+            tree.get(section, {}).pop(key, None)
+    return hashlib.sha256(canonical_json(tree)).hexdigest()[:12]
 
 
 def account_label(mode: str, feed: str = "live") -> str:

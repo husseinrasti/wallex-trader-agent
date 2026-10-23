@@ -109,7 +109,9 @@ def main(argv: list[str] | None = None) -> int:
         record("3 check_account (read-only)", "SKIP", "WALLEX_API_KEY not set in .env", t0)
     else:
         code, text = run([PY, "scripts/check_account.py", "--timeout", str(args.timeout)], out / "03_check_account.txt", 180)
-        warn = "WARN" in text.upper() or "warning" in text.lower()
+        import re  # noqa: PLC0415
+        m = re.search(r"warnings:\s*(\d+)", text)
+        warn = bool(m and int(m.group(1)) > 0)
         status = "PASS" if code == 0 else ("WARN" if code is not None and code != 2 else "FAIL")
         if status == "PASS" and warn:
             status = "WARN"
@@ -172,10 +174,11 @@ def main(argv: list[str] | None = None) -> int:
         hb = last_json(logs, "health")
         decisions = list(iter_jsonl(logs, "decisions"))
         extra = (hb or {}).get("extra", {}) if isinstance((hb or {}).get("extra"), dict) else {}
-        fresh = extra.get("fresh_books") or extra.get("books_fresh")
+        ages = extra.get("book_age_s") if isinstance(extra.get("book_age_s"), dict) else {}
+        fresh = f"{sum(1 for a in ages.values() if a is not None and a <= 30)}/{len(ages)}" if ages else None
         plans = sum(1 for d in decisions if d.get("kind") == "plan")
         orders = sum(1 for d in decisions if d.get("kind") == "order")
-        ok = code == 0 and hb is not None and hb.get("rest_ok")
+        ok = code == 0 and hb is not None and bool(hb.get("rest_ok") or hb.get("ws_ok"))
         detail = (f"rest_ok={hb.get('rest_ok') if hb else None} ws_ok={hb.get('ws_ok') if hb else None} "
                   f"fresh_books={fresh} plans={plans} paper_orders={orders} ai={ai_flag}")
         record("7 shadow run on the real feed (paper)", "PASS" if ok else "FAIL",

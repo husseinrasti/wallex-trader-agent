@@ -67,3 +67,18 @@ shapes come from the documentation and the Overview §9. Parsers are tolerant an
 - Ping: server sends `{}` every 25 s; reply `{}` within 8 s or it closes with 3012.
 - Close codes 3000–3499 → reconnect; ≥ 3500 → do not retry. No history: messages during a
   disconnect are lost (REST poller covers gaps).
+
+## Verified against the live API (2026-10-23, from an Iranian IP)
+
+- REST `/v1/markets`, `/v1/depth`, `/v2/depth/all`, `/v1/udf/history`, `/v1/account/fee`, `/v1/account/balances`
+  and `/sub-accounts` parse as implemented (`make smoke-real`, `wta markets`, `scripts/check_account.py`: 0 warnings).
+- **WebSocket v2 wraps every channel payload** as `{"message": <payload>}` — depth is
+  `{"message": [{"price": 81633.75, "quantity": 0.0011, "sum": 89.79}, ...]}` (numbers, not strings), not the bare
+  list the docs show. `wallex_ws.unwrap_message` accepts both. ~120 messages/s on 63 channels, 0 parse errors.
+- The WS handshake sometimes answers **HTTP 503**, and the server closes a healthy connection every 1–4 minutes
+  (no close code); the client's reconnect (1 s, 2 s, 4 s …) recovers within seconds. REST polling covers the gap.
+- **Credit sub-account:** `GET /sub-accounts` lists one active `prop` account ("هکاتون استارکوچ | والکس"). With
+  `sub-account-client-id: <clientId>` the balances endpoint returns that account (5,000,000 TMN, 0 open orders);
+  its fees are the table values (TMN pairs 0.25 % / 0.30 %, USDT pairs 0.10 % / 0.13 %).
+- **MCP** (`https://api.wallex.ir/mcp`, header `X-API-Key`) initializes and serves the read-only tools; the analyst
+  used them on the real feed (`tools_source: mcp`).

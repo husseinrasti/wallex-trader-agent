@@ -611,6 +611,12 @@ def s1_diagnostics(extra: Mapping[str, Any]) -> dict[str, Any] | None:
     return s1 if isinstance(s1, dict) else None
 
 
+def _diag_value(d: dict[str, Any], name: str) -> Any:
+    """S1 writes ``<name>_pct`` today (``edge_tmn_cheap_pct``); older heartbeats used ``<name>``."""
+    value = d.get(f"{name}_pct")
+    return d.get(name) if value is None else value
+
+
 def s1_edges(snap: DashboardSnapshot) -> list[EdgeRow]:
     """From the S1 diagnostics in the heartbeat; else estimated from the latest books."""
     diag = s1_diagnostics(snap.extra) or {}
@@ -622,7 +628,8 @@ def s1_edges(snap: DashboardSnapshot) -> list[EdgeRow]:
     rows = []
     for coin in sorted(coins):
         d = _dict(coins[coin])
-        c_t, c_u = _dec(d.get("cost_tmn_cheap")), _dec(d.get("cost_usdt_cheap"))
+        c_t, c_u = _dec(_diag_value(d, "cost_tmn_cheap")), _dec(_diag_value(d, "cost_usdt_cheap"))
+        n_t, n_u = _dec(_diag_value(d, "need_tmn_cheap")), _dec(_diag_value(d, "need_usdt_cheap"))
         lockin, revert = str(d.get("lockin") or ""), str(d.get("revert") or "")
         if lockin.startswith("ENTER"):
             status = "▶ lock-in"  # the highlighted edge cell shows which book is cheap
@@ -633,10 +640,10 @@ def s1_edges(snap: DashboardSnapshot) -> list[EdgeRow]:
         rows.append(
             EdgeRow(
                 coin=coin,
-                edge_tmn_cheap=_dec(d.get("edge_tmn_cheap")),
-                need_tmn_cheap=None if c_t is None else c_t + margin,
-                edge_usdt_cheap=_dec(d.get("edge_usdt_cheap")),
-                need_usdt_cheap=None if c_u is None else c_u + margin,
+                edge_tmn_cheap=_dec(_diag_value(d, "edge_tmn_cheap")),
+                need_tmn_cheap=n_t if n_t is not None else (None if c_t is None else c_t + margin),
+                edge_usdt_cheap=_dec(_diag_value(d, "edge_usdt_cheap")),
+                need_usdt_cheap=n_u if n_u is not None else (None if c_u is None else c_u + margin),
                 status=status,
             )
         )

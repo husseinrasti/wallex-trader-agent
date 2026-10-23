@@ -9,10 +9,10 @@ Legend: [x] done and verified · [~] done offline, needs the live API to verify 
 
 ## Phase 1 — Core engine (PRD-01)
 - [x] `make install && make test` green (563 tests, ruff clean; Python 3.12 local, 3.11 Docker build)
-- [~] `python -m wta markets` implemented + tested with fixtures (banned -> exit 1, unreachable -> exit 2); live run pending API access
+- [x] `python -m wta markets` verified on the live API 2026-10-23 (watchlist parsed, none banned)
 - [~] `python -m wta record` running detached since 2026-10-22 10:42 UTC (run/recorder.pid); survives the outage; rows start when the API is reachable
-- [~] `python -m wta feed BTCUSDT` implemented (WS Centrifugo + REST fallback, tested against a local WS server)
-- [~] `scripts/check_account.py` report saved (`docs/REPORTS/api_probe.md`: API unreachable); `--probe-order` must be run by the operator
+- [x] `python -m wta feed BTCUSDT` verified live: WebSocket (after the `{"message": ...}` envelope fix) and REST
+- [x] `scripts/check_account.py` (read-only) on the live API: 0 warnings, 0 problems; challenge sub-account 5,000,000 TMN; `--probe-order` is the operator's step
 - [x] `python -m wta logs check` validates `logs/` (exit 0)
 - [x] Tag `v0.1-core` pushed
 
@@ -31,7 +31,7 @@ Legend: [x] done and verified · [~] done offline, needs the live API to verify 
 - [x] Half-size live config (`configs/live_halfsize.yaml`, `run --overlay`) + `docs/GO_LIVE_CHECKLIST.md`; tag `v0.3-strategies`
 
 ## Phase 4 — AI layer (PRD-04)
-- [x] Plan every slow-loop interval in shadow with notes: 15 real OpenRouter plans (gpt-5.4-mini) in 900 s at a 60 s interval (synthetic feed; docs/REPORTS/phase4_acceptance.md). [~] MCP tools on the real feed pending API reachability
+- [x] Plan every slow-loop interval in shadow with notes: 15 real OpenRouter plans (gpt-5.4-mini) in 900 s at a 60 s interval (synthetic feed; docs/REPORTS/phase4_acceptance.md). [x] Real feed + Wallex MCP tools verified 2026-10-23: 6 real-LLM plans in 6 min with `tools_source: mcp`
 - [x] Provider failure / network loss degrades to rules-only (`llm_ok=false`, no exceptions)
 - [x] Plans replay from the cache with 0 provider calls (`python -m wta.ai.replay`: 15/15 LLM, 6/6 offline). Full engine replay: Phase 5
 - [x] Reviewer applies <= 2 bounded changes; config_hash of later decisions changes (tests + 2 real reviewer journal entries)

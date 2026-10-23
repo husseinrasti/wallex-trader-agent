@@ -755,3 +755,34 @@ def test_plan_staleness(cfg: Config, caplog: pytest.LogCaptureFixture) -> None:
 def test_compact_features_passes_errors_through() -> None:
     assert compact_features({"error": "features not available yet"}) == {"error": "features not available yet"}
     assert compact_features(None) is None
+
+
+# ---------------------------------------------------------------- nesting repair (ai.repair_plan_nesting)
+
+
+def test_repair_nesting_lifts_misplaced_top_level_keys() -> None:
+    """gpt-5.4-mini wrote the top-level keys inside `regimes` on the real feed (2026-10-23); the repair lifts
+    them, never changes a value, and refuses anything that still does not validate."""
+    import json as _json
+
+    from wta.ai.analyst import RegimeAnalyst
+
+    regime = {"regime": "range", "confidence": 0.5, "evidence": "e"}
+    nested = {"regimes": {"USDTTMN": regime, "BTCUSDT": regime, "ETHUSDT": regime, "SOLUSDT": regime,
+                          "enabled_strategies": ["S2"], "s1_margin_min_pct": 0.002, "size_multiplier": 0.5,
+                          "usdt_target_share": 0.5, "risk_flags": [], "notes": "n"}}
+    out, moved = RegimeAnalyst._repair_nesting(_json.dumps(nested))
+    assert out is not None and moved == sorted(["enabled_strategies", "notes", "risk_flags", "s1_margin_min_pct",
+                                                "size_multiplier", "usdt_target_share"])
+    assert out.size_multiplier == 0.5 and out.enabled_strategies == ["S2"] and set(out.regimes) == {
+        "USDTTMN", "BTCUSDT", "ETHUSDT", "SOLUSDT"}
+    broken = {"regimes": {"USDTTMN": regime, "size_multiplier": "big"}}
+    assert RegimeAnalyst._repair_nesting(_json.dumps(broken)) == (None, [])
+    assert RegimeAnalyst._repair_nesting("not json") == (None, [])
+
+
+def test_repair_flag_defaults_off_for_recorded_configs_and_on_in_default_yaml() -> None:
+    from wta.config import AICfg, load_config
+
+    assert AICfg().repair_plan_nesting is False  # configs recorded before the flag replay unchanged
+    assert load_config(env={}).ai.repair_plan_nesting is True

@@ -127,6 +127,15 @@ def build_channels(
     return kept, dropped
 
 
+def unwrap_message(data: Any) -> Any:
+    """The live v2 endpoint wraps every channel payload as ``{"message": <payload>}`` (observed on
+    2026-10-23: ``{"message": [{price, quantity, sum}, ...]}`` for depth); the docs show the bare payload.
+    Both are accepted; a dict that already looks like a trade/level (has ``price``) is left alone."""
+    while isinstance(data, dict) and "message" in data and "price" not in data:
+        data = data["message"]
+    return data
+
+
 def parse_levels(data: Any, levels: int, descending: bool) -> list[Level]:
     """Depth payload ``[{price, quantity, sum}, ...]`` -> sorted ``Level`` list, zero qty dropped."""
     items = data.values() if isinstance(data, dict) else data
@@ -391,6 +400,7 @@ class WallexWS:
         Malformed payloads are logged and counted in ``parse_errors``; they never raise.
         """
         symbol, kind = split_channel(channel)
+        data = unwrap_message(data)
         try:
             if kind in ("buyDepth", "sellDepth"):
                 self._on_depth(symbol, kind, data)

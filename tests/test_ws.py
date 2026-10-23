@@ -431,3 +431,35 @@ async def test_failing_listener_does_not_drop_the_connection():
     assert fake.sent[0] == '{"id":1,"connect":{}}' and len(fake.sent) == 4
     stop.set()
     await asyncio.wait_for(task, 2)
+
+
+# ---------------------------------------------------------------- live payload shape (observed 2026-10-23)
+
+
+def test_live_message_envelope_is_unwrapped_for_depth_and_trades() -> None:
+    """The real v2 endpoint sends ``{"message": [...]}`` for depth (captured from wss://api.wallex.ir)."""
+    from decimal import Decimal
+
+    from wta.exchange.base import MarketDataBus
+    from wta.exchange.wallex_ws import WallexWS, unwrap_message
+
+    bus = MarketDataBus()
+    trades: list = []
+    bus.on_trade(trades.append)
+    ws = WallexWS("wss://example.invalid/connection/websocket", ["BTCUSDT"], bus)
+    ws.handle_push("orderbook:BTCUSDT@sellDepth", {"message": [
+        {"price": 81650.18, "quantity": 0.34989589, "sum": 28569.0623997602},
+        {"price": 81633.75, "quantity": 0.0011, "sum": 89.797125}]})
+    ws.handle_push("orderbook:BTCUSDT@buyDepth", {"message": [
+        {"price": 81434.27, "quantity": 1.964e-05, "sum": 1.5993690628},
+        {"price": 81434.61, "quantity": 0.00452477, "sum": 368.4728802897}]})
+    book = bus.latest("BTCUSDT")
+    assert ws.parse_errors == 0 and book is not None and book.source == "ws"
+    assert book.best_ask == Decimal("81633.75") and book.best_bid == Decimal("81434.61")
+    ws.handle_push("public:BTCUSDT@trade", {"message": {"isBuyOrder": True, "quantity": "0.000243",
+                                                        "price": "81500.5", "timestamp": "2026-10-23T15:30:00Z"}})
+    ws.handle_push("public:BTCUSDT@trade", {"message": [{"isBuyOrder": False, "quantity": "0.1",
+                                                         "price": "81501", "timestamp": "2026-10-23T15:30:01Z"}]})
+    assert ws.parse_errors == 0 and [t.side for t in trades] == ["SELL", "BUY"]
+    assert unwrap_message([1, 2]) == [1, 2]
+    assert unwrap_message({"price": 1, "message": "x"}) == {"price": 1, "message": "x"}

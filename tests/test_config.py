@@ -295,3 +295,20 @@ def test_mask_secrets_handles_several_short_and_empty_secrets() -> None:
     text = "a=abcd b=xyz c=longer-secret"
     assert mask_secrets(text, ["abcd", "xyz", "", "longer-secret"]) == "a=*** b=xyz c=***"
     assert mask_secrets(text, []) == text
+
+
+def test_a_field_at_its_legacy_value_does_not_change_the_hash() -> None:
+    """Configs recorded before ai.repair_plan_nesting existed keep their exact hash (replay stays exact)."""
+    from wta.config import HASH_LEGACY_DEFAULTS, apply_changes, load_config
+
+    cfg = load_config(env={})
+    on = apply_changes(cfg, {"ai.repair_plan_nesting": True})
+    off = apply_changes(cfg, {"ai.repair_plan_nesting": False})
+    assert on.config_hash != off.config_hash
+    tree = off.model_dump(mode="json")
+    tree["ai"].pop("repair_plan_nesting")  # what a config recorded before the field looked like
+    import hashlib
+
+    from wta.config import canonical_json
+    assert off.config_hash == hashlib.sha256(canonical_json(tree)).hexdigest()[:12]
+    assert ("ai", "repair_plan_nesting") in HASH_LEGACY_DEFAULTS

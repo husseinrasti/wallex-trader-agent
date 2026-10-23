@@ -321,6 +321,7 @@ class _Run:
     tools_used: set[str] = field(default_factory=set)
     rounds: int = 0
     retried: bool = False
+    repaired: list[str] = field(default_factory=list)  # plan keys lifted out of `regimes`
 
     @property
     def offered_names(self) -> set[str]:
@@ -591,6 +592,10 @@ class RegimeAnalyst:
             if resp is None:
                 return None
             out, err = self._parse(resp.text)
+            if out is None and self.cycle_cfg.ai.repair_plan_nesting:
+                out, run.repaired = self._repair_nesting(resp.text)
+                if out is not None:
+                    log.warning("analyst: plan JSON repaired: lifted %s out of `regimes`", ", ".join(run.repaired))
             if out is None:
                 self.last_error = f"llm_invalid: {err}"
                 log.warning("analyst: invalid plan JSON twice: %s", err[:200])
@@ -629,6 +634,28 @@ class RegimeAnalyst:
                             f"{REQUIRED_SYMBOLS[-1]} and put them at the top level. ")
             return None, (hint + str(exc))[:800]
 
+    @staticmethod
+    def _repair_nesting(text: str) -> tuple[PlanOutput | None, list[str]]:
+        """The one structural repair: top-level plan keys that the model wrote inside ``regimes`` are
+        moved back to the top level (only keys absent there). Returns (plan, moved keys) when the
+        result validates, else (None, []). Values are never changed, and clamping still applies."""
+        try:
+            data = extract_json(text)
+        except ValueError:
+            return None, []
+        regimes = data.get("regimes")
+        if not isinstance(regimes, Mapping):
+            return None, []
+        moved = sorted(k for k in regimes if k in PLAN_KEYS and k != "regimes" and k not in data)
+        if not moved:
+            return None, []
+        fixed = {**data, **{k: regimes[k] for k in moved}}
+        fixed["regimes"] = {k: v for k, v in regimes.items() if k not in moved}
+        try:
+            return PlanOutput.model_validate(fixed), moved
+        except ValidationError:
+            return None, []
+
     def _finish(self, run: _Run, out: PlanOutput, reason: str) -> MarketPlan:
         final = run.responses[-1]
         meta = {
@@ -661,6 +688,8 @@ class RegimeAnalyst:
             "usage": _usage_total(run.responses),
             "config_hash": cfg.config_hash,  # the cycle's config, whatever the engine holds by now
         }
+        if run.repaired:  # only when it happened: records of runs without a repair keep their old shape
+            record["repaired"] = {"lifted_out_of_regimes": list(run.repaired)}
         self.last_plan = plan
         self.last_record = record
         if not self._replaying and plan.prompt_hash:

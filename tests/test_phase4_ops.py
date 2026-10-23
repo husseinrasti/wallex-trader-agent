@@ -315,12 +315,14 @@ def test_run_forever_watchdog_restarts_a_child_without_heartbeats(tmp_path: Path
 def test_run_forever_watchdog_leaves_a_beating_child_alone(tmp_path: Path) -> None:
     log_dir = tmp_path / "lg"
     log_dir.mkdir()
-    env = {**_fake_python(tmp_path), "WATCHDOG_S": "1", "WATCHDOG_GRACE_S": "0", "WATCHDOG_POLL_S": "0.2",
+    # 2 s, not 1 s: the watchdog reads heartbeat mtimes with 1-second granularity (stat %m), so a 1 s limit
+    # can fire on a beating child when the machine is busy
+    env = {**_fake_python(tmp_path), "WATCHDOG_S": "2", "WATCHDOG_GRACE_S": "0", "WATCHDOG_POLL_S": "0.2",
            "FAKE_BEAT": str(log_dir / "health-20261023.jsonl")}
     cmd = ["bash", str(ROOT / "scripts" / "run_forever.sh"), "run", "--mode", "shadow", f"--log-dir={log_dir}"]
     proc = subprocess.Popen(cmd, env=env)
     try:
-        time.sleep(3.5)  # > 3 x WATCHDOG_S
+        time.sleep(5.0)  # > 2 x WATCHDOG_S
         proc.send_signal(signal.SIGTERM)
         assert proc.wait(timeout=10) == 0
     finally:

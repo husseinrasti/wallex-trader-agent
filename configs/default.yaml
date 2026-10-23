@@ -123,6 +123,7 @@ ai:
   tool_result_max_bytes: 4096
   cache_dir: logs/llm_cache
   replay_strict: true
+  repair_plan_nesting: true          # lift plan keys written inside `regimes` (after the retry), logged as `repaired`
 alerts:
   telegram_enabled: false
   # inbound /status /pause /resume /kill: only ONE engine per bot may poll them (false on a second engine)

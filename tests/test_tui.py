@@ -691,3 +691,16 @@ def test_settings_deadline_overrides_logs(populated: tuple[Path, Path]) -> None:
     settings = DashboardSettings(challenge_end_utc="2026-10-22T11:00:00Z")
     out = _text(build_snapshot(log_dir, db, now=T0, settings=settings))
     assert "2026-10-22 11:00Z" in out and "in 1h00m" in out
+
+
+def test_s1_edges_read_the_current_pct_keys() -> None:
+    """S1 diagnostics name the fields ``edge_tmn_cheap_pct`` / ``need_tmn_cheap_pct`` (real-feed run 2026-10-23)."""
+    from decimal import Decimal
+
+    from wta.dashboard.tui import _diag_value
+
+    d = {"edge_tmn_cheap_pct": "-0.003", "need_tmn_cheap_pct": "0.0058", "edge_usdt_cheap": "-0.001"}
+    assert Decimal(_diag_value(d, "edge_tmn_cheap")) == Decimal("-0.003")
+    assert Decimal(_diag_value(d, "need_tmn_cheap")) == Decimal("0.0058")
+    assert _diag_value(d, "edge_usdt_cheap") == "-0.001"  # an older heartbeat's key still works
+    assert _diag_value(d, "cost_tmn_cheap") is None
