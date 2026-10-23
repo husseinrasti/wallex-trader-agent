@@ -6,7 +6,7 @@
 1. A 4.08 h run of the engine in mode `shadow` (paper money), exchange `paper`, strategies S1, S2. The feed was the **SYNTHETIC feed (generated market data): not evidence of performance**. AI on, real LLM calls: the 86 cached answers came from `openrouter/openai/gpt-5.4-mini` ×83, `openrouter/openai/gpt-6-luna-pro` ×3.
 2. Recorded at commit `7e8f2f5af1c5` (clean tree), config hash `481cc6dc3ce2`, 2026-10-22T22:53:39.578Z → 2026-10-23T02:58:39.872Z (4.08 h), 7,292 ticks, 1 process (no restart).
 3. 40 decisions (2 order, 38 plan) and 2 outcome lines; orders by strategy: 2 S2; vetoes: 0. 6 of 245 heartbeats are kept here (hourly sample).
-4. Replay: `make replay-deliverable` replays this run from the bundle in [`../replay/shadow_synth_4h/`](../replay/shadow_synth_4h/README.md) with no network; its output is in that README. Last result: **40/40 decisions reproduced -> PASS** (2026-10-23 07:28:52 UTC).
+4. Replay: `make replay-deliverable` replays this run from the bundle in [`../replay/shadow_synth_4h/`](../replay/shadow_synth_4h/README.md) with no network; its output is in that README. Last result: **40/40 decisions reproduced -> PASS** (2026-10-23 14:24:49 UTC).
 5. Not a live run. No live trading has happened yet: live trading starts only when the operator says "go live" (`docs/GO_LIVE_CHECKLIST.md`). `api.wallex.ir` is reachable only intermittently from the dev machine.
 
 ## What this is
@@ -50,4 +50,4 @@ python -m wta logs check --dir deliverables/shadow_synth_4h --secrets   # every 
 make replay-deliverable                                        # = python scripts/replay_check.py --bundle deliverables/replay/shadow_synth_4h
 ```
 
-Written by `scripts/make_deliverables.py` at commit `85acc16b6778` (working tree with uncommitted changes). The decision, order and event files are byte-for-byte copies of the run's own files.
+Written by `scripts/make_deliverables.py` at commit `b42a5f6361c8` (clean working tree). The decision, order and event files are byte-for-byte copies of the run's own files.

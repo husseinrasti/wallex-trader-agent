@@ -50,6 +50,6 @@ Details, commands and numbers: `docs/REPORTS/phase5_acceptance.md`. SYNTHETIC re
 - [ ] Commit the second- and third-session changes; tag `v0.5-backtest`
 
 ## Phase 6 — Ops, docs, video (PRD-06)
-- [ ] docker-compose, run_forever, Telegram, status, TUI, CI
-- [ ] README, ARCHITECTURE, STRATEGY, RISK, REPRODUCE, RUNBOOK, DECISION_LOG_FORMAT
-- [ ] deliverables assembled; fresh-clone Docker quick start verified; video shot list
+- [x] docker-compose (recorder + agent + optional shadow, WTA_LIVE pinned to 0), run_forever.sh (restart cap + heartbeat watchdog), Telegram alerts/commands (needs TELEGRAM_CHAT_ID), `wta status`, `wta tui`, CI (ruff + pytest + docker build, green)
+- [x] README (+ README.fa.md), ARCHITECTURE, STRATEGY, RISK, REPRODUCE, RUNBOOK, DECISION_LOG_FORMAT, GO_LIVE_CHECKLIST, SUBMISSION_CHECKLIST
+- [x] deliverables assembled (REPORT.md, 4 h run logs + llm_cache, replay bundle: `make replay-deliverable` -> 40/40 PASS, 0 network; real market DB); fresh-clone quick start verified on host + Docker (docs/REPORTS/fresh_clone_check.md); video shot list (docs/VIDEO_SHOTLIST.md + scripts/demo.sh). [ ] Video recording and live run: operator

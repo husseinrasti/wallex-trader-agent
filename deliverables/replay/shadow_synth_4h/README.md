@@ -28,7 +28,7 @@ python scripts/replay_check.py --log-dir /tmp/wta-bundle/shadow_synth_4h --state
 
 ## Replay output
 
-`python scripts/replay_check.py --bundle deliverables/replay/shadow_synth_4h`, finished 2026-10-23 07:28:52 UTC at commit `85acc16b6778` (working tree with uncommitted changes): exit 0, wall 137 s.
+`python scripts/replay_check.py --bundle deliverables/replay/shadow_synth_4h`, finished 2026-10-23 14:24:49 UTC at commit `b42a5f6361c8` (clean working tree): exit 0, wall 108 s.
 
 ```
 bundle:   deliverables/replay/shadow_synth_4h: SHA256SUMS verified (logs.tar.xz, state.sqlite.xz); unpacked into a temporary directory
@@ -45,4 +45,4 @@ report:   not written (--bundle without --reports-dir)  (replay output removed w
 
 What the lines mean: `window` is the replayed tick range and how many recorded plans were re-derived identically from the LLM cache; `network` counts refused connection attempts and LLM provider calls (both must be 0); `strict` compares every field of every decision, time stamps included; `end` compares the final heartbeat (informational). The full report of the same replay over `logs/`: [`docs/REPORTS/replay_20261023.md`](../../../docs/REPORTS/replay_20261023.md).
 
-Written by `scripts/make_deliverables.py` at commit `85acc16b6778` (working tree with uncommitted changes).
+Written by `scripts/make_deliverables.py` at commit `b42a5f6361c8` (clean working tree).
