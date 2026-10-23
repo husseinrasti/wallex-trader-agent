@@ -13,9 +13,13 @@
 #
 # Options:
 #   --workdir DIR   every file the demo writes goes here (default: ${TMPDIR:-/tmp}/wta-demo); outside the repo
-#   --ai on|off     on (default): the analyst as configured. That is the real LLM when an OpenRouter (or Gemini)
+#   --feed synthetic|live  the dashboard run's market data: synthetic (default, offline) or live = the REAL
+#                   Wallex feed (needs api.wallex.ir, e.g. VPN off). Still shadow mode: paper fills, never live
+#                   trading. The kill-switch drill always uses the synthetic feed (it needs the synthetic shock).
+#   --ai on|off|offline  on (default): the analyst as configured. That is the real LLM when an OpenRouter (or Gemini)
 #                   key is set, else the offline rules provider (labelled "not an LLM").
-#                   off: rules only (--set ai.enabled=false). The kill-switch drill always runs with AI off.
+#                   off: rules only (--set ai.enabled=false). offline: the labelled offline rules provider even
+#                   with keys (a network that reaches Wallex but not OpenRouter). The drill always runs with AI off.
 #   --no-open       do not open the report PNGs in an image viewer (their paths are printed)
 #   --fresh         delete the work dir before starting
 #
@@ -56,6 +60,7 @@ BUNDLE=${DEMO_REPLAY_BUNDLE:-deliverables/replay/shadow_synth_4h}
 W=${TMPDIR:-/tmp}
 W="${W%/}/wta-demo"
 AI=on
+FEED=${DEMO_FEED:-synthetic}  # the dashboard run's market data; the kill-switch drill is always synthetic
 YES=0
 DRY_RUN=0
 OPEN=1
@@ -85,8 +90,12 @@ while [ $# -gt 0 ]; do
         --no-open) OPEN=0 ;;
         --fresh) FRESH=1 ;;
         --ai)
-            [ $# -ge 2 ] || { echo "demo.sh: --ai needs on or off" >&2; exit 2; }
-            case $2 in on|off) AI=$2 ;; *) echo "demo.sh: --ai on|off" >&2; exit 2 ;; esac
+            [ $# -ge 2 ] || { echo "demo.sh: --ai needs on, off or offline" >&2; exit 2; }
+            case $2 in on|off|offline) AI=$2 ;; *) echo "demo.sh: --ai on|off|offline" >&2; exit 2 ;; esac
+            shift ;;
+        --feed)
+            [ $# -ge 2 ] || { echo "demo.sh: --feed needs synthetic or live" >&2; exit 2; }
+            case $2 in synthetic|live) FEED=$2 ;; *) echo "demo.sh: --feed synthetic|live" >&2; exit 2 ;; esac
             shift ;;
         --workdir)
             [ $# -ge 2 ] || { echo "demo.sh: --workdir needs a directory" >&2; exit 2; }
@@ -303,7 +312,7 @@ print_status() {
 
 # The dashboard run: shadow, synthetic feed, S1+S2, analyst every 60 s (production: 300 s).
 dash_cmd() {
-    local cmd=("$PY" -m wta run --mode shadow --feed synthetic --seconds "$DASH_SECONDS"
+    local cmd=("$PY" -m wta run --mode shadow --feed "$FEED" --seconds "$DASH_SECONDS"
         --log-dir "$W/dash/logs"
         --set "data.sqlite_path=$W/dash/market.sqlite"
         --set "data.state_sqlite_path=$W/dash/state_{mode}.sqlite"
@@ -312,18 +321,20 @@ dash_cmd() {
         --set alerts.telegram_enabled=false
         --runtime-dir "$W/dash/runtime")
     [ "$AI" = off ] && cmd+=(--set ai.enabled=false)
+    [ "$AI" = offline ] && cmd+=(--ai offline)
     "${cmd[@]}"
 }
 dash_shown() {
     local extra=""
     [ "$AI" = off ] && extra=" --set ai.enabled=false"
-    printf '%s%s' "$(show_cmd "$PY" -m wta run --mode shadow --feed synthetic --seconds "$DASH_SECONDS" \
+    [ "$AI" = offline ] && extra=" --ai offline"
+    printf '%s%s' "$(show_cmd "$PY" -m wta run --mode shadow --feed "$FEED" --seconds "$DASH_SECONDS" \
         --log-dir "$W/dash/logs" --set "data.sqlite_path=$W/dash/market.sqlite" \
         --set "data.state_sqlite_path=$W/dash/state_{mode}.sqlite" --set "ai.cache_dir=$W/dash/llm_cache" \
         --set engine.slow_loop_interval_s=60 --set engine.heartbeat_interval_s=20 \
         --set alerts.telegram_enabled=false --runtime-dir "$W/dash/runtime")" "$extra"
 }
-DASH_VIEW=(--log-dir "$W/dash/logs" --mode shadow --feed synthetic
+DASH_VIEW=(--log-dir "$W/dash/logs" --mode shadow --feed "$FEED"
     --set "data.sqlite_path=$W/dash/market.sqlite" --set "data.state_sqlite_path=$W/dash/state_{mode}.sqlite")
 
 # The kill-switch drill: strategies and AI off, one injected BTCUSDT entry at 5 s, a -8 % synthetic shock

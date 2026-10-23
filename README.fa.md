@@ -81,6 +81,14 @@ python -m wta tui    --log-dir logs/shadow_synth --set data.sqlite_path=data/sha
 
 <div dir="rtl">
 
+**روی داده‌ی واقعی والکس (بدون VPN):** `make smoke-real` همه‌ی مسیرهای واقعی را فقط‌خواندنی تست می‌کند؛
+اگر OpenRouter در دسترس نبود، `--ai offline` بگذارید. راهنمای کامل قدم‌به‌قدم:
+[`docs/QUICKSTART_FA.md`](docs/QUICKSTART_FA.md).
+
+</div>
+
+<div dir="rtl">
+
 ### Docker
 
 </div>

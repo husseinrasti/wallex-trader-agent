@@ -105,6 +105,18 @@ made in step 1. Its report goes to `logs/replay_<day>.md`, so the committed proo
 `docs/REPORTS/replay_20261023.md` is never overwritten (`make replay-report` is the variant that
 rewrites `docs/REPORTS`; details in [REPRODUCE §3.2](docs/REPRODUCE.md#32-make-replay-a-run-of-your-own)).
 
+### On the real Wallex feed (a network that reaches api.wallex.ir, e.g. from Iran without a VPN)
+
+```bash
+make smoke-real                               # read-only: markets, account, WS + REST feed, one LLM plan,
+                                              # 3-min paper shadow on the real feed -> PASS / WARN / FAIL
+python -m wta run --mode shadow --ai offline  # paper shadow on real data; --ai offline when OpenRouter is
+python -m wta tui --mode shadow               # not reachable from that network (labelled, not an LLM)
+bash scripts/demo.sh --feed live --ai offline --scene 0   # the demo with the dashboard on real data
+```
+
+Persian step-by-step guide: [`docs/QUICKSTART_FA.md`](docs/QUICKSTART_FA.md).
+
 ### Docker
 
 ```bash

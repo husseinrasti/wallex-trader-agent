@@ -12,7 +12,7 @@ REPLAY_ARGS   ?= --decisions logs/decisions.jsonl --reports-dir logs --no-index
 REPLAY_REPORT_ARGS ?= --decisions logs/decisions.jsonl
 DELIVER_RUN   ?= logs/shadow_synth_4h
 
-.PHONY: install test lint record survey shadow shadow-synth live backtest backtest-books backtest-synth backtest-cache market-db replay replay-report replay-deliverable deliverables final-report report export flatten flatten-live status tui ps docker
+.PHONY: smoke-real smoke-real-quick install test lint record survey shadow shadow-synth live backtest backtest-books backtest-synth backtest-cache market-db replay replay-report replay-deliverable deliverables final-report report export flatten flatten-live status tui ps docker
 
 install:
 	$(PYTHON) -m venv $(VENV) && $(VENV)/bin/pip install -U pip && $(VENV)/bin/pip install -e ".[dev]"
@@ -91,3 +91,9 @@ ps:
 
 docker:
 	docker build -t wallex-trader-agent .
+
+smoke-real:         # READ-ONLY check of every real Wallex path + a 3-min paper shadow on the real feed (VPN off)
+	$(PY) scripts/smoke_real.py
+
+smoke-real-quick:   # the same without the shadow run (~1 min)
+	$(PY) scripts/smoke_real.py --quick

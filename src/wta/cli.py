@@ -74,7 +74,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from rich import box
 from rich.console import Console
 from rich.table import Table
@@ -84,6 +84,7 @@ from wta.ai.cache import CacheMissError
 from wta.config import (
     Config,
     Settings,
+    apply_changes,
     canonical_json,
     load_config,
     load_settings,
@@ -540,8 +541,31 @@ def _pinned_keys(args: argparse.Namespace) -> list[str]:
     return sorted(keys)
 
 
+AI_CHOICES = ("on", "off", "offline")
+
+
+def apply_ai_choice(choice: str | None, cfg: Config, settings: Settings) -> tuple[Config, Settings]:
+    """``--ai`` of ``wta run`` / ``wta plan``.
+
+    * ``on`` (default): the analyst as configured — the LLM when an OpenRouter/Gemini key is set, else the
+      offline rules provider.
+    * ``off``: rules only (``ai.enabled=false``, the ablation; changes the config hash).
+    * ``offline``: the offline rules provider even when keys are set (it is labelled "offline rules (no LLM
+      key)", never an LLM) — for a network that reaches Wallex but not OpenRouter/Gemini.
+    """
+    if choice in (None, "on"):
+        return cfg, settings
+    if choice == "off":
+        return apply_changes(cfg, {"ai.enabled": False}), settings
+    if choice == "offline":
+        blank = {"openrouter_api_key": SecretStr(""), "gemini_api_key": SecretStr("")}
+        return cfg, settings.model_copy(update=blank)
+    raise ValueError(f"--ai must be one of {', '.join(AI_CHOICES)}, got {choice!r}")
+
+
 def cmd_run(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
     """The guards (``wta.safety``) are checked here for a friendly message, and again by the engine."""
+    cfg, settings = apply_ai_choice(getattr(args, "ai", None), cfg, settings)
     if args.mode == "live":
         reason = live_guard_reason(args.i_understand_live, args.allow_dirty, settings)
         if reason is None:
@@ -728,6 +752,7 @@ def cmd_tui(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
 
 def cmd_plan(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
     """One analyst cycle (``engine.plan_once``); prints ``{"plan", "analyst", "ai_source", ...}``."""
+    cfg, settings = apply_ai_choice(getattr(args, "ai", None), cfg, settings)
     log_dir = run_log_dir("shadow", args.log_dir)
     try:
         out = asyncio.run(
@@ -1137,6 +1162,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="where the reviewer writes (and startup reads) its overlays "
              "(default configs/runtime/<account>: live, shadow or shadow_synthetic)",
     )
+    p.add_argument(
+        "--ai",
+        choices=AI_CHOICES,
+        default="on",
+        help="on: analyst as configured (LLM if a key is set); off: rules only (ai.enabled=false); "
+             "offline: the labelled offline rules provider even with keys (network without OpenRouter)",
+    )
 
     p = add("reset-kill", cmd_reset_kill, "clear the kill-switch by hand (writes a reset_kill event)")
     p.add_argument("--reason", required=True, help="why the kill-switch is reset (logged)")
@@ -1182,6 +1214,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-runtime-overlay", action="store_true", help="ignore the reviewer's <runtime-dir>/latest.yaml")
     p.add_argument("--runtime-dir", default=None, metavar="DIR",
                    help="reviewer overlay directory (default configs/runtime/<account>)")
+    p.add_argument("--ai", choices=("on", "offline"), default="on",
+                   help="on: the configured LLM (offline rules without a key); offline: the offline rules provider")
     _add_overlay_option(p)
 
     p = add("alert", cmd_alert, "send one Telegram message (no-op without TELEGRAM_* and alerts.telegram_enabled)")
