@@ -12,6 +12,7 @@ import importlib.util
 import json
 import socket
 import sqlite3
+import subprocess
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -475,7 +476,9 @@ def test_check_account_report_warns_about_routing(check_account, tmp_path, capsy
     assert "tools/list: 4 tools (1 state-changing, never called)" in report  # 3. MCP
     assert [c["name"] for c in mcp_calls] == [module.MCP_SUB_ACCOUNTS_TOOL, module.MCP_SUB_BALANCES_TOOL]
     assert mcp_calls[1]["arguments"] == {"clientId": SUB_ID}
-    assert f"| Wallex trading challenge | {SUB_ID} |" in report
+    # account ids show only their last 4 characters: in the table, the warning and the raw MCP payload
+    assert "| Wallex trading challenge | ...6666 |" in report and SUB_ID not in report
+    assert "(...6666). Orders and balances would use the MAIN wallet" in report
     assert "WARNING: WALLEX_SUB_ACCOUNT_CLIENT_ID IS EMPTY BUT CREDIT SUB-ACCOUNTS EXIST" in report
     assert "WARNING: MCP SUB-ACCOUNT BALANCES DIFFER FROM REST BALANCES" in report and "TMN: REST 5000000 vs MCP 4000000" in report
     assert "| SOLTMN | 0 | 2 | 0.01 | 50000 | NO | no |" in report  # 4. markets
@@ -556,6 +559,7 @@ def test_check_account_probe_places_fetches_and_always_cancels(check_account, tm
     assert "| yes | NEW |" in limit_row and "| CANCELED |" in limit_row
     assert "| no |" in stop_row and "HTTP 422 invalid_type: stop orders disabled" in stop_row
     assert "nothing to cancel (not found)" in stop_row
+    assert "- sub-account-client-id: set (...6666)" in report and SUB_ID not in report
     actions = [r["action"] for r in iter_family(tmp_path / "logs", "orders", strict=True)]
     assert actions[:2] == ["place", "response"] and "cancel_response" in actions and "error" in actions
     assert check_logs(tmp_path / "logs").ok
@@ -667,6 +671,17 @@ def test_check_account_probe_aborts_on_a_crossed_book(check_account, tmp_path) -
         module.main(["--out", str(tmp_path / "probe.md"), "--probe-order", "--yes", "--log-dir", str(tmp_path / "logs")])
     assert not posted.called
     assert "book is crossed or mis-parsed" in (tmp_path / "probe.md").read_text()
+
+
+def test_check_account_writes_to_the_gitignored_logs_by_default(check_account) -> None:
+    module, _ = check_account
+    assert module.DEFAULT_OUT == ROOT / "logs" / "api_probe.md"
+    assert module.parse_args([]).out == module.DEFAULT_OUT
+    ignored = subprocess.run(["git", "check-ignore", "-q", str(module.DEFAULT_OUT)], cwd=ROOT, check=False)
+    assert ignored.returncode == 0  # logs/ is in .gitignore: the raw balances never reach git by default
+    assert module.mask_id(SUB_ID) == "...6666" and module.mask_id("abc") == "..."
+    text = f"id {SUB_ID} and {SUB_ID[:-1]}x, short abc"
+    assert module.mask_ids(text, [SUB_ID, "", "abc"]) == f"id ...6666 and {SUB_ID[:-1]}x, short abc"
 
 
 def test_equity_and_balance_helpers(check_account) -> None:

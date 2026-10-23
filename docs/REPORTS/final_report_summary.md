@@ -59,7 +59,7 @@ These are mechanisms, not performance:
   - AI plans are bounded, logged, cached and replayable without network.
   - When the LLM provider fails, the engine keeps the last plan until it is 20 minutes old, then runs rules-only (4-h shadow run).
   - Replay result: all 40 decisions of the 4-h shadow run reproduced, with zero network and zero provider calls.
-    The replay's inputs (`logs/shadow_synth_4h` and the 108 MB state DB) are not in git: `/logs/` and `/data/` are ignored.
+    The inputs ship as the checksummed bundle `deliverables/replay/shadow_synth_4h/` (`logs.tar.xz`, `state.sqlite.xz`, `SHA256SUMS`); `make replay-deliverable` reproduces 40/40 with 0 network on a fresh clone.
 * **Not proven.**
   - That S1, S2 or S3 make money on Wallex. The real data is 20 minutes of books and 2 hours of candles.
   - That the AI adds value.

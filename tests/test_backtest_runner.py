@@ -525,6 +525,45 @@ async def test_ai_on_caps_cycles_and_a_rerun_needs_no_provider(tmp_path: Path, d
     assert any("at most 2 cycles per run" in x for x in second.limitations)
 
 
+def _tree(root: Path) -> dict[str, bytes]:
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+async def test_ai_cache_reruns_a_cached_run_without_key_or_provider(tmp_path: Path, dollar_db: Path) -> None:
+    """``--ai cache``: routes from the cache, refusing providers, a strict and untouched cache."""
+    from wta.ai.cache import CacheMissError
+
+    recorded = load_config(env={}, overrides={"llm.analyst.model": "fake/analyst-1"})
+    kwargs: dict[str, Any] = dict(driver="candles", from_ts=T + 60, to_ts=T + 1800, strategies="S2",
+                                  ai_max_calls=2, market_db=dollar_db)
+    first = await bt(recorded, ai="on", ai_providers={"openrouter": _ScriptedLLM()}, out_dir=tmp_path / "on", **kwargs)
+    cache = tmp_path / "on" / "llm_cache"
+    before = _tree(cache)
+    plain = load_config(env={}, overrides={"ai.cache_dir": str(cache)})  # no model configured, no key
+    assert plain.llm.analyst.model is None
+    res = await bt(plain, ai="cache", out_dir=tmp_path / "cache", settings=Settings(_env_file=None), **kwargs)
+    meta = res.meta
+    assert meta["ai"] == "cache" and meta["ai_source"] == "llm"
+    assert meta["ai_cache_routes"] == ["openrouter/fake/analyst-1"] and meta["provider_calls"] == 0
+    assert meta["model_calls"] == meta["cached_calls"] == first.meta["model_calls"] == 2
+    plans = [{k: v for k, v in r["plan_snapshot"].items() if k not in ("cached", "latency_ms")}
+             for r in records(tmp_path / "cache") if r["kind"] == "plan"]
+    recorded_plans = [{k: v for k, v in r["plan_snapshot"].items() if k not in ("cached", "latency_ms")}
+                      for r in records(tmp_path / "on") if r["kind"] == "plan"]
+    assert plans == recorded_plans and res.metrics.return_pct == first.metrics.return_pct
+    assert _tree(cache) == before  # read only: neither answers nor the cycle tape were rewritten
+    assert any("ai=cache" in x and "no provider was called" in x for x in res.limitations)
+    assert "| AI | cache (recorded LLM answers, no provider call) |" in (tmp_path / "cache" / "report.md").read_text()
+    # another window asks other questions: a miss stops the run, nothing is called or written
+    with pytest.raises(CacheMissError):
+        await bt(plain, ai="cache", out_dir=tmp_path / "miss", settings=Settings(_env_file=None),
+                 **{**kwargs, "from_ts": T + 600})
+    assert _tree(cache) == before
+    empty = load_config(env={}, overrides={"ai.cache_dir": str(tmp_path / "nothing")})
+    with pytest.raises(ValueError, match="no cached LLM answers"):
+        await bt(empty, ai="cache", out_dir=tmp_path / "none", **kwargs)
+
+
 # ---------------------------------------------------------------- synthetic market DB
 
 

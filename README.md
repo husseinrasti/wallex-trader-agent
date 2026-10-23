@@ -6,7 +6,7 @@
 1. An autonomous, explainable spot-trading agent for the Wallex exchange, built for the Starcoach "Wallex Algorithmic Trading Challenge". In one line: **AI plans, rules trade, risk guards.**
 2. One code path for four modes: `backtest`, `shadow` (paper trading on live books), `live` and `replay`. Only the exchange object, the data source and the clock change.
 3. Every decision is one JSON line holding the signal, the AI plan in force, all 23 risk checks, the order and its outcome, plus `git_commit` and `config_hash`.
-4. Proven offline: 1,939 tests pass. A 4-hour shadow run with a real LLM, on the synthetic feed, replays 40 of 40 decisions with zero network calls (`make replay-deliverable`).
+4. Proven offline: 1,953 tests pass. A 4-hour shadow run with a real LLM, on the synthetic feed, replays 40 of 40 decisions with zero network calls (`make replay-deliverable`).
 5. Not proven yet: profitability, and behaviour on real Wallex data. `api.wallex.ir` answers the development machine only now and then, so only about 20 minutes of real order books exist. No live trading has happened.
 
 [فارسی (Persian summary and quick start)](README.fa.md)
@@ -39,16 +39,16 @@ request, so `replay` re-runs a recorded session without any network access.
                  -> decisions.jsonl, orders.jsonl, events.jsonl, health.jsonl
 ```
 
-## Status (2026-10-23, tag `v0.5-backtest`)
+## Status (2026-10-23, tag `v0.6-ops`)
 
 > | | What | Evidence |
 > |---|---|---|
-> | **Proven** | 1,939 tests pass on `main` (1,913 at `v0.5-backtest`), 1 skipped; CI runs ruff, pytest on Python 3.11 and a Docker build | badge above, `make test` |
+> | **Proven** | 1,953 tests pass at `v0.6-ops` (1,913 at `v0.5-backtest`), 1 skipped; CI runs ruff, pytest on Python 3.11 and a Docker build | badge above, `make test` |
 > | **Proven** | The same `Engine` runs backtest, shadow and replay; risk rules fire as specified (kill-switch at −5 % drawdown, then flatten; fee budget; rate caps) | [phase2_acceptance](docs/REPORTS/phase2_acceptance.md), [REPORT.md](deliverables/REPORT.md) |
 > | **Proven** | A real LLM is in the loop: a 4.08-h shadow run on the **synthetic feed** got 38 plans from `openai/gpt-5.4-mini` via OpenRouter. When the provider failed, the engine ran rules-only, as designed | [shadow report](docs/REPORTS/shadow_20261023_synth4h/report.md) |
 > | **Proven** | Replay of that run: 40/40 decisions identical (strict pass, time stamps included), 0 socket attempts, 0 LLM calls | [replay proof](docs/REPORTS/replay_20261023.md), `make replay-deliverable` |
 > | **Pending** | **Live run: none.** Live trading is started only by the operator after "go live" ([GO_LIVE_CHECKLIST](docs/GO_LIVE_CHECKLIST.md)). No live order has been placed | — |
-> | **Pending** | **Real data:** about 20 minutes of REST order books (2026-10-22 14:20–14:40Z, plus a 1-second burst at 20:16Z) and 2.2 h of 1-minute candles. The survey verdict is "insufficient data". No 30-day candle backfill exists | [survey](docs/REPORTS/survey_20261022.md) |
+> | **Pending** | **Real data:** about 20 minutes of REST order books (2026-10-22 14:20–14:40Z, plus a 1-second burst at 20:16Z) and 2.2 h of 1-minute candles. The survey verdict is "insufficient data". No 30-day candle backfill exists. The recorded data is in git (`deliverables/market/`, `make market-db`), so the real-data reports rerun offline | [survey](docs/REPORTS/survey_20261022.md), [REPRODUCE §4.2](docs/REPRODUCE.md#42-on-real-data-the-shipped-market-db) |
 > | **Pending** | **API connectivity:** `api.wallex.ir` answers the development machine only intermittently. The WebSocket feed, the MCP tools, STOP_LIMIT acceptance and sub-account routing are built against the docs and still unverified on the live API | [api_probe](docs/REPORTS/api_probe.md) |
 > | **Pending** | **Operator settings:** `CHALLENGE_END_UTC`, `WALLEX_SUB_ACCOUNT_CLIENT_ID` and `TELEGRAM_CHAT_ID` are still empty in the operator's `.env` (live refuses to start without `CHALLENGE_END_UTC`). The Gemini fallback key is quota-limited (HTTP 429), so in practice an OpenRouter failure means rules-only | [RUNBOOK](docs/RUNBOOK.md) |
 >
@@ -62,13 +62,18 @@ Needs Python ≥ 3.11 (tested with 3.11 in Docker/CI, 3.12 and 3.14), `make` and
 commands can place a real order: live mode needs `WTA_LIVE=1` in the environment, `--i-understand-live`,
 a clean git tree and `CHALLENGE_END_UTC`.
 
+> **Access.** The repository is **private** until the operator opens it at submission
+> ([SUBMISSION_CHECKLIST §3](docs/SUBMISSION_CHECKLIST.md#3-making-the-repo-public-operator-decision-at-the-end)).
+> Until then the clone below and the CI badge work only for accounts that were given access; an
+> anonymous request gets HTTP 404.
+
 ```bash
 git clone https://github.com/husseinrasti/wallex-trader-agent.git
 cd wallex-trader-agent
 cp .env.example .env          # all keys are optional, see below
 make install                  # creates .venv (uses python3; pick another with: make install PYTHON=python3.12)
 source .venv/bin/activate     # so that `python` below is the venv's (make targets use .venv on their own)
-make test                     # ruff ("All checks passed!") + pytest (`1939 passed, 1 skipped`), about 2 min, exit 0
+make test                     # ruff ("All checks passed!") + pytest (`1953 passed, 1 skipped`), about 2 min, exit 0
 ```
 
 **Keys.** Without any key everything below works. The AI layer then uses the offline rules provider
@@ -81,10 +86,12 @@ for live trading. Market data is public.
 |---|---|---|---|---|
 | 1 | `make shadow-synth` | nothing (offline synthetic feed) | until Ctrl-C | `AI: offline rules (no LLM key) ...`, one `heartbeat: feed=synthetic ... fresh_books=21/21` line per 60 s, an S2 order in the first tick; Ctrl-C prints `engine: stopped (signal SIGINT)` |
 | 2 | `make shadow` | `api.wallex.ir` reachable | until Ctrl-C | paper trading on live books. When the API is unreachable: `markets fetch failed ... using configs/markets_snapshot.yaml`, WebSocket timeouts, `fresh_books=0/21`, and no trades |
-| 3 | `make backtest-synth` | nothing (writes a SYNTHETIC 6-h book DB) | ~30 s | `return -0.236%  max drawdown +0.770%  trades 2  orders 19  vetoes 18  fees 16,063 TMN`, report in `docs/REPORTS/synthetic_bt_books/` |
-| 4 | `make backtest` | 30 days of real 1-min candles in `data/wta.sqlite` (`python -m wta backfill --days 30`, needs the API) | ~15–20 min | on a fresh clone: `error: market database data/wta.sqlite does not exist` (exit 2). The offline variant is in [REPRODUCE §4](docs/REPRODUCE.md#4-backtests) |
+| 3 | `make backtest-synth` | nothing (writes a SYNTHETIC 6-h book DB) | ~30 s | `return -0.236%  max drawdown +0.770%  trades 2  orders 19  vetoes 18  fees 16,063 TMN`, report in `logs/synthetic_bt_books/` (gitignored, so later runs still log a clean tree) |
+| 4 | `make backtest` | 30 days of real 1-min candles in `data/wta.sqlite` (`python -m wta backfill --days 30`, needs the API) | ~15–20 min | on a fresh clone: `error: market database data/wta.sqlite does not exist` (exit 2). It writes `docs/REPORTS/bt_candles_30d_real/`, never the shipped SYNTHETIC `bt_candles_30d/`. The offline variants are in [REPRODUCE §4](docs/REPRODUCE.md#4-backtests) |
 | 5 | `make replay-deliverable` | nothing (the bundle is in git) | ~2–3 min | `result:   40/40 decisions reproduced -> PASS` with `network:  0 socket attempts, 0 LLM provider calls` (all lines in [REPRODUCE §3](docs/REPRODUCE.md#3-replay-the-key-reproducibility-check)) |
-| 6 | `python -m wta status` / `python -m wta tui` | a run's logs | instant | one-screen summary / live dashboard (Ctrl-C quits, `--once` prints one frame) |
+| 6 | `make backtest-cache` | nothing (the LLM cache is in git; builds a SYNTHETIC 24-h book DB first) | ~3 min | the AI ablation's real-LLM run again, with no key: `ai=cache`, `return +0.121%`, `model calls 132 (132 cached)` ([REPRODUCE §4.1](docs/REPRODUCE.md#41-offline-synthetic-data)) |
+| 7 | `make market-db` | nothing (the recorded books are in git) | ~1 s | `SHA256SUMS verified; wrote data/wta.sqlite (REAL recorded Wallex market data)`: 6,131 books, 1,476 candles. Then the real-data reports rerun offline ([REPRODUCE §4.2](docs/REPRODUCE.md#42-on-real-data-the-shipped-market-db)) |
+| 8 | `python -m wta status` / `python -m wta tui` | a run's logs | instant | one-screen summary / live dashboard (Ctrl-C quits, `--once` prints one frame) |
 
 `make status` and `make tui` read the logs of `make shadow` (`logs/shadow`). For the synthetic run of step 1:
 
@@ -94,8 +101,9 @@ python -m wta tui    --log-dir logs/shadow_synth --set data.sqlite_path=data/sha
 ```
 
 `make replay` (no bundle) replays the newest run under `logs/` instead, for example the one you just
-made in step 1. It rewrites `docs/REPORTS/replay_<day>.md` and the reports index; run
-`git checkout -- docs/REPORTS` afterwards to restore the committed proof (details in [REPRODUCE](docs/REPRODUCE.md)).
+made in step 1. Its report goes to `logs/replay_<day>.md`, so the committed proof
+`docs/REPORTS/replay_20261023.md` is never overwritten (`make replay-report` is the variant that
+rewrites `docs/REPORTS`; details in [REPRODUCE §3.2](docs/REPRODUCE.md#32-make-replay-a-run-of-your-own)).
 
 ### Docker
 
@@ -127,9 +135,10 @@ non-root user, and the synthetic backtest gives the same numbers there as on the
 | [`deliverables/REPORT.md`](deliverables/REPORT.md) | the final report, assembled from `docs/REPORTS` (real and SYNTHETIC sections labelled) | yes |
 | `deliverables/replay/shadow_synth_4h/` | replay bundle of the 4-h shadow run: `logs.tar.xz`, `state.sqlite.xz`, `SHA256SUMS` | yes |
 | `deliverables/shadow_synth_4h/` | that run's decision, order and event logs, hourly health, journal, LLM cache | yes |
+| `deliverables/market/` | the recorded **real** Wallex market data (`wta.sqlite.xz`, 6,131 books, 1,476 candles, `SHA256SUMS`); `make market-db` unpacks it to `data/wta.sqlite` | yes |
 | [`deliverables/TAGS.md`](deliverables/TAGS.md) | every git tag with its commit, and which commit produced each evidence run | yes |
 | `logs/<run>/` | logs of runs you start: `decisions-YYYYMMDD.jsonl` (+ `decisions.jsonl` link), `orders`, `events`, `health`, `journal.md`, `llm_cache/` | no |
-| `data/` | the market store `data/wta.sqlite` and one engine state DB per mode and feed | no |
+| `data/` | the market store `data/wta.sqlite` (from `make market-db` or the recorder) and one engine state DB per mode and feed | no |
 | `configs/` | `default.yaml` (every parameter, hashed into `config_hash`), `markets.yaml` (watchlist + verbatim ban list), `llm.yaml`, `live_halfsize.yaml` | yes |
 
 ## Documentation (read in this order)

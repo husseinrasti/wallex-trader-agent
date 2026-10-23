@@ -12,6 +12,10 @@ Every folder and file under `deliverables/`, one line each (written by `scripts/
 | [`REPORT.md`](REPORT.md) | this report: survey, backtests, AI ablation, walk-forward, shadow run, live run (none yet), replay proof |
 | [`VIDEO.md`](VIDEO.md) | link to the demo video (PRD-06 §5) |
 | [`TAGS.md`](TAGS.md) | git tags with their commits and time ranges: the engineering phases, `live-*` per live start, `final` |
+| [`market/`](market/README.md) | the recorded REAL Wallex market data (order books, trades, 1-minute candles): `make market-db` unpacks it to `data/wta.sqlite` for the real-data reports |
+| [`market/README.md`](market/README.md) | what is inside (rows and time range per table) and the checksums |
+| [`market/SHA256SUMS`](market/SHA256SUMS) | sha256 of the archive; `scripts/market_db.py` refuses an archive that does not match |
+| [`market/wta.sqlite.xz`](market/wta.sqlite.xz) | the recorder's market DB (SQLite online backup + VACUUM, xz -9); account and engine tables empty |
 | [`shadow_synth_4h/`](shadow_synth_4h/README.md) | Shadow run `shadow_synth_4h` — SYNTHETIC feed, real LLM |
 | [`shadow_synth_4h/README.md`](shadow_synth_4h/README.md) | what the run is, commit, config hash, window, how to replay |
 | [`shadow_synth_4h/decisions-20261022.jsonl`](shadow_synth_4h/decisions-20261022.jsonl) | decision records of 2026-10-22 (UTC): 18 lines (2 order, 2 outcome, 14 plan) |
@@ -36,14 +40,14 @@ Every folder and file under `deliverables/`, one line each (written by `scripts/
 | # | section | status | source |
 | --- | --- | --- | --- |
 | 1 | Read first: what this evidence is and is not | included (2026-10-23) | [final_report_summary.md](../docs/REPORTS/final_report_summary.md) |
-| 2 | Market survey (real recorded books) | included (2026-10-22) | [survey_20261022.md](../docs/REPORTS/survey_20261022.md) |
+| 2 | Market survey (real recorded books) | included (2026-10-22) — real | [survey_20261022.md](../docs/REPORTS/survey_20261022.md) |
 | 3 | Backtest: 1-min candles, 30 days, S2+S3 (SYNTHETIC) | included (2026-10-23) — SYNTHETIC | [bt_candles_30d/report.md](../docs/REPORTS/bt_candles_30d/report.md) |
-| 4 | Backtest: 1-min candles, all recorded real candles (2.25 h), S2+S3 | included (2026-10-23) | [bt_candles_recorded_ai_off/report.md](../docs/REPORTS/bt_candles_recorded_ai_off/report.md) |
-| 5 | Backtest: all recorded real order books (0.32 h), S1+S2, ai=off | included (2026-10-23) | [bt_books_recorded_ai_off/report.md](../docs/REPORTS/bt_books_recorded_ai_off/report.md) |
-| 6 | Backtest: all recorded real order books (0.32 h), S1+S2, ai=on (real LLM) | included (2026-10-23) | [bt_books_recorded_ai_on/report.md](../docs/REPORTS/bt_books_recorded_ai_on/report.md) |
+| 4 | Backtest: 1-min candles, all recorded real candles (2.25 h), S2+S3 | included (2026-10-23) — real | [bt_candles_recorded_ai_off/report.md](../docs/REPORTS/bt_candles_recorded_ai_off/report.md) |
+| 5 | Backtest: all recorded real order books (0.32 h), S1+S2, ai=off | included (2026-10-23) — real | [bt_books_recorded_ai_off/report.md](../docs/REPORTS/bt_books_recorded_ai_off/report.md) |
+| 6 | Backtest: all recorded real order books (0.32 h), S1+S2, ai=on (real LLM) | included (2026-10-23) — real | [bt_books_recorded_ai_on/report.md](../docs/REPORTS/bt_books_recorded_ai_on/report.md) |
 | 7 | Backtest: 24 h order books, S1+S2, ai=off (SYNTHETIC) | included (2026-10-23) — SYNTHETIC | [bt_books_synth24h_ai_off/report.md](../docs/REPORTS/bt_books_synth24h_ai_off/report.md) |
 | 8 | Backtest: 6 h order books, S1+S2, ai=on with the real LLM (SYNTHETIC) | included (2026-10-23) — SYNTHETIC | [bt_books_synth24h_6h_ai_on/report.md](../docs/REPORTS/bt_books_synth24h_6h_ai_on/report.md) |
-| 9 | AI ablation (ai=on − ai=off) | included (2026-10-23) — SYNTHETIC | [ablation_20261023.md](../docs/REPORTS/ablation_20261023.md) |
+| 9 | AI ablation (ai=on − ai=off) | included (2026-10-23) — real + SYNTHETIC | [ablation_20261023.md](../docs/REPORTS/ablation_20261023.md) |
 | 10 | Walk-forward: S1 margin grid, S1+S2 (SYNTHETIC) | included (2026-10-23) — SYNTHETIC | [walkforward_s1_margin/walkforward.md](../docs/REPORTS/walkforward_s1_margin/walkforward.md) |
 | 11 | Walk-forward: S1 margin grid, S1 only (SYNTHETIC) | included (2026-10-23) — SYNTHETIC | [walkforward_s1_margin_s1only/walkforward.md](../docs/REPORTS/walkforward_s1_margin_s1only/walkforward.md) |
 | 12 | Shadow (paper) run: 4 h, S1+S2, AI on (SYNTHETIC feed) | included (2026-10-23) — SYNTHETIC | [shadow_20261023_synth4h/report.md](../docs/REPORTS/shadow_20261023_synth4h/report.md) |
@@ -115,7 +119,7 @@ These are mechanisms, not performance:
   - AI plans are bounded, logged, cached and replayable without network.
   - When the LLM provider fails, the engine keeps the last plan until it is 20 minutes old, then runs rules-only (4-h shadow run).
   - Replay result: all 40 decisions of the 4-h shadow run reproduced, with zero network and zero provider calls.
-    The replay's inputs (`logs/shadow_synth_4h` and the 108 MB state DB) are not in git: `/logs/` and `/data/` are ignored.
+    The inputs ship as the checksummed bundle `deliverables/replay/shadow_synth_4h/` (`logs.tar.xz`, `state.sqlite.xz`, `SHA256SUMS`); `make replay-deliverable` reproduces 40/40 with 0 network on a fresh clone.
 * **Not proven.**
   - That S1, S2 or S3 make money on Wallex. The real data is 20 minutes of books and 2 hours of candles.
   - That the AI adds value.
@@ -1579,6 +1583,8 @@ _Generated by `backtest/report.py`. Files: [summary.json](../docs/REPORTS/bt_boo
 
 _Source: [ablation_20261023.md](../docs/REPORTS/ablation_20261023.md) — AI ablation (ai=on − ai=off), 2026-10-23._
 
+<!-- data: mixed -->
+
 > **SYNTHETIC DATA — not evidence of performance** in sections 2 and 3. Section 1 uses recorded Wallex books, but only 0.32 h of them.
 
 Three pairs of backtests: the same window, market DB, seed and config, apart from `ai.enabled`. The first pair runs on
@@ -1620,7 +1626,8 @@ The plans did not change a single order. Here is why:
 * **The USDT target matched the rules.** 50 % is the rules-table target for `range`, so S2 placed the same three BUYs.
 * **Two of the three BUYs came before any fresh plan.** The first was placed at startup, before the first plan. The last one (20:16:14) was placed on rules, because the plan before it was 5.6 h old (stale after 1,200 s). The recording has a gap from 14:40 to 20:16.
 
-A rerun replays from the cache with 11 of 11 cached calls and no provider call, and gives the same result.
+A rerun replays from the cache with 11 of 11 cached calls and no provider call, and gives the same result. Without
+a key: `make market-db`, then the `--ai cache` command of `docs/REPRODUCE.md` §4.2 (`model calls 11 (11 cached)`).
 
 ### 2. SYNTHETIC books, 6-h sub-window 2026-10-01 12:00–18:00Z, S1+S2 — real LLM
 
@@ -1643,6 +1650,13 @@ How the plans changed trading:
 * **S1 skipped two marginal signals.** With that margin in force, S1 placed no order for the BTCTMN signal at 14:26:26 (edge 0.659 %) or the ETHUSDT signal at 17:42:44 (edge 0.600 %). The ai=off run took both. The second became its only closed cycle, a lock-in that lost 1,953 TMN after 4,277 TMN of fees (both legs crossed, so every fill paid the taker fee). Its leg 1 was paid in USDT, which dropped the USDT share to 30.1 % and triggered one extra S2 rebalance (3.69 USDT).
 * **Most rules-run entries never filled.** 5 of the rules run's 6 S1 leg-1 orders expired unfilled: on this synthetic feed the cross-book gap is gone by the next snapshot, and the fill model acts one step later.
 * **Where the gain came from.** It is fewer fees and one avoided losing cycle. It is not better entries.
+
+**Rerun it without a key.** The ai=on side's LLM cache is committed (`bt_books_synth24h_6h_ai_on/llm_cache/`, 132
+answers). `make backtest-cache` reruns that run from it alone: `--ai cache` reads the analyst's route from the cache
+entries, replaces the providers by stand-ins that refuse every call, and treats a cache miss as an error (exit 1),
+so it can never fall back to rules-only or call the network. It prints `return +0.121%` and
+`model calls 132 (132 cached)`, the numbers above (`docs/REPRODUCE.md` §4.1). The ai=off side is the same command
+with `--ai off`.
 
 ### 3. SYNTHETIC books, 24 h 2026-10-01, S1+S2 — offline rules provider (NOT an LLM)
 

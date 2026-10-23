@@ -7,7 +7,7 @@
 4. `orders.jsonl` (order traffic), `events.jsonl` (engine events) and `health.jsonl` (heartbeats) complete the trail; `wta logs check` validates all four. The state DB keeps the replay inputs (`ticks`, `engine_books`, `engine_candles`).
 5. The examples are real records of the 4-h shadow run (SYNTHETIC feed, real OpenRouter LLM) and of runs at `v0.5-backtest` on the synthetic feed and on crafted test books. None is live: no live order has been placed yet, and `api.wallex.ir` is reachable only intermittently.
 
-This file describes the code at tag `v0.5-backtest` (`85acc16`): `src/wta/models.py`,
+This file describes the code at tag `v0.6-ops` (the log schema is unchanged since `v0.5-backtest`, `85acc16`): `src/wta/models.py`,
 `src/wta/logging_/`, `src/wta/execution/order_manager.py`, `src/wta/engine.py`. Where the code
 differs from the PRDs, this file follows the code and §10 lists the differences.
 

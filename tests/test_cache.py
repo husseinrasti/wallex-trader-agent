@@ -120,7 +120,7 @@ def test_hit_and_miss_counters(tmp_path: Path) -> None:
 
 def test_strict_miss_raises_and_counts(tmp_path: Path) -> None:
     cache = LLMCache(tmp_path, strict=True)
-    with pytest.raises(CacheMissError, match="replay_strict"):
+    with pytest.raises(CacheMissError, match="strict cache"):
         cache.get(_key())
     assert cache.misses == 1
     cache.put(_key(), _entry())

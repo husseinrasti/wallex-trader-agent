@@ -3,13 +3,14 @@
 **Summary**
 1. Everything below runs from a clean clone with Python ≥ 3.11 or Docker. The offline checks need no API key and no access to Wallex.
 2. The key check is `make replay-deliverable`. It unpacks the committed bundle of the 4-hour shadow run (synthetic feed, real LLM) and re-runs it with all network access refused. Result: 40/40 decisions reproduced, 0 socket attempts, 0 LLM provider calls.
-3. Backtests and shadow runs work offline on SYNTHETIC data, labelled as such. The same commands run on real data once `api.wallex.ir` is reachable and the recorder has filled `data/wta.sqlite`.
+3. Backtests and shadow runs work offline on SYNTHETIC data, labelled as such. The recorded real data ships in git (`deliverables/market/`, `make market-db`), so the real-data reports rerun offline too, and `--ai cache` reruns the real-LLM backtests from their committed caches without a key.
 4. Every decision line carries `git_commit` and `config_hash`. §6 shows how to check them against the git tags and `python -m wta config hash`.
-5. Real Wallex data is about 20 minutes of order books and is not in git. No live run exists yet, so there is no live log to replay.
+5. Real Wallex data is about 20 minutes of order books and 2.2 h of candles, too little to judge the strategies. No live run exists yet, so there is no live log to replay.
 
 Every command in this file was run on 2026-10-23 on macOS arm64 and in the Docker image. Most ran on
-fresh clones of tag `v0.5-backtest`. The Phase 6 bundle commands (`make replay-deliverable`, `--bundle`)
-ran on the current working tree. The times are wall-clock times on that machine. Run commands from
+fresh clones of tag `v0.5-backtest`; the Phase-6 commands (`make replay-deliverable`, `--bundle`,
+`make backtest-cache`, `make market-db` and §4.2) ran on tag `v0.6-ops`, which also regenerated every
+report in `docs/REPORTS` on a clean tree. The times are wall-clock times on that machine. Run commands from
 the repo root. `python` means the venv's interpreter: run `source .venv/bin/activate` first, or write
 `.venv/bin/python`. `make` targets use `.venv` on their own.
 
@@ -17,13 +18,15 @@ the repo root. `python` means the venv's interpreter: run `source .venv/bin/acti
 
 | Claim | Command | Needs | Time | Expected |
 |---|---|---|---|---|
-| Code and tests are sound | `make test` | install only | ~2 min | `All checks passed!` (ruff), then pytest dots and `1939 passed, 1 skipped`, exit 0 |
+| Code and tests are sound | `make test` | install only | ~2 min | `All checks passed!` (ruff), then pytest dots and `1953 passed, 1 skipped`, exit 0 |
 | The 4-h shadow run is reproducible | `make replay-deliverable` | nothing | ~2–3 min | `result:   40/40 decisions reproduced -> PASS`, exit 0 (§3.1) |
 | Backtest path, offline | `make backtest-synth` | nothing | ~30 s | `return -0.236%  max drawdown +0.770%  trades 2  orders 19  vetoes 18  fees 16,063 TMN` (§4.1) |
+| The AI ablation's real-LLM run reproduces without a key | `make backtest-cache` | nothing | ~3 min | `ai=cache`, `return +0.121%`, `model calls 132 (132 cached)`, exit 0; a cache miss would be exit 1 (§4.1) |
 | Engine, risk, AI plumbing, offline | `make shadow-synth` | nothing | until Ctrl-C | heartbeats with `fresh_books=21/21`, an S2 order, `logs check` OK (§5.1) |
 | Your own run replays | `make replay` | a run under `logs/` | seconds to minutes | `N/N decisions reproduced -> PASS` (§3.2) |
 | Logs belong to a tagged commit and config | §6 commands | git history | instant | the commit is in a tag; `config hash` prints the logged hash |
-| Strategies on real data | `make backtest`, `make backtest-books`, `make survey` | recorded Wallex data | — | not possible offline: the real data is not in git, and it is too short to judge the strategies (§2) |
+| The real-data reports reproduce | `make market-db`, then the §4.2 commands | nothing | seconds | the shipped numbers: survey "insufficient data"; recorded books −0.055 %, 3 orders, AI off = AI on (§4.2) |
+| Strategies on enough real data | `make backtest`, `make backtest-books`, `make survey` | more recorded Wallex data | — | not possible yet: 20 minutes of books are too short to judge the strategies (§2, §8) |
 
 ## 1. Environment
 
@@ -38,8 +41,8 @@ the repo root. `python` means the venv's interpreter: run `source .venv/bin/acti
   uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[dev]"
   ```
 * **Docker:** `cp .env.example .env && docker compose build` builds `wallex-trader-agent:latest`
-  (Python 3.11, non-root user `wta`, `tini`, about 100 s). `.dockerignore` keeps `.env`, `.venv`,
-  `data/`, `logs/`, `run/` and `video/` out of the image. The image holds the code, `configs/`,
+  (Python 3.11, non-root user `wta`, `tini`, about 100 s). `.dockerignore` keeps `.env` (and any
+  `.env.*` copy except `.env.example`), `.venv`, `data/`, `logs/`, `run/` and `video/` out of the image. The image holds the code, `configs/`,
   `docs/`, `deliverables/` and `.git` (for the provenance fields). Compose passes `.env` in at run time
   (`env_file`); without the file every compose command fails with `env file .../.env not found`. Run
   one-off commands with `--no-deps`, or compose also starts the recorder, which `agent` depends on:
@@ -72,15 +75,16 @@ the repo root. `python` means the venv's interpreter: run `source .venv/bin/acti
 
 | Data | Where | In git | Notes |
 |---|---|---|---|
-| Real Wallex market data | `data/wta.sqlite` (4 MB) | no (`/data/` is ignored) | 6,131 REST order-book snapshots in 21 markets: one window 2026-10-22 14:20:05–14:40:15Z (6,103 snapshots) and a 1-second burst of 28 at 20:16:12Z. Plus 2.2 h of 1-minute candles (12:25–14:39Z). No 30-day backfill. `api.wallex.ir` answers the development machine only intermittently, and the recorder has stored nothing since |
+| Real Wallex market data | `deliverables/market/wta.sqlite.xz` (257 KB, `SHA256SUMS`); `make market-db` writes `data/wta.sqlite` (3.4 MB) | yes (the archive; `/data/` itself is ignored) | 6,131 REST order-book snapshots in 21 markets: one window 2026-10-22 14:20:05–14:40:15Z (6,103 snapshots) and a 1-second burst of 28 at 20:16:12Z. Plus 2.2 h of 1-minute candles (12:25–14:39Z) and 300 trades. Account and engine tables are empty. No 30-day backfill. `api.wallex.ir` answers the development machine only intermittently, and the recorder has stored nothing since |
 | The 4-h shadow run (synthetic feed, real LLM `openai/gpt-5.4-mini`) | `deliverables/replay/shadow_synth_4h/` (bundle) and `deliverables/shadow_synth_4h/` (readable copy) | yes | from `logs/shadow_synth_4h` + `data/state_shadow4h_shadow_synthetic.sqlite` (108 MB, compressed in the bundle) |
 | Reports, with each run's decision logs and, for `ai=on` runs, the LLM cache | `docs/REPORTS/*/` | yes | index in `docs/REPORTS/README.md`; the final report is `deliverables/REPORT.md` |
 | Offline market rules and fees | `configs/markets_snapshot.yaml`, `configs/fees_snapshot.yaml` | yes | used when `/v1/markets` or `/v1/account/fee` cannot be reached |
 | Synthetic market DBs | made on demand by `--synthetic-db PATH` | no | deterministic (seed 42). Every book is tagged `source="synthetic"`, and the generator never overwrites a database without its synthetic marker |
 
-A fresh clone therefore holds no real market data. Every backtest you can run offline is SYNTHETIC.
-The real-data reports in `docs/REPORTS/` (survey, `bt_*_recorded_*`) can be rerun only on a machine
-that has `data/wta.sqlite`, or after you record your own data (§8).
+A fresh clone holds the recorded real market data as a compressed archive. `make market-db` checks
+its `SHA256SUMS` and unpacks it to `data/wta.sqlite` (it refuses to overwrite an existing file); after
+that the real-data reports in `docs/REPORTS/` (survey, `bt_*_recorded_*`) rerun offline (§4.2). Every
+longer run is SYNTHETIC: 20 minutes of real books are all there is (§8 records more).
 
 ## 3. Replay: the key reproducibility check
 
@@ -138,9 +142,10 @@ docker compose run --rm --no-deps agent python scripts/replay_check.py --bundle 
 ### 3.2 `make replay` (a run of your own)
 
 ```bash
-make replay                                              # newest live run under logs/, else the newest shadow run
-python scripts/replay_check.py --log-dir logs/shadow_synth --reports-dir '' --no-index   # a given run, repo files untouched
+make replay                                              # newest live run under logs/, else the newest shadow run; report in logs/
+python scripts/replay_check.py --log-dir logs/shadow_synth --reports-dir '' --no-index   # a given run, no report at all
 python scripts/replay_check.py --log-dir logs/shadow_synth --out /tmp/replay1 --json      # keep the output, print JSON
+make replay-report                                       # like make replay, but writes docs/REPORTS/replay_<day>.md + the index
 ```
 
 After `make shadow-synth` (§5.1), `make replay` printed on a fresh clone:
@@ -152,13 +157,15 @@ window:   2026-10-23T07:08:43.432Z -> 2026-10-23T07:09:21.506Z (0.01 h, 20 ticks
 network:  0 socket attempts, 0 LLM provider calls; LLM cache 2 hits / 0 misses
 ...
 result:   2/2 decisions reproduced -> PASS
-report:   docs/REPORTS/replay_20261023.md  (replay output: /var/folders/.../wta-replay-...)
+report:   logs/replay_20261023.md  (replay output: /var/folders/.../wta-replay-...)
 ```
 
-* **It writes into the repo.** `make replay` writes `docs/REPORTS/replay_<YYYYMMDD>.md`, named after
-  the UTC day of the last replayed tick, and regenerates `docs/REPORTS/README.md`. A run you make
-  today therefore overwrites the committed proof `replay_20261023.md`. Use `--reports-dir '' --no-index`
-  as shown above, or restore it with `git checkout -- docs/REPORTS`.
+* **It never writes into the repo.** `make replay` writes its report to `logs/replay_<YYYYMMDD>.md`
+  (named after the UTC day of the last replayed tick; `logs/` is gitignored) and leaves the reports
+  index alone, so the committed proof `docs/REPORTS/replay_20261023.md` stays as it is. Only
+  `make replay-report` (or `scripts/replay_check.py` without `--reports-dir`) writes
+  `docs/REPORTS/replay_<YYYYMMDD>.md` and regenerates `docs/REPORTS/README.md`; restore them with
+  `git checkout -- docs/REPORTS`.
 * **One segment at a time.** Each process start in a log directory is a segment. By default the
   latest fresh start is replayed; choose another with `--segment N`.
 * **A run still being written** is a failure unless you pass `--allow-partial`.
@@ -182,7 +189,7 @@ synthetic market DB data/synthetic_books.sqlite (generated): 2026-10-01T00:00:00
 SYNTHETIC — not evidence of performance (generated market data)
 backtest books S1,S2 ai=off (disabled): 2026-10-01T00:00:00.000Z -> 2026-10-01T06:00:00.000Z, data 6.0006 h, 10801 ticks
   return -0.236%  max drawdown +0.770%  trades 2  orders 19  vetoes 18  fees 16,063 TMN
-  report: docs/REPORTS/synthetic_bt_books/report.md
+  report: logs/synthetic_bt_books/report.md
 ```
 
 This is a 6-h order-book run of S1+S2 with the AI off, and it takes about 30 s. The variants below
@@ -190,7 +197,9 @@ were run the same way, and the times are wall-clock:
 
 ```bash
 # the same 6 h with AI plans: offline = the rules provider (NOT an LLM);
-# on = the LLM in .env; with no key it falls back to offline rules and the report says so
+# on = the LLM in .env (OPENROUTER_API_KEY + OPENROUTER_MODEL_FAST); with no key, --ai on falls back
+# to the offline rules and the report says so. To rerun a shipped real-LLM run without a key, use
+# --ai cache (below)
 python -m wta backtest --driver books --synthetic-db data/synthetic_books.sqlite --synthetic-hours 6 \
   --ai offline --strategies S1,S2 --out /tmp/bt_synth_offline --state-db /tmp/bt_synth_offline/state.sqlite
 #   ~26 s: the same numbers as ai=off, plus "analyst cycles 73 (cap 150), plans 73, model calls 146 (0 cached)"
@@ -207,31 +216,94 @@ python -m wta backtest --driver candles --synthetic-db /tmp/synth_candles_30d.sq
   --out /tmp/bt_candles_30d --state-db /tmp/bt_candles_30d/state.sqlite
 ```
 
+**The real-LLM runs, again, without a key: `--ai cache`.** The only real-LLM evidence of AI value is the
+6-h ablation pair (`bt_books_synth24h_6h_ai_{off,on}`, `ablation_20261023.md` §2). Its LLM cache is
+committed (`docs/REPORTS/bt_books_synth24h_6h_ai_on/llm_cache/`, 132 answers). `--ai cache` reruns it
+from that cache alone: the analyst's routes are read from the cache entries, the providers are
+stand-ins that refuse every call, the cache is strict (a miss stops the run with exit 1, it never
+calls a provider) and read-only (nothing is written into it). No key and no model name are needed.
+
+```bash
+make backtest-cache     # = the command below; ~1 min to build the SYNTHETIC 24-h DB, then ~30 s
+python -m wta backtest --driver books --synthetic-db data/synth_books_24h.sqlite --synthetic-hours 24 \
+  --from 2026-10-01T12:00Z --to 2026-10-01T18:00Z --ai cache --strategies S1,S2 \
+  --set ai.cache_dir=docs/REPORTS/bt_books_synth24h_6h_ai_on/llm_cache \
+  --out logs/bt_cache_synth24h_6h --state-db data/backtest_state/bt_cache_synth24h_6h.sqlite
+```
+```
+SYNTHETIC — not evidence of performance (generated market data)
+backtest books S1,S2 ai=cache (llm): 2026-10-01T12:00:00.000Z -> 2026-10-01T18:00:00.000Z, data 6.0006 h, 10801 ticks
+  return +0.121%  max drawdown +0.380%  trades 0  orders 6  vetoes 0  fees 6,234 TMN
+  analyst cycles 73 (cap 150), plans 73, model calls 132 (132 cached)
+```
+
+Those are the shipped `ai=on` numbers. The `ai=off` side is the same command with `--ai off`
+(`return +0.031%`, 12 orders), so the +0.09 pp of the ablation is checkable on a fresh clone. The run's
+report says `AI | cache (recorded LLM answers, no provider call)`, and its `summary.json` has
+`provider_calls: 0` and `ai_cache_routes: ["openrouter/openai/gpt-5.4-mini"]`. The recorded-books pair
+works the same way after `make market-db` (§4.2). A different window, strategy set, config or code
+asks questions the cache never saw: that is `error: --ai cache: LLM cache miss ...` and exit 1.
+
 Without `--out`, a backtest writes to `docs/REPORTS/bt_<driver>_<from>_<to>`, so pass `--out` to keep
 the committed reports as they are. Every command behind the shipped reports, ablation and walk-forward
 (`--param-grid`) included, is listed in
 [`REPORTS/phase5_acceptance.md`](REPORTS/phase5_acceptance.md) §2.
 
-### 4.2 On real data (needs `data/wta.sqlite`)
+### 4.2 On real data (the shipped market DB)
+
+The recorded real data is in git as `deliverables/market/wta.sqlite.xz`. Unpack it first (it never
+overwrites an existing `data/wta.sqlite`):
 
 ```bash
-make backtest          # 30 days of 1-min candles, S2+S3 (FROM=2026-09-22 TO=2026-10-22; override: make backtest FROM=... TO=...)
-make backtest-books    # recorded order books, S1+S2 (BOOKS_FROM / BOOKS_TO; AI=off|on|offline)
+make market-db         # = python scripts/market_db.py
+```
+```
+deliverables/market/wta.sqlite.xz: SHA256SUMS verified; wrote data/wta.sqlite (REAL recorded Wallex market data)
+  books      6,131 rows  2026-10-22T14:20:05Z -> 2026-10-22T20:16:13Z
+  trades       300 rows  2026-10-22T14:19:36Z -> 2026-10-22T14:40:24Z
+  candles    1,476 rows  2026-10-22T12:25:00Z -> 2026-10-22T14:39:00Z
+  events         5 rows  2026-10-22T10:42:48Z -> 2026-10-22T20:56:03Z
 ```
 
-On a fresh clone both stop at once with `error: market database data/wta.sqlite does not exist`
-(exit 2). Get the data with `python -m wta backfill --days 30 --resolution 1` (candles) and
-`make record` (books). Both need `api.wallex.ir` (§8). The shipped real-data runs used the recorded
-windows, for example:
+Then every real-data report reruns offline, in seconds. These are the commands behind the shipped
+reports, with `--out` outside the repo (the expected lines are the shipped numbers):
 
 ```bash
-python -m wta backtest --driver books --from 2026-10-22T14:20Z --to 2026-10-22T20:17Z --ai off \
-  --strategies S1,S2 --out /tmp/bt_books_recorded_ai_off --state-db /tmp/bt_books_recorded_ai_off/state.sqlite
+# the survey (docs/REPORTS/survey_20261022.md): "insufficient data", defaults kept
+python scripts/survey.py --since 72h --png --json --out /tmp/survey
+#   Recommendation (insufficient_data): margin_min_pct=0.0015 leg1_taker=true S1 lock-in viable: unknown
+
+# all recorded books, S1+S2, AI off (bt_books_recorded_ai_off) and AI on from its committed cache (bt_books_recorded_ai_on)
+python -m wta backtest --driver books --from 2026-10-22T14:20Z --to 2026-10-22T20:17Z --ai off --strategies S1,S2 \
+  --out /tmp/bt_books_recorded_ai_off --state-db /tmp/bt_books_recorded_ai_off.sqlite
 #   backtest books S1,S2 ai=off (disabled): 2026-10-22T14:20:00.000Z -> 2026-10-22T20:17:00.000Z, data 0.3239 h, 583 ticks
-#     return -0.055%  max drawdown +0.063%  trades 0  orders 3  vetoes 0  fees 3,123 TMN     (the shipped report's numbers, ~3 s)
+#     return -0.055%  max drawdown +0.063%  trades 0  orders 3  vetoes 0  fees 3,123 TMN
+python -m wta backtest --driver books --from 2026-10-22T14:20Z --to 2026-10-22T20:17Z --ai cache --strategies S1,S2 \
+  --set ai.cache_dir=docs/REPORTS/bt_books_recorded_ai_on/llm_cache \
+  --out /tmp/bt_books_recorded_ai_on --state-db /tmp/bt_books_recorded_ai_on.sqlite
+#     return -0.055%  max drawdown +0.063%  trades 0  orders 3  vetoes 0  fees 3,123 TMN
+#     analyst cycles 6 (cap 150), plans 6, model calls 11 (11 cached)
+
+# all recorded 1-minute candles, S2+S3 (S3 rules-only), AI off (bt_candles_recorded_ai_off)
+python -m wta backtest --driver candles --from 2026-10-22T12:25Z --to 2026-10-22T14:40Z --ai off --strategies S2,S3 \
+  --set strategies.s3_momentum.allow_rules_only=true \
+  --out /tmp/bt_candles_recorded_ai_off --state-db /tmp/bt_candles_recorded_ai_off.sqlite
+#     return +0.092%  max drawdown +0.091%  trades 0  orders 4  vetoes 0  fees 6,242 TMN
 ```
 
-The report states how many hours the data really covers (0.32 h here), not the requested window.
+Each report states how many hours the data really covers (0.32 h of books, 2.25 h of candles), not
+the requested window. The longer real-data targets need more data than was ever recorded:
+
+```bash
+make backtest          # 30 days of REAL 1-min candles, S2+S3 (allow_rules_only, like the shipped candle reports) -> docs/REPORTS/bt_candles_30d_real/
+make backtest-books    # recorded order books, S1+S2 (BOOKS_FROM / BOOKS_TO; AI=off|on|offline) -> docs/REPORTS/bt_books/
+```
+
+Without `data/wta.sqlite` both stop at once with `error: market database data/wta.sqlite does not
+exist` (exit 2). With the shipped DB, the default `make backtest` window (`FROM=2026-09-22`, `TO=2026-10-22`,
+midnight) ends before the first recorded candle (12:25Z), so its report says INSUFFICIENT DATA; a
+real 30-day run needs `python -m wta backfill --days 30 --resolution 1` and
+`make record` first, and both need `api.wallex.ir` (§8).
 
 ## 5. Shadow runs
 
@@ -401,8 +473,8 @@ make survey                                    # = python scripts/survey.py --si
 python scripts/survey.py --since 72h --png --json --out /tmp/survey    # longer window, chart + JSON, outside the repo
 ```
 
-On the development machine's `data/wta.sqlite`, which is not in git, the second command took about
-1.5 s and printed:
+On `data/wta.sqlite` (the recorded data, shipped as `deliverables/market/`), the second command took
+about 1.5 s and printed:
 
 ```
 Market survey 20261022: window 2026-10-19T20:16:13.129Z -> 2026-10-22T20:16:13.129Z
@@ -418,9 +490,9 @@ Recommendation (insufficient_data): margin_min_pct=0.0015 leg1_taker=true S1 loc
 * **A changed parameter** passes the walk-forward guard first (`wta backtest --param-grid ...`,
   70/30 split). Then rerun the commands of §4.2 on the new window, and the AI ablation with
   `--ai off` and `--ai on`.
-* **Then rebuild the reports index and the final report:**
-  `python scripts/make_deliverables.py --index-only` rewrites the deliverables index of
-  `deliverables/REPORT.md`, and `phase5_acceptance.md` §7 shows how the report itself is assembled.
+* **Then rebuild the reports index and the final report:** `make final-report`
+  (`scripts/assemble_report.py`) regenerates `docs/REPORTS/README.md`, `deliverables/REPORT.md` and
+  its deliverables index from the reports. `phase5_acceptance.md` §7 explains the sections.
 
 ## 9. Troubleshooting
 
@@ -431,9 +503,11 @@ Recommendation (insufficient_data): margin_min_pct=0.0015 leg1_taker=true S1 loc
 | `error: market database data/wta.sqlite does not exist` | a real-data backtest on a fresh clone | record or backfill first (§8), or use the synthetic variants (§4.1) |
 | `markets fetch failed`, `ws: connect failed: TimeoutError`, `fresh_books=0/21` | `api.wallex.ir` cannot be reached (it answers the development machine only now and then) | check with `curl` (§8). Use `--feed synthetic` for offline runs |
 | `make replay` exits 2, `nothing to replay` | no run under `logs/` | `make replay-deliverable`, or make a run first (§5.1) |
+| `error: --ai cache: LLM cache miss ...` (exit 1) | the run asks something the cached run did not: another window, `--strategies`, `--set`, seed or code | use the shipped run's exact command (§4.1, §4.2); with a key, `--ai on` would call the model instead |
+| `make market-db`: `data/wta.sqlite exists` (exit 2) | a market DB is already there (the recorder's, or an earlier unpack) | keep it, or move it away and unpack again |
 | replay exits 2, output directory not empty | `--out` points at a used folder | give a new folder, or drop `--out` (a temporary one is used) |
 | replay FAIL with an LLM cache miss, or a config hash not matched | the code or config differs from the recording, or a `--set` is missing | replay on the recorded commit's config; `--set`/`--overlay` as recorded; see the report's mismatch list |
-| `git status` shows `docs/REPORTS/replay_*.md` or `README.md` modified | `make replay` writes its report there | `git checkout -- docs/REPORTS`, or use `--reports-dir '' --no-index` |
+| `git status` shows `docs/REPORTS/replay_*.md` or `README.md` modified | `make replay-report` (or `replay_check.py` without `--reports-dir`) writes its report there | `git checkout -- docs/REPORTS`; `make replay` writes to `logs/` instead |
 | `config hash` differs from the logged one | different `--set` flags or `${VAR}` values | §6 step 4: the same flags and model names; check `python -m wta config show` |
 | `status`: `details need the engine state db` | the run used another `data.sqlite_path` | pass the run's `--set data.sqlite_path=...` (§5.1) |
 | `AI: offline rules (no LLM key)` | no `OPENROUTER_API_KEY` | expected without keys. Set the key and `OPENROUTER_MODEL_FAST` for the real LLM |

@@ -7,7 +7,7 @@
 4. AI is real, bounded and logged. Every plan record carries the model, `prompt_hash`, the tools used and anything that was clamped. The evidence runs used the real OpenRouter LLM (`openai/gpt-5.4-mini`). Without a key, a deterministic offline rules provider fills the slot and is labelled "not an LLM" everywhere.
 5. Honest status: `api.wallex.ir` is reachable from the dev machine only intermittently. The real data is about 20 minutes of REST books from 2026-10-22, so the evidence runs used the labelled synthetic feed. No live trading has happened; the operator starts live mode.
 
-Code reference: tag `v0.5-backtest` (`85acc16`) plus the Phase-6 ops work. Related documents:
+Code reference: tag `v0.6-ops` (`v0.5-backtest`, `85acc16`, plus the Phase-6 ops work). Related documents:
 [`STRATEGY.md`](STRATEGY.md), [`RISK.md`](RISK.md), [`RUNBOOK.md`](RUNBOOK.md),
 [`DECISION_LOG_FORMAT.md`](DECISION_LOG_FORMAT.md), [`GO_LIVE_CHECKLIST.md`](GO_LIVE_CHECKLIST.md),
 [`DECISIONS.md`](DECISIONS.md) (one-line design decisions), [`REPORTS/`](REPORTS/README.md) (evidence).
@@ -535,7 +535,7 @@ JSON → validation → clamp → cache → replay) runs without a key:
 * first turn: asks for `get_features` (the four regime symbols) and `get_pnl_summary`; asks
   `get_candle_stats` for any symbol still missing features;
 * plan: each regime from S2's `rule_regime` on that symbol's features, confidence from the EMA-gap
-  size; `enabled_strategies` = the configured ones; `size_multiplier` 1.0, 0.5 when drawdown > 2 %, 0
+  size; `enabled_strategies` = S1 and S2 when enabled in config (never S3); `size_multiplier` 1.0, 0.5 when drawdown > 2 %, 0
   when any regime is `chaos`; `usdt_target_share` from the S2 regime table; `s1_margin_min_pct` =
   config;
 * reviewer: a journal that only counts what it was given, no parameter suggestions.

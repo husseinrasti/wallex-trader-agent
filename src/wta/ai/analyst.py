@@ -830,8 +830,15 @@ class RegimeAnalyst:
         self._tape_put(key, {"tool": tc.name, "content": text, "mcp_failed": failed})
         return text, failed
 
+    @property
+    def _tape_read_only(self) -> bool:
+        """A strict cache outside replay (``backtest --ai cache``) is a recorded run's cache: its
+        tape is read, never rewritten."""
+        cache = getattr(self.llm, "cache", None)
+        return bool(getattr(cache, "strict", False)) and not self._replaying
+
     def _tape_put(self, key: str, entry: Json) -> None:
-        if self.tape is None:
+        if self.tape is None or self._tape_read_only:
             return
         try:
             self.tape.put(key, entry)

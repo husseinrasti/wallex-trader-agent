@@ -22,7 +22,7 @@ from wta.config import canonical_json
 
 
 class CacheMissError(RuntimeError):
-    """Raised in strict replay when a request has no cached response."""
+    """Raised by a strict cache (replay, ``backtest --ai cache``) when a request has no cached response."""
 
 
 def cache_key(provider: str, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
@@ -55,7 +55,7 @@ class LLMCache:
         if not p.exists():
             self.misses += 1
             if self.strict:
-                raise CacheMissError(f"LLM cache miss for key {key} (replay_strict)")
+                raise CacheMissError(f"LLM cache miss for key {key} (strict cache)")
             return None
         self.hits += 1
         return json.loads(p.read_text(encoding="utf-8"))

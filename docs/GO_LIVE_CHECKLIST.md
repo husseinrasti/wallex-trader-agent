@@ -49,8 +49,9 @@ git status --porcelain         # must print nothing (live refuses a dirty tree, 
 - [ ] No routing warnings (sub-account id set; MCP and REST balances agree where both answer).
 - [ ] Fees match the table (TMN pairs 0.25 / 0.30 %, USDT pairs 0.10 / 0.13 %).
 - [ ] Market rules printed for every watchlist symbol; none banned.
-- [ ] The script rewrote `docs/REPORTS/api_probe.md`: read it, then commit it (the tree must be clean
-      again before step 5).
+- [ ] Read the report `logs/api_probe.md`. It is gitignored on purpose: it holds the raw balance payloads.
+      Account identifiers (`WALLEX_SUB_ACCOUNT_CLIENT_ID`, every listed `clientId`) appear only as their
+      last 4 characters. Do not commit it; tick the boxes here instead (the tree stays clean for step 5).
 
 ## 3. Order-type probe (operator only; places and cancels 2 far-from-market orders)
 
@@ -61,7 +62,8 @@ git status --porcelain         # must print nothing (live refuses a dirty tree, 
 - [ ] LIMIT accepted and cancelled.
 - [ ] STOP_LIMIT accepted and cancelled. If it is rejected, set `execution.use_server_side_stops: false`
       in `configs/default.yaml` (software stops take over) and commit.
-- [ ] `docs/REPORTS/api_probe.md` committed.
+- [ ] The probe results are in `logs/api_probe.md` (not committed). If you want them on record, copy the
+      two result rows of section 5 into the live tag's notes in `deliverables/TAGS.md`.
 
 ## 4. Shadow on the real feed (≥ 4 h before the first live start, PRD-05 §5)
 
@@ -128,9 +130,12 @@ same flag on every later restart). The live engine logs to `logs/`, keeps its st
 - [ ] T−30min: `flatten` with `kind: flatten_final`.
 - [ ] T−5min: `final_state` says "100% TMN (dust only)". If it says "ALERT: not flat yet", stop the
       agent and run `make flatten-live` at once.
-- [ ] After the end: stop the agent; copy the run's dated `decisions`/`orders`/`events`/`health`
-      files, `journal.md` and `llm_cache/` into `deliverables/`; `wta logs check --dir <that dir>
-      --secrets`; commit; tag `final`; push.
+- [ ] After the end: stop the agent; `python scripts/make_deliverables.py --run-dir logs --name live --bundle
+      --replay` (copies the dated `decisions`/`orders`/`events`/`health` files, `journal.md` and `llm_cache/`
+      into `deliverables/live/`, packs the replay bundle, scans for secrets, replays it);
+      `python -m wta report --source logs --out docs/REPORTS/live_<YYYYMMDD>`; `make final-report` (the live
+      section of `deliverables/REPORT.md`); `wta logs check --dir deliverables/live --secrets`; fill in the live
+      rows of `deliverables/TAGS.md`; commit; tag `final`; push.
 
 ## Emergency
 

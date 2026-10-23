@@ -167,6 +167,9 @@ KEY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("OpenRouter key (sk-or-v1-...)", re.compile(r"(?<![A-Za-z0-9])sk-or-v1-[A-Za-z0-9]{20,}")),
     ("OpenAI-style key (sk-...)", re.compile(r"(?<![A-Za-z0-9])sk-(?!or-v1-)[A-Za-z0-9_-]{20,}")),
     ("Google API key (AIza...)", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
+    ("Google API key (AQ.)", re.compile(r"(?<![A-Za-z0-9])AQ\.[A-Za-z0-9_-]{40,}")),
+    # Wallex trading keys are "<numeric id>|<40+ alphanumerics>" (PRD-06 §7 scans for "\|[A-Za-z0-9]{30,}")
+    ("Wallex API key (id|token)", re.compile(r"(?<![A-Za-z0-9|])[0-9]{1,10}\|[A-Za-z0-9]{30,}")),
     ("Telegram bot token", re.compile(r"(?<![0-9])[0-9]{8,10}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])")),
     ("X-API-Key header value", re.compile(r"(?i)x-api-key[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9_.-]{16,}")),
 ]

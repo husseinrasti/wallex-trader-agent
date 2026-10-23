@@ -347,7 +347,9 @@ file.
 
 `make replay` with no arguments picks the newest live run under `logs/`, else the newest shadow run: today that is
 `logs/shadow_synth_4h`. Its inputs (`logs/`, `data/`) are not in git, so the replay can be rerun only on a machine
-that holds them (§6).
+that holds them (§6). **Superseded (Phase 6, `391783c`):** the inputs now ship as the checksummed bundle
+`deliverables/replay/shadow_synth_4h/`, and `make replay-deliverable` reproduces 40/40 on a fresh clone with 0
+network (`docs/REPORTS/fresh_clone_check.md`).
 
 ### 2.8 Consolidation, index and final report
 
@@ -522,9 +524,12 @@ data, and the S1-only walk-forward is the evidence for finding 2.
 * **Replay inputs are not in git.** `/logs/` and `/data/` are ignored, so `logs/shadow_synth_4h` (5.5 MB with its LLM
   cache) and `data/state_shadow4h_shadow_synthetic.sqlite` (108 MB) exist only on this machine. For judges to rerun
   `make replay` on this run they must be shipped (e.g. as a release asset), or the replay must be rerun on the live run.
+  **Superseded (Phase 6):** they ship as `deliverables/replay/shadow_synth_4h/` (`391783c`, `make replay-deliverable`),
+  and the recorded real market data as `deliverables/market/` (`make market-db`).
 * **Commit and tag.** The second and third sessions' code changes (§4 items 7–10, §8), the regenerated reports and the
   docs are not committed. The report provenance will read `git_dirty` until they are; tag `v0.5-backtest` after that
-  commit.
+  commit. **Superseded:** committed as `85acc16` = `v0.5-backtest`; every report was regenerated on the clean tag
+  `v0.6-ops` (`deliverables/TAGS.md` §2).
 * **S2 hysteresis** (finding 1) and the **SOL step / S3 dust** check (finding 4) need decisions by the strategy owner.
 
 ## 7. Appendix: the helper scripts

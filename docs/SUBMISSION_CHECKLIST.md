@@ -43,12 +43,20 @@ grep -E '^(WALLEX_API_KEY|OPENROUTER_API_KEY|GEMINI_API_KEY|TELEGRAM_BOT_TOKEN|W
       "$(git grep -lF --untracked -- "$v" | wc -l | tr -d ' ')"
   done
 
-# 3. key shapes (OpenRouter sk-or-v1-…, Google AIza…, Telegram bot tokens) in every commit: prints 0
-git log --all -p | grep -cE 'sk-or-v1-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{35}|[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}'
+# 3. key shapes in every commit: prints 0. OpenRouter sk-or-v1-…, Google AIza… and AQ.…, Telegram bot
+#    tokens, and the Wallex "<id>|<token>" form (the PRD-06 §7 "\|[A-Za-z0-9]{30,}" term); this also
+#    catches a rotated or earlier key that is no longer in .env
+git log --all -p | grep -cE 'sk-or-v1-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{35}|(^|[^A-Za-z0-9])AQ\.[A-Za-z0-9_-]{40,}|[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|(^|[^A-Za-z0-9|])[0-9]{1,10}\|[A-Za-z0-9]{30,}'
 
-# 4. logs, deliverables/ and docs/REPORTS/, including the .xz bundle: "secrets scan: clean"
+# 4. logs, deliverables/ and docs/REPORTS/, including the .xz bundles: "secrets scan: clean"
 .venv/bin/python -m wta logs check --secrets --dir deliverables/shadow_synth_4h
 ```
+
+Command 4 and `scripts/make_deliverables.py` use the same set as command 2: every `SecretStr` value of
+`.env` plus `WALLEX_SUB_ACCOUNT_CLIENT_ID` (`Settings.scan_values`), and the key shapes of command 3
+(`KEY_PATTERNS` in `src/wta/logging_/checker.py`). `scripts/check_account.py` writes its report to the
+gitignored `logs/api_probe.md` and shows account ids only as their last 4 characters, so the go-live
+probe cannot put the sub-account id into git.
 
 Results on 2026-10-23 07:30 UTC (history up to `85acc16`): (1) nothing; (2) `history 0` for each of the 4 configured
 values; (3) `0`; (4) `secrets scan: clean`. Re-run on 2026-10-23 08:10 UTC, after `391783c` (the Phase-6 commit,
@@ -89,7 +97,7 @@ From [`GO_LIVE_CHECKLIST.md`](GO_LIVE_CHECKLIST.md), these items are still open 
 
 1. `make test` green, `git status --porcelain` empty.
 2. Live logs copied into `deliverables/` (`scripts/make_deliverables.py --run-dir logs --name live --bundle --replay`), `deliverables/REPORT.md`
-   reassembled with the live section, `deliverables/TAGS.md` live rows filled in, video link in `deliverables/VIDEO.md`
+   reassembled with the live section (`python -m wta report --source logs --out docs/REPORTS/live_<date>`, then `make final-report`), `deliverables/TAGS.md` live rows filled in, video link in `deliverables/VIDEO.md`
    and the README.
 3. `make replay` on the live run, then `make replay-deliverable`, both PASS.
 4. Secrets scan (§2) clean.

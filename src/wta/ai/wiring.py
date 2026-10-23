@@ -22,8 +22,9 @@
 Every client shares one ``LLMCache`` (``llm_cache_dir``): ``ai.cache_dir`` at its default
 (``logs/llm_cache``) means ``<log dir>/llm_cache`` of the run, so a shadow run (``logs/shadow``)
 and live (``logs``) keep their own caches next to their own logs; any other value is used as given
-(relative to the working directory). The cache is strict only in ``replay`` mode with
-``ai.replay_strict``.
+(relative to the working directory). The cache is strict in ``replay`` mode with
+``ai.replay_strict``, and in a ``wta backtest --ai cache`` run (``strict_cache``): a miss raises
+``CacheMissError`` instead of calling a provider.
 
 ``build_mcp``: the read-only Wallex MCP client (``READ_ONLY_ALLOWLIST``) on the live feed only. On
 the synthetic feed the analyst gets the ``*_local`` tools: real Wallex prices next to synthetic
@@ -161,12 +162,14 @@ def build_llm(
     *,
     providers: dict[str, Provider] | None = None,
     on_call: Any = None,
+    strict_cache: bool = False,
 ) -> LLMSetup:
     """The AI source and its clients (see the module docstring). ``providers`` replaces the HTTP
-    providers (tests: a fake provider under the configured provider name)."""
+    providers (tests: a fake provider under the configured provider name; ``backtest --ai cache``:
+    providers that refuse every call). ``strict_cache``: a cache miss raises ``CacheMissError``."""
     if not cfg.ai.enabled:
         return LLMSetup(source=AI_DISABLED)
-    strict = mode == "replay" and cfg.ai.replay_strict
+    strict = (mode == "replay" and cfg.ai.replay_strict) or strict_cache
     cache = LLMCache(cache_dir, strict=strict)
     if providers is None and not has_llm_key(settings):
         llm = make_offline_llm(cfg, cache, mode, clock, on_call=on_call)

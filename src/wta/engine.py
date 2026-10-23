@@ -2325,6 +2325,7 @@ class Engine:
         runtime_dir: str | Path | None = None,
         runtime_overlay: dict[str, Any] | None = None,
         pinned_keys: Iterable[str] = (),
+        strict_cache: bool = False,
     ) -> str:
         """Attach the Regime Analyst and the Post-trade Reviewer (``wta.ai.wiring.build_llm``).
 
@@ -2336,7 +2337,8 @@ class Engine:
         start event; the ConfigManager keeps building on it, including the entries the operator
         pinned, and restarts the cooldown from its ``applied_ts``). ``pinned_keys`` (the operator's
         ``--set`` / ``--overlay`` keys) are never offered to or changed by the reviewer. Returns
-        the AI source: ``llm``, ``offline-rules`` or ``disabled``.
+        the AI source: ``llm``, ``offline-rules`` or ``disabled``. ``strict_cache`` (``backtest --ai
+        cache``): an LLM cache miss raises ``CacheMissError`` instead of calling a provider.
         """
         if runtime_dir is not None:
             self.runtime_dir = Path(runtime_dir)
@@ -2347,7 +2349,7 @@ class Engine:
             return self.ai_source
         setup = build_llm(
             self.cfg, self.settings, self.mode, self.clock.base, llm_cache_dir(self.cfg, self.log_dir),
-            providers=providers, on_call=self._note_llm_call,
+            providers=providers, on_call=self._note_llm_call, strict_cache=strict_cache,
         )
         self.ai_setup = setup
         self.ai_source = setup.source

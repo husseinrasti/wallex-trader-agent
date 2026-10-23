@@ -42,6 +42,10 @@ reconcile, flatten and decision log — and swaps only what PRD-05 §3.1 says ma
   local tools only (MCP off), at most ``ai_max_calls`` cycles per run (cached or not, so a rerun
   makes exactly the same cycles). Every answer is cached under ``<out_dir>/llm_cache`` (the
   default ``ai.cache_dir`` resolves next to the run's logs), so a rerun is free and reproducible.
+  ``cache`` -> re-runs a cached ``ai=on`` run without any key: the analyst's routes are read from
+  the cache entries (``cached_routes``), the providers are stand-ins that refuse every call, and
+  the cache is strict, so a miss stops the run with ``CacheMissError`` (never a provider call).
+  Point ``ai.cache_dir`` at the run's ``llm_cache/`` (``--set ai.cache_dir=...``).
   The Post-trade Reviewer is not run in backtests (no config changes mid-run).
 
 Outputs in ``out_dir``: the engine's own logs (``decisions-*.jsonl`` + ``decisions.jsonl``,
@@ -103,6 +107,7 @@ from backtest.report import (
     VETOES_PNG,
     write_report,
 )
+from wta.ai.llm_client import ProviderError, Route
 from wta.ai.offline_provider import OFFLINE_STATUS
 from wta.ai.wiring import AI_LLM, AI_OFFLINE, llm_cache_dir
 from wta.config import Config, Settings, apply_changes, load_settings
@@ -130,7 +135,7 @@ from wta.utils.timeutil import SimClock, iso, parse_iso
 log = logging.getLogger(__name__)
 
 DRIVERS = ("books", "candles")
-AI_MODES = ("off", "on", "offline")
+AI_MODES = ("off", "on", "offline", "cache")
 STRATEGY_IDS = ("S1", "S2", "S3")
 DEFAULT_STRATEGIES = {"candles": ("S2", "S3"), "books": ("S1", "S2")}
 DEFAULT_AI_MAX_CALLS = 150
@@ -159,6 +164,63 @@ SYNTHETIC_VOLUME_SIGMA = 0.5  # clustered volume: stationary std of the log-acti
 SYNTHETIC_START_TS = 1_790_812_800.0  # 2026-10-01T00:00:00Z: fixed, so a seed always gives the same DB
 SYNTHETIC_SYMBOLS = ("USDTTMN", "BTCTMN", "BTCUSDT", "ETHTMN", "ETHUSDT", "SOLTMN", "SOLUSDT")
 _LLM_KEYS_OFF = {"openrouter_api_key": SecretStr(""), "gemini_api_key": SecretStr("")}
+CACHE_PROVIDERS = ("openrouter", "gemini")  # LLMRoleCfg.provider
+
+
+class CacheOnlyProvider:
+    """``--ai cache``: stands in for a provider and refuses every call (the cache is strict, so a
+    call can only come from a bug); ``calls`` counts them."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.calls = 0
+
+    async def chat(self, messages: Any, tools: Any, model: str, temperature: float, max_tokens: int,
+                   json_mode: bool) -> Any:
+        self.calls += 1
+        raise ProviderError(f"backtest --ai cache: provider {self.name} must not be called")
+
+
+def cached_routes(cache_dir: str | Path) -> list[Route]:
+    """The (provider, model) routes of the answers in an LLM cache directory, most answers first
+    (at most two: the analyst's route and its fallback). Raises ``ValueError`` when there is none."""
+    counts: dict[tuple[str, str], int] = {}
+    root = Path(cache_dir)
+    for f in sorted(root.glob("*.json")) if root.is_dir() else []:
+        try:
+            entry = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        req = entry.get("request") if isinstance(entry, dict) else None
+        if isinstance(req, dict) and req.get("provider") and req.get("model"):
+            key = (str(req["provider"]), str(req["model"]))
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        raise ValueError(
+            f"--ai cache: no cached LLM answers in {root}; point ai.cache_dir at the llm_cache/ "
+            "of an ai=on run, e.g. --set ai.cache_dir=docs/REPORTS/bt_books_synth24h_6h_ai_on/llm_cache"
+        )
+    routes = [Route(p, m) for (p, m), _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:2]]
+    unknown = [r.provider for r in routes if r.provider not in CACHE_PROVIDERS]
+    if unknown:
+        raise ValueError(
+            f"--ai cache: the cache in {root} holds answers of {', '.join(unknown)} (not an LLM "
+            "provider); use --ai offline for the offline rules provider"
+        )
+    return routes
+
+
+def cache_only_ai(cfg: Config, cache_dir: str | Path) -> tuple[Config, dict[str, Any], list[Route]]:
+    """``--ai cache``: the run's config with the analyst (and fallback) routes of the cache, the
+    refusing providers, and the routes."""
+    routes = cached_routes(cache_dir)
+    changes: dict[str, Any] = {"llm.analyst.provider": routes[0].provider, "llm.analyst.model": routes[0].model}
+    if len(routes) > 1:
+        changes.update({"llm.fallback.provider": routes[1].provider, "llm.fallback.model": routes[1].model})
+    else:
+        changes["llm.fallback.model"] = None
+    providers: dict[str, Any] = {r.provider: CacheOnlyProvider(r.provider) for r in routes}
+    return apply_changes(cfg, changes), providers, routes
 
 
 # ================================================================= small helpers
@@ -635,7 +697,8 @@ def build_backtest_engine(
         strategies=default_strategies(cfg),
     )
     if ai != "off":
-        engine.enable_ai(providers=ai_providers, mcp=None, runtime_dir=log_dir / "runtime", runtime_overlay=None)
+        engine.enable_ai(providers=ai_providers, mcp=None, runtime_dir=log_dir / "runtime", runtime_overlay=None,
+                         strict_cache=ai == "cache")
     return engine
 
 
@@ -680,7 +743,7 @@ async def arun_backtest(
     if driver not in DRIVERS:
         raise ValueError(f"unknown driver {driver!r} (books | candles)")
     if ai not in AI_MODES:
-        raise ValueError(f"unknown ai mode {ai!r} (off | on | offline)")
+        raise ValueError(f"unknown ai mode {ai!r} (off | on | offline | cache)")
     if ai_max_calls < 0:
         raise ValueError("ai_max_calls must be >= 0")
     a, b = parse_ts(from_ts, "from"), parse_ts(to_ts, "to")
@@ -715,6 +778,13 @@ async def arun_backtest(
             initial_equity_tmn=equity0 if initial_balances is None else None,
         )
         run_settings = backtest_settings(settings if settings is not None else load_settings(), ai)
+        cache_routes: list[Route] = []
+        if ai == "cache":
+            if ai_providers is not None:
+                raise ValueError("--ai cache brings its own refusing providers (ai_providers must be None)")
+            run_cfg, ai_providers, cache_routes = cache_only_ai(
+                run_cfg, Path(llm_cache) if llm_cache is not None else llm_cache_dir(run_cfg, out)
+            )
         _prepare_out_dir(out, state_path)
         if llm_cache is not None and ai != "off":
             link = out / LLM_CACHE
@@ -724,6 +794,7 @@ async def arun_backtest(
         with _quiet(quiet):
             run = _Run(run_cfg, run_settings, db, plan, out, a, b, balances0, ai, ai_max_calls, ai_providers,
                        heartbeat_every_s, strats, state_path)
+            run.cache_routes = [f"{r.provider}/{r.model}" for r in cache_routes]
             await run.execute()
     return _finish(run, cfg=run_cfg, requested=requested, strats=strats, flatten=flatten, notes=notes,
                    title=title, write=write, db_path=db_path, report_date=report_date)
@@ -753,6 +824,7 @@ class _Run:
         self.from_ts, self.to_ts = from_ts, to_ts
         self.balances0 = balances
         self.ai, self.ai_max_calls, self.ai_providers = ai, ai_max_calls, ai_providers
+        self.cache_routes: list[str] = []  # --ai cache: the routes read from the cache
         self.heartbeat_every_s = heartbeat_every_s
         self.strategies = tuple(strategies)
         self.driver = plan.driver
@@ -1125,6 +1197,9 @@ def _finish(
             llm_cache=display_path(cache_dir) if cache_dir is not None else None,
             ai_routes=dict(engine.ai_setup.routes) if engine.ai_setup is not None else {},
         )
+        if run.ai == "cache":
+            meta["ai_cache_routes"] = list(run.cache_routes)
+            meta["provider_calls"] = sum(getattr(p, "calls", 0) for p in (run.ai_providers or {}).values())
     if synthetic:
         meta["synthetic_note"] = SYNTHETIC_NOTE
     limits = _limitations(run, cfg, meta, flatten, notes, raw)
@@ -1260,6 +1335,13 @@ def _limitations(run: _Run, cfg: Config, meta: Mapping[str, Any], flatten: bool,
         )
         if engine.ai_source == AI_OFFLINE:
             out.append("ai=on was requested but no LLM key is configured: plans came from the offline rules provider.")
+    elif run.ai == "cache":
+        out.append(
+            f"ai=cache: every analyst answer came from the recorded LLM cache ({meta.get('llm_cache')}; routes "
+            f"{', '.join(run.cache_routes)}). No API key was used and no provider was called (a cache miss would "
+            f"have stopped the run), so the plans are the recorded model output, replayed; at most "
+            f"{run.ai_max_calls} cycles per run ({meta.get('analyst_cycles')} run)."
+        )
     elif run.ai == "offline":
         out.append(f"ai=offline: plans from the deterministic offline rules provider ({OFFLINE_STATUS}), NOT an LLM.")
     if run.ai != "off":

@@ -74,12 +74,13 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import SecretStr, ValidationError
+from pydantic import ValidationError
 from rich import box
 from rich.console import Console
 from rich.table import Table
 
 from wta import engine as engine_mod
+from wta.ai.cache import CacheMissError
 from wta.config import (
     Config,
     Settings,
@@ -204,13 +205,9 @@ def load_cli_config(overrides: list[str] | None, overlays: list[str] | None = No
 
 
 def _secret_fields(settings: Settings) -> dict[str, str]:
-    """``{field name: value}`` of every secret setting (for the secrets scan)."""
-    out: dict[str, str] = {}
-    for name in type(settings).model_fields:
-        value = getattr(settings, name)
-        if isinstance(value, SecretStr):
-            out[name] = value.get_secret_value()
-    return out
+    """``{field name: value}`` for the secrets scan: every secret setting plus the challenge
+    sub-account id (``Settings.scan_values``)."""
+    return settings.scan_values()
 
 
 def _install_stop_signals(stop: asyncio.Event) -> Callable[[], None]:
@@ -893,6 +890,10 @@ def cmd_backtest(args: argparse.Namespace, cfg: Config, settings: Settings) -> i
         if args.param_grid:
             from backtest import walkforward as wf
 
+            if args.ai == "cache":
+                raise ValueError("--ai cache cannot run a --param-grid walk-forward (its runs ask questions the cache "
+                                 "never saw); use --ai on or off")
+
             grid = wf.parse_param_grid(args.param_grid, cfg)
             result = wf.run_walkforward(cfg, grid=grid, out_dir=out, **common)
             print(f"walk-forward: chosen {wf.label(result.chosen.params)}; {result.reason}; final "
@@ -906,6 +907,10 @@ def cmd_backtest(args: argparse.Namespace, cfg: Config, settings: Settings) -> i
     except EngineLockError as exc:
         _err(f"{exc} (another backtest writes into the same --out)")
         return EXIT_CANNOT_RUN
+    except CacheMissError as exc:
+        _err(f"--ai cache: {_one_line(exc)}: this run asked a question the recorded cache does not hold (another "
+             "window, config, strategies or code than the cached run); no provider was called")
+        return EXIT_FAILED
     if res is not None:
         _print_backtest(res)
     return EXIT_OK
@@ -1205,8 +1210,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="candles: 1-minute bars, S2/S3 (default); books: recorded order books, S1/S2")
     p.add_argument("--from", dest="from_ts", default=None, metavar="ISO", help="window start, e.g. 2026-09-22")
     p.add_argument("--to", dest="to_ts", default=None, metavar="ISO", help="window end, e.g. 2026-10-22T10:00Z")
-    p.add_argument("--ai", choices=("off", "on", "offline"), default="off",
-                   help="off: rules only (default); on: the configured LLM (cached, capped); offline: rules provider")
+    p.add_argument("--ai", choices=("off", "on", "offline", "cache"), default="off",
+                   help="off: rules only (default); on: the configured LLM (cached, capped); offline: rules provider; "
+                        "cache: an ai=on run's recorded LLM answers (--set ai.cache_dir=<run>/llm_cache), no key, "
+                        "no provider call, a cache miss is an error")
     p.add_argument("--strategies", default=None, metavar="S2,S3",
                    help="strategies to run (others disabled; default S2,S3 for candles, S1,S2 for books)")
     p.add_argument("--out", default=None, metavar="DIR",

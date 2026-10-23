@@ -223,7 +223,7 @@ TMN book. A gap that large is usually lockable, so reverts mostly happen when wi
 
 | Parameter | Value | Why |
 |---|---|---|
-| `coins` | BTC, ETH, SOL, XRP, DOGE, ADA, TRX, LTC, LINK, AVAX | allowed majors with both books. Only BTC, ETH, SOL, XRP and DOGE are on the watchlist today, so the rest are skipped ("no cross features") |
+| `coins` | BTC, ETH, SOL, XRP, DOGE, ADA, TRX, LTC, LINK, AVAX | allowed majors with both books; all 10 are on the 21-symbol watchlist (`configs/markets.yaml`, commit `e63347a`: each coin's TMN and USDT book plus USDTTMN) |
 | `margin_min_pct` | 0.15 % | covers what can go wrong between legs: book moves in the ~2–4 s before leg 2, partial fills, conversion error. ≈ ⅓ of the fees |
 | `leg1_taker` | true | lags last seconds, so a resting maker leg 1 would mostly miss them. Costs +0.05 % (TMN) / +0.03 % (USDT), already in `cost` |
 | `leg2_max_loss_pct` | 0.30 % | a known small loss beats an unhedged coin position |
@@ -470,8 +470,8 @@ mid, a self-cross (wash-trade prevention) or a duplicate. Exposure limits never 
 > (BTC rising in BTCUSDT while BTCTMN lags). The plan is invented; the order response and outcome are illustrative
 > values consistent with the code's accounting; identity fields are placeholders and some keys are elided.
 > No S1 cycle has completed on real Wallex books yet: the 0.33 h of aligned recorded books never had an edge above
-> cost (section 11.1). Real-engine S1 records on synthetic data are in `docs/REPORTS/bt_books_synth24h_ai_off/`
-> (`decisions.jsonl`). `TODO(phase-6)`: replace with a real-feed shadow/live record.
+> cost (section 11.1), and no live run exists. Section 8.1 below quotes a **recorded** S1 cycle of the real engine on
+> SYNTHETIC books, and `docs/DECISION_LOG_FORMAT.md` §3.3 annotates a full lock-in cycle line by line.
 
 Situation: USDTTMN 266,720 / 266,758; BTCUSDT 83,450.00 / 83,510.00; BTCTMN 22,073,000,000 / 22,100,000,000;
 account 2,500,000 TMN + 9.40 USDT (≈ 50 % USDT).

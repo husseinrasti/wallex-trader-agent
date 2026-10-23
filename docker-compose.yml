@@ -1,9 +1,12 @@
 # Two long-running services sharing ./data and ./logs (PRD-06 §1).
 #   docker compose up -d recorder            # market data only
 #   docker compose up -d recorder agent      # + agent in WTA_MODE (shadow by default)
-#   docker compose run --rm agent python -m wta backtest ...   # one-off commands
+#   docker compose run --rm --no-deps agent python -m wta backtest ...   # one-off commands
+#     (--no-deps: without it compose also starts the recorder, which agent depends on)
 # Live mode additionally needs WTA_LIVE=1 and the agent command's --i-understand-live flag
-# (see docs/RUNBOOK.md); the default compose file never trades live.
+# (see docs/RUNBOOK.md); the default compose file never trades live. env_file passes .env into every
+# container, so each service pins WTA_LIVE: "0" in its own environment: a WTA_LIVE=1 left in .env
+# never arms the live guard. Only an explicit `docker compose run -e WTA_LIVE=1 ...` overrides it.
 x-common: &common
   build: .
   image: wallex-trader-agent:latest
@@ -17,6 +20,8 @@ x-common: &common
 services:
   recorder:
     <<: *common
+    environment:
+      WTA_LIVE: "0"
     command: ["python", "-m", "wta", "record", "--symbols-from", "configs/markets.yaml"]
 
   agent:
@@ -24,6 +29,7 @@ services:
     depends_on: [recorder]
     environment:
       WTA_MODE: ${WTA_MODE:-shadow}
+      WTA_LIVE: "0"
     command: ["sh", "-c", "python -m wta run --mode ${WTA_MODE:-shadow} --log-dir logs/${WTA_MODE:-shadow}"]
     healthcheck:
       # unhealthy when THIS agent (logs/$WTA_MODE, its own --log-dir) wrote no heartbeat in the last
@@ -41,6 +47,7 @@ services:
     profiles: ["shadow"]
     environment:
       WTA_MODE: shadow
+      WTA_LIVE: "0"
     command: ["python", "-m", "wta", "run", "--mode", "shadow", "--log-dir", "logs/shadow",
               "--set", "alerts.telegram_commands_enabled=false"]
     healthcheck:

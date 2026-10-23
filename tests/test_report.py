@@ -433,6 +433,13 @@ def test_limitations_auto_filled_and_custom_first(tmp_path: Path, inputs: dict[s
         driver="candles", strategies="S2,S3", ai="off", spreads={"SOLUSDT": spreads["SOLUSDT"]})).read_text()
     assert "the reference spread of configs/markets_snapshot.yaml for every symbol" in only_ref
 
+    synth_shadow = _write(tmp_path / "shadow_synth", inputs, meta=_meta(mode="shadow", feed="synthetic", driver="n/a"))
+    lim = _section(synth_shadow.read_text(), "## Limitations")
+    assert "paper fills against the synthetic feed's generated books" in lim and "live book" not in lim
+    live_feed = _write(tmp_path / "shadow_live", inputs, meta=_real_meta(mode="shadow", feed="live", driver="n/a"))
+    lim = _section(live_feed.read_text(), "## Limitations")
+    assert "paper fills against the live book" in lim and "generated books" not in lim
+
     offline = _write(tmp_path / "offline", inputs, plans=_plans(T0, T0 + 3600, model="offline-rules-v1"))
     lim = _section(offline.read_text(), "## Limitations")
     assert "offline rules provider (offline-rules-v1), not an LLM" in lim
@@ -452,6 +459,9 @@ def test_vetoes_ai_and_fees_sections(tmp_path: Path, inputs: dict[str, Any]) -> 
     assert f"| Plans produced | {n} |" in ai
     assert "| Average size multiplier | 0.80 |" in ai
     assert f"| Plans served from the LLM cache | {(n + 1) // 2} |" in ai
+    assert "| Plan-to-plan changes of enabled_strategies |" in ai
+    n_s1 = len(range(0, n, 5))  # every 5th plan enables S2 only; S3 (configured) is in no plan
+    assert f"| Plans that narrowed the configured strategies | {n} of {n} (left out: S1 in {n_s1}, S3 in {n}) |" in ai
     assert "| Models | test/model |" in ai
     assert "| symbol | trend_up | range | trend_down | chaos | calls |" in ai  # canonical regime order
     btc = inputs["metrics"]["regime_distribution"]["BTCUSDT"]  # same numbers as the metrics
@@ -650,6 +660,13 @@ def test_index_lists_reports(tmp_path: Path, inputs: dict[str, Any]) -> None:
         "# Wallex API probe\n\n- generated: 2026-10-20T10:43:05.764Z (UTC)\n"
     )
     (reports / "notes").mkdir()  # a folder without markdown is not a report
+    _write(reports / "bt_books_recorded", inputs, title="Books backtest (recorded)", meta=_real_meta())
+    (reports / "survey_20261019.md").write_text(
+        "# Market survey — 20261019\n\n| Field | Value |\n|---|---|\n| Synthetic data | no |\n"
+    )
+    (reports / "ablation_20261019.md").write_text(
+        "# AI ablation, 2026-10-19\n\n<!-- data: mixed -->\n\n> **SYNTHETIC DATA — not evidence of performance** in §2.\n"
+    )
     readme = update_index(reports)
     assert readme == reports / INDEX_MD
     text = readme.read_text()
@@ -657,9 +674,15 @@ def test_index_lists_reports(tmp_path: Path, inputs: dict[str, Any]) -> None:
         "| [Books backtest (synthetic)](bt_books_3h/report.md) | 2026-10-22 | synthetic | `bt_books_3h/` |"
         in text
     )
-    assert "| [Shadow run](shadow_2026-10-21/report.md) | 2026-10-21 | — | `shadow_2026-10-21/` |" in text
-    assert "| [Wallex API probe](api_probe.md) | 2026-10-20 | — | `api_probe.md` |" in text
-    assert "notes" not in text
+    assert (
+        "| [Shadow run](shadow_2026-10-21/report.md) | 2026-10-21 | real (Wallex feed) | `shadow_2026-10-21/` |"
+        in text
+    )
+    assert "| [Books backtest (recorded)](bt_books_recorded/report.md) | 2026-10-22 | real (recorded Wallex) |" in text
+    assert "| [Market survey — 20261019](survey_20261019.md) | 2026-10-19 | real (recorded Wallex) |" in text
+    assert "| [AI ablation, 2026-10-19](ablation_20261019.md) | 2026-10-19 | mixed (real + synthetic) |" in text
+    assert "| [Wallex API probe](api_probe.md) | 2026-10-20 | — | `api_probe.md` |" in text  # no data of its own
+    assert "`notes" not in text and "](notes" not in text
     assert (
         text.index("bt_books_3h") < text.index("shadow_2026-10-21") < text.index("api_probe.md")
     )  # newest first

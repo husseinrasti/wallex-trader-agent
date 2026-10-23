@@ -68,7 +68,7 @@ Tools: OBS/QuickTime; 1080p; mic; no editing required. Upload (YouTube unlisted 
 
 1. `make test` green; `git status` clean; `git tag live-<ts>`; `git push --tags`.
 2. `scripts/check_account.py` → balances on the **challenge sub-account**, fees, order probe OK.
-3. `.env`: `WTA_MODE=live`, `WTA_LIVE=1`, deadline set, Telegram set.
+3. `.env`: `WTA_MODE=live`, deadline set, Telegram set; keep `WTA_LIVE=0` in `.env` (as built, live is armed only by `WTA_LIVE=1` in the live command's own environment, never by `.env`; see `docs/GO_LIVE_CHECKLIST.md`).
 4. Start recorder (if not running) → start agent → confirm first heartbeat + Telegram "started".
 5. Watch first S2 allocation fill; verify in Wallex web UI (read-only!) that the order carries our `client_id` pattern.
 6. Half-size for the first 6 h, then defaults (config change logged by `events`).

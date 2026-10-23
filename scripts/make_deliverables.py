@@ -44,8 +44,6 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from pydantic import SecretStr
-
 from wta.config import ROOT, Settings
 from wta.logging_.checker import scan_for_secrets
 from wta.logging_.jsonl import family_files, iter_family
@@ -101,14 +99,10 @@ def _git_state() -> str:
 
 
 def secret_fields(settings: Settings) -> dict[str, str]:
-    """``{field name: value}`` of every secret setting (``.env``), the same set ``wta logs check --secrets``
-    uses. The values are only handed to the scanner, never printed."""
-    out: dict[str, str] = {}
-    for name in type(settings).model_fields:
-        value = getattr(settings, name)
-        if isinstance(value, SecretStr):
-            out[name] = value.get_secret_value()
-    return out
+    """``{field name: value}`` of every secret setting (``.env``) plus the challenge sub-account id, the
+    same set ``wta logs check --secrets`` uses (``Settings.scan_values``). The values are only handed
+    to the scanner, never printed."""
+    return settings.scan_values()
 
 
 def _lines(path: Path) -> list[bytes]:
@@ -623,6 +617,16 @@ def index_block(deliverables: Path) -> str:
             for sub in sorted(p for p in path.iterdir() if p.is_dir() and not p.name.startswith(".")):
                 rows.append((f"replay/{sub.name}/", _h1(sub / "README.md") or "a replay bundle"))
                 rows += _bundle_rows(sub, f"replay/{sub.name}/")
+        elif path.name == "market":
+            rows.append(("market/", "the recorded REAL Wallex market data (order books, trades, 1-minute candles): "
+                                    "`make market-db` unpacks it to `data/wta.sqlite` for the real-data reports"))
+            known = {
+                "README.md": "what is inside (rows and time range per table) and the checksums",
+                "SHA256SUMS": "sha256 of the archive; `scripts/market_db.py` refuses an archive that does not match",
+                "wta.sqlite.xz": "the recorder's market DB (SQLite online backup + VACUUM, xz -9); account and engine "
+                                 "tables empty",
+            }
+            rows += [(f"market/{name}", text) for name, text in known.items() if (path / name).is_file()]
         elif _generated(path):
             rows.append((f"{path.name}/", _h1(path / "README.md")))
             rows += _run_rows(path, f"{path.name}/")

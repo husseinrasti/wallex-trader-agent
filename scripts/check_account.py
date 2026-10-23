@@ -3,7 +3,7 @@
     python scripts/check_account.py                  # read-only checks
     python scripts/check_account.py --probe-order    # also place and cancel two far-from-market orders
 
-The report goes to ``docs/REPORTS/api_probe.md`` (``--out``) and to stdout. Sections, in order:
+The report goes to ``logs/api_probe.md`` (``--out``; ``logs/`` is gitignored) and to stdout. Sections, in order:
 
 1. fee rates for the watchlist (``/v1/account/fee``);
 2. balances: raw payload (truncated, secrets masked) + parsed, and the equity in TMN at best bids;
@@ -20,7 +20,11 @@ The report goes to ``docs/REPORTS/api_probe.md`` (``--out``) and to stdout. Sect
    ``--probe-main-wallet`` is given.
 
 Every section survives an unreachable API: it says what failed and the script moves on. The API
-key is never written (only "set"/"not set") and every secret is scrubbed from the report.
+key is never written (only "set"/"not set") and every secret is scrubbed from the report. Account
+identifiers (``WALLEX_SUB_ACCOUNT_CLIENT_ID`` and every ``clientId`` the API lists) appear only as
+their last 4 characters (``...6666``), in the tables, the warnings and the raw payloads alike. The raw
+balance payloads stay in the report, which is why it goes to the gitignored ``logs/`` by default:
+commit a copy (``--out docs/REPORTS/api_probe.md``) only when it shows the challenge sub-account.
 Exit code: 0 when every section ran cleanly without warnings, 1 otherwise.
 """
 
@@ -57,7 +61,7 @@ from wta.utils.timeutil import SystemClock, iso
 
 log = logging.getLogger("check_account")
 
-DEFAULT_OUT = ROOT / "docs" / "REPORTS" / "api_probe.md"
+DEFAULT_OUT = ROOT / "logs" / "api_probe.md"  # gitignored: the report holds raw balance payloads
 RAW_MAX_CHARS = 3000
 MCP_SUB_ACCOUNTS_TOOL = "wallex_credit_active_sub_accounts_list"
 MCP_SUB_BALANCES_TOOL = "wallex_credit_sub_account_balances_details"
@@ -135,6 +139,20 @@ def compare_balances(rest: dict[str, Balance], mcp: dict[str, Balance]) -> list[
         if abs(a - b) > Decimal("1e-8") * max(Decimal(1), abs(a)):
             diffs.append(f"{asset}: REST {_num(a)} vs MCP {_num(b)}")
     return diffs
+
+
+def mask_id(value: str) -> str:
+    """An account identifier as the report shows it: only its last 4 characters (``...6666``)."""
+    text = str(value or "")
+    return "..." + text[-4:] if len(text) > 4 else "..."
+
+
+def mask_ids(text: str, ids: Iterable[str]) -> str:
+    """``text`` with every identifier in ``ids`` (4+ characters) replaced by ``mask_id``; longer ids
+    first, so an id that contains a shorter one is masked whole."""
+    for value in sorted({str(v) for v in ids if v and len(str(v)) >= 4}, key=len, reverse=True):
+        text = text.replace(value, mask_id(value))
+    return text
 
 
 def find_client_ids(payload: Any) -> list[str]:
@@ -291,7 +309,7 @@ class AccountCheck:
         r.line(f"- REST base URL: {s.wallex_base_url}")
         r.line(f"- MCP URL: {s.wallex_mcp_url} (auth header `{s.wallex_mcp_auth_header}`)")
         r.line(f"- API key: {'set (never printed)' if self.key else 'NOT SET'}")
-        r.line(f"- sub-account-client-id: {sub if sub else 'not set'}")
+        r.line(f"- sub-account-client-id: {f'set ({mask_id(sub)})' if sub else 'not set'}")
         r.line(f"- order probe: {'requested' if self.args.probe_order else 'not requested (read-only run)'}")
         started = time.monotonic()
         try:
@@ -303,9 +321,18 @@ class AccountCheck:
                 self.rest_down = _one_line(exc)
             r.line(f"- REST reachable: **NO** ({_one_line(exc)})")
 
+    def known_ids(self) -> list[str]:
+        """Every account identifier this run has seen: the configured sub-account and the listed ones."""
+        return [self.settings.wallex_sub_account_client_id, *self.mcp_client_ids, *self.rest_client_ids]
+
+    def redact(self, text: str) -> str:
+        """``text`` without secrets (``***``) and with account identifiers cut to their last 4 characters."""
+        return mask_ids(mask_secrets(text, self.settings.secret_values()), self.known_ids())
+
     def _raw(self, payload: Any) -> str:
         text = json.dumps(json_safe(payload), indent=1, ensure_ascii=False)
-        text = mask_secrets(text, self.settings.secret_values())
+        text = mask_ids(mask_secrets(text, self.settings.secret_values()),
+                        [*self.known_ids(), *find_client_ids(payload)])
         if len(text) > RAW_MAX_CHARS:
             text = text[:RAW_MAX_CHARS] + f"\n... (truncated; {len(text)} chars in total)"
         return text
@@ -475,8 +502,8 @@ class AccountCheck:
                 raise
             r.problem(f"/sub-accounts: {_one_line(exc)}")
             return
-        rows = [[s.get("title", ""), s.get("clientId", ""), s.get("type", ""), s.get("isActive", ""),
-                 s.get("isSuspend", "")] for s in subs]
+        rows = [[s.get("title", ""), mask_id(s.get("clientId", "")) if s.get("clientId") else "", s.get("type", ""),
+                 s.get("isActive", ""), s.get("isSuspend", "")] for s in subs]
         r.table(["title", "clientId", "type", "isActive", "isSuspend"], rows or [["(none)", "", "", "", ""]])
         self.rest_client_ids = find_client_ids(subs)
 
@@ -490,12 +517,13 @@ class AccountCheck:
             self.routing_bad = True
             r.warn(
                 "WALLEX_SUB_ACCOUNT_CLIENT_ID IS EMPTY BUT CREDIT SUB-ACCOUNTS EXIST "
-                f"({', '.join(known)}). Orders and balances would use the MAIN wallet, not the challenge "
+                f"({', '.join(mask_id(k) for k in known)}). Orders and balances would use the MAIN wallet, not the challenge "
                 "account. Set WALLEX_SUB_ACCOUNT_CLIENT_ID in .env and run this check again."
             )
         elif configured and known and configured not in known:
             self.routing_bad = True
-            r.warn(f"WALLEX_SUB_ACCOUNT_CLIENT_ID ({configured}) is not among the listed sub-accounts ({', '.join(known)}).")
+            r.warn(f"WALLEX_SUB_ACCOUNT_CLIENT_ID ({mask_id(configured)}) is not among the listed sub-accounts "
+                   f"({', '.join(mask_id(k) for k in known)}).")
         elif configured:
             r.line(f"- sub-account-client-id is set{' and listed' if known else ''}.")
         else:
@@ -761,8 +789,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     cfg = load_config(args.set)
     settings = load_settings()
-    report = asyncio.run(AccountCheck(cfg, settings, args).run())
-    text = mask_secrets(report.text(), settings.secret_values())
+    check = AccountCheck(cfg, settings, args)
+    report = asyncio.run(check.run())
+    text = check.redact(report.text())
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")

@@ -24,6 +24,8 @@ OPENAI = "sk" + "-proj-" + "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z"
 GOOGLE = "AI" + "za" + "SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q"
 TELEGRAM = "1234567890" + ":" + "AAH" + "x" * 32
 WALLEX = "wlx-test-" + "9f8e7d6c5b4a39281706"
+WALLEX_SHAPE = "48213" + "|" + "Q7wErTy2UiOp4AsDf6GhJk8LzXc0VbNm1QaZsWxEdCrFvT"  # the "<id>|<token>" form
+GOOGLE_AQ = "AQ" + "." + "Ab8RN6Kq-1w2E3r4T5y6U7i8O9p0_aSdFgHjKlZxCvBnM"
 
 
 def plant(path: Path, text: str) -> Path:
@@ -62,6 +64,10 @@ def test_json_escaped_secret_is_found(tmp_path: Path) -> None:
         (f'{{"api_key": "{OPENAI}"}}', "OpenAI-style key (sk-...)"),
         (f"url=https://x/?key={GOOGLE}", "Google API key (AIza...)"),
         (f"https://api.telegram.org/bot{TELEGRAM}/sendMessage", "Telegram bot token"),
+        (f"WALLEX_API_KEY={WALLEX_SHAPE}", "Wallex API key (id|token)"),
+        (f'{{"headers": {{"X-API-Key": "{WALLEX_SHAPE}"}}}}', "Wallex API key (id|token)"),
+        (f"GEMINI_API_KEY={GOOGLE_AQ}", "Google API key (AQ.)"),
+        (f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_AQ}", "Google API key (AQ.)"),
         ("X-API-Key: " + "abcdef0123456789abcd", "X-API-Key header value"),
         ('{"x-api-key": "' + "ABCDEF0123456789.abcd" + '"}', "X-API-Key header value"),
     ],
@@ -84,6 +90,9 @@ def test_harmless_text_is_not_flagged(tmp_path: Path) -> None:
                 "X-API-Key: <key>",
                 '{"wallex_api_key": "<set>", "note": "sk-short"}',
                 "ratio 1729591234:12",
+                "| 12 | ETHUSDT | 0.25% | maker |",
+                "S1_BTCTMN|" + "a" * 40,
+                "AQ.short-value",
             ]
         ),
     )
@@ -131,6 +140,25 @@ def test_compressed_files_are_decompressed_or_reported(tmp_path: Path) -> None:
     assert all(WALLEX not in f for f in findings)
 
 
+def test_the_scan_covers_every_secret_and_the_sub_account_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("OPENROUTER_API_KEY", "GEMINI_API_KEY", "WALLEX_API_KEY", "TELEGRAM_BOT_TOKEN",
+                 "WALLEX_SUB_ACCOUNT_CLIENT_ID"):
+        monkeypatch.delenv(name, raising=False)
+    sub_id = "challenge-sub-" + "7c41d2e9"
+    settings = Settings(_env_file=None, wallex_api_key=WALLEX, telegram_bot_token=TELEGRAM,
+                        wallex_sub_account_client_id=sub_id)
+    values = settings.scan_values()
+    secret_names = {n for n in type(settings).model_fields if isinstance(getattr(settings, n), SecretStr)}
+    assert set(values) == secret_names | {"wallex_sub_account_client_id"}
+    assert values["wallex_sub_account_client_id"] == sub_id and values["openrouter_api_key"] == ""
+    f = plant(tmp_path / "api_probe.md", f"- sub-account-client-id: {sub_id}\n")
+    assert scan_for_secrets([tmp_path], values) == [f"{f}:1: configured secret wallex_sub_account_client_id"]
+    from scripts.make_deliverables import secret_fields
+    from wta.cli import _secret_fields
+
+    assert _secret_fields(settings) == values == secret_fields(settings)
+
+
 # ---------------------------------------------------------------- the real guard
 
 
@@ -145,11 +173,7 @@ def _scan_repo_outputs() -> list[str]:
     except ValidationError as exc:
         fields = sorted({".".join(str(p) for p in e["loc"]) for e in exc.errors()})
         pytest.fail(f"Settings() failed to load; check these .env fields: {fields}", pytrace=False)
-    secrets = {
-        name: value.get_secret_value()
-        for name in type(settings).model_fields
-        if isinstance(value := getattr(settings, name), SecretStr) and value.get_secret_value()
-    }
+    secrets = {name: value for name, value in settings.scan_values().items() if value}
     return scan_for_secrets([ROOT / "logs", ROOT / "deliverables", ROOT / "docs" / "REPORTS"], secrets)
 
 

@@ -86,6 +86,15 @@ INDEX_MD = "README.md"
 DEFAULT_FINAL_REPORT = "deliverables/REPORT.md"
 
 SYNTHETIC_BANNER = "SYNTHETIC DATA — not evidence of performance"
+# the "data" column of the reports index (``_data_label``)
+DATA_SYNTHETIC = "synthetic"
+DATA_REAL = "real (recorded Wallex)"
+DATA_REAL_FEED = "real (Wallex feed)"
+DATA_MIXED = "mixed (real + synthetic)"
+DATA_NONE = "—"
+# an explicit label in a hand-written report's first 30 lines: <!-- data: real | synthetic | mixed -->
+_DATA_MARKER_RE = re.compile(r"<!--\s*data:\s*(real|synthetic|mixed)\s*-->", re.I)
+_SURVEY_SYNTHETIC_ROW_RE = re.compile(r"^\|\s*Synthetic data\s*\|\s*(no|\*\*YES\*\*)", re.M)
 INSUFFICIENT_BANNER = "INSUFFICIENT DATA"
 NOT_AVAILABLE = "not available yet"
 TRADES_TABLE_ROWS = 50
@@ -557,7 +566,7 @@ def _ai_on(meta: Mapping[str, Any]) -> bool | None:
     if isinstance(raw, bool):
         return raw
     text = str(raw).strip().lower()
-    if text in {"on", "true", "1", "yes", "enabled"}:
+    if text in {"on", "true", "1", "yes", "enabled", "cache"}:  # cache: the recorded LLM answers (backtest --ai cache)
         return True
     if text in {"off", "false", "0", "no", "disabled"}:
         return False
@@ -1021,7 +1030,27 @@ def _regime_table(dist: Mapping[str, Any]) -> dict[str, dict[str, int]]:
     return out
 
 
-def _ai_stats(metrics: Mapping[str, Any], plans: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _narrowed(plans: Sequence[Mapping[str, Any]], configured: Sequence[str]) -> dict[str, Any] | None:
+    """How many plans left out at least one of the run's configured strategies (a plan can only
+    narrow them), and how often each one was left out. None when the configuration is unknown."""
+    conf = {str(s).upper() for s in configured}
+    if not conf:
+        return None
+    left: Counter[str] = Counter()
+    n = 0
+    for p in plans:
+        if p.get("enabled") is None:
+            continue
+        missing = conf - {str(s).upper() for s in p["enabled"]}
+        if missing:
+            n += 1
+            left.update(missing)
+    return {"n": n, "left_out": dict(sorted(left.items()))}
+
+
+def _ai_stats(
+    metrics: Mapping[str, Any], plans: Sequence[Mapping[str, Any]], configured: Sequence[str] = ()
+) -> dict[str, Any]:
     """AI section numbers: from the plans when given (so they match the timeline), else from metrics."""
     nested = metrics.get("ai") if isinstance(metrics.get("ai"), Mapping) else {}
     src: dict[str, Any] = {**metrics, **nested}
@@ -1045,6 +1074,7 @@ def _ai_stats(metrics: Mapping[str, Any], plans: Sequence[Mapping[str, Any]]) ->
             "plans_cached": sum(1 for p in plans if p["cached"]),
             "plans_clamped": sum(1 for p in plans if p["clamped"]),
             "models": sorted({p["model"] for p in plans if p["model"]}),
+            "plans_narrowing_configured": _narrowed(plans, configured),
         }
     else:
         dist = src.get("regime_distribution")
@@ -1060,6 +1090,7 @@ def _ai_stats(metrics: Mapping[str, Any], plans: Sequence[Mapping[str, Any]]) ->
             "plans_cached": None,
             "plans_clamped": None,
             "models": [],
+            "plans_narrowing_configured": None,
         }
     gated = src.get("regime_gated") if isinstance(src.get("regime_gated"), Mapping) else {}
     stats["s3_entries_gated"] = _num(gated.get("s3_entries_gated", src.get("trades_gated_by_regime")))
@@ -1337,10 +1368,16 @@ def _limitations(
             "queue position is not modelled."
         )
     if mode == "shadow":
-        auto.append(
-            "Shadow fills are paper fills against the live book (PaperExchange): they consume no liquidity "
-            "and ignore queue position."
-        )
+        if synthetic or str(meta.get("feed") or "").lower() == "synthetic":
+            auto.append(
+                "Shadow fills are paper fills against the synthetic feed's generated books (PaperExchange): no "
+                "Wallex book was involved; they consume no liquidity and ignore queue position."
+            )
+        else:
+            auto.append(
+                "Shadow fills are paper fills against the live book (PaperExchange): they consume no liquidity "
+                "and ignore queue position."
+            )
     if ai is False:
         auto.append(
             "AI disabled (ai=off): rules-only defaults; the AI's contribution shows only in the ablation."
@@ -1467,7 +1504,7 @@ def write_report(
     report_date = _report_date(meta_d, window)
     vetoes = _veto_counts(metrics_d, decision_rows)
     fees = _fees(metrics_d, meta_d, trade_rows, points, window["data_hours"])
-    ai_stats = _ai_stats(metrics_d, plan_rows)
+    ai_stats = _ai_stats(metrics_d, plan_rows, _strategies(meta_d))
     limits = _limitations(
         meta_d, metrics_d, window, points, trade_rows, plan_rows, list(limitations or []), insufficient
     )
@@ -1615,7 +1652,8 @@ def _header(run: _Run) -> list[str]:
         ],
         ["Data present (UTC)", _span_text(window["data_from"], window["data_to"], window["data_hours"])],
         ["Data source", str(meta.get("data_source") or "n/a") + (" (SYNTHETIC)" if run.synthetic else "")],
-        ["AI", "on" if ai_flag else ("off" if ai_flag is False else str(meta.get("ai") or "n/a"))],
+        ["AI", ("cache (recorded LLM answers, no provider call)" if str(meta.get("ai")) == "cache" else "on")
+         if ai_flag else ("off" if ai_flag is False else str(meta.get("ai") or "n/a"))],
         ["Strategies", ", ".join(_strategies(meta)) or "n/a"],
         ["Data end (UTC)", _data_end(meta, window)],
         ["Report date", (run.report_date + _report_date_note(meta)) if run.report_date else "n/a"],
@@ -1683,10 +1721,17 @@ def _ai_section(run: _Run) -> list[str]:
         ["Plans produced", _fmt("int", ai.get("n_plans"))],
         ["Average size multiplier", _fmt("num", ai.get("avg_size_multiplier"))],
         [
-            "Plans that changed the enabled strategies",
+            "Plan-to-plan changes of enabled_strategies",
             _fmt("int", ai.get("n_plan_changes_of_enabled_strategies")),
         ],
     ]
+    narrowed = ai.get("plans_narrowing_configured")
+    if isinstance(narrowed, Mapping) and ai.get("n_plans"):
+        left = ", ".join(f"{s} in {c:,}" for s, c in narrowed["left_out"].items())
+        rows.append([
+            "Plans that narrowed the configured strategies",
+            f"{narrowed['n']:,} of {int(ai['n_plans']):,}" + (f" (left out: {left})" if left else ""),
+        ])
     if ai.get("plans_cached") is not None:
         rows.append(["Plans served from the LLM cache", _fmt("int", ai["plans_cached"])])
     if ai.get("plans_clamped") is not None:
@@ -1879,6 +1924,7 @@ class ReportInfo:
     title: str
     date: str | None
     synthetic: bool | None
+    data: str = DATA_NONE  # DATA_SYNTHETIC | DATA_REAL | DATA_REAL_FEED | DATA_MIXED | DATA_NONE
 
 
 def _first_heading(text: str) -> str | None:
@@ -1900,6 +1946,25 @@ def _date_from(text: str) -> str | None:
         return None
 
 
+def _data_label(text: str, summary: Mapping[str, Any]) -> str:
+    """What data a report is built on, for the index: an explicit ``<!-- data: ... -->`` marker in
+    its first 30 lines, else its ``summary.json`` (``synthetic`` and the mode), else the survey's
+    "Synthetic data" row, else the SYNTHETIC banner; documents without data of their own get "—"."""
+    head = "\n".join(text.splitlines()[:30])
+    marker = _DATA_MARKER_RE.search(head)
+    if marker:
+        return {"real": DATA_REAL, "synthetic": DATA_SYNTHETIC, "mixed": DATA_MIXED}[marker.group(1).lower()]
+    if isinstance(summary.get("synthetic"), bool):
+        if summary["synthetic"]:
+            return DATA_SYNTHETIC
+        meta = summary.get("meta") if isinstance(summary.get("meta"), Mapping) else {}
+        return DATA_REAL_FEED if str(meta.get("mode") or "").lower() in {"shadow", "live"} else DATA_REAL
+    row = _SURVEY_SYNTHETIC_ROW_RE.search(text)
+    if row:
+        return DATA_REAL if row.group(1) == "no" else DATA_SYNTHETIC
+    return DATA_SYNTHETIC if SYNTHETIC_BANNER in text else DATA_NONE
+
+
 def _report_info(md_path: Path, name: str) -> ReportInfo:
     text = md_path.read_text(encoding="utf-8", errors="replace")
     summary: dict[str, Any] = {}
@@ -1914,13 +1979,14 @@ def _report_info(md_path: Path, name: str) -> ReportInfo:
     title = str((summary.get("title") if own else None) or _first_heading(text) or name)
     # the report's date, never a data date found in the text when the run's summary.json has one
     when = summary.get("report_date") or _date_from(name) or _date_from("\n".join(text.splitlines()[:30]))
+    data = _data_label(text, summary)
     synthetic = (
         summary.get("synthetic")
         if isinstance(summary.get("synthetic"), bool)
-        else (SYNTHETIC_BANNER in text or None)
+        else (data in (DATA_SYNTHETIC, DATA_MIXED) or SYNTHETIC_BANNER in text or None)
     )
     return ReportInfo(
-        path=md_path, name=name, title=title, date=str(when) if when else None, synthetic=synthetic
+        path=md_path, name=name, title=title, date=str(when) if when else None, synthetic=synthetic, data=data
     )
 
 
@@ -1962,12 +2028,17 @@ def update_index(reports_dir: Path | str) -> Path:
         "Regenerated by `backtest/report.py` (`update_index`) — do not edit by hand. Rows marked "
         "*synthetic* were produced on generated data and are **not evidence of performance**.",
         "",
+        f"Data column: *{DATA_REAL}* = order books or candles recorded from Wallex; *{DATA_REAL_FEED}* = a "
+        f"shadow or live run on the Wallex feed; *{DATA_SYNTHETIC}* = generated data; *{DATA_MIXED}* = "
+        f"sections of both kinds, each labelled; {DATA_NONE} = a document without data of its own "
+        "(acceptance notes, the API probe, the read-first summary).",
+        "",
     ]
     if infos:
         rows = []
         for info in infos:
             rel = info.path.relative_to(root).as_posix()
-            data = "synthetic" if info.synthetic else "—"
+            data = info.data
             rows.append([f"[{info.title}]({rel})", info.date or "n/a", data, f"`{info.name}`"])
         lines += [_md_table(["report", "date", "data", "path"], rows), ""]
     else:
@@ -2147,11 +2218,9 @@ def assemble_final_report(
         if info is None:
             toc.append([str(n), sec.title, sec.status_if_missing or NOT_AVAILABLE, "—"])
         else:
-            status = (
-                "included"
-                + (f" ({info.date})" if info.date else "")
-                + (" — SYNTHETIC" if info.synthetic else "")
-            )
+            kind = {DATA_SYNTHETIC: " — SYNTHETIC", DATA_MIXED: " — real + SYNTHETIC", DATA_REAL: " — real",
+                    DATA_REAL_FEED: " — real"}.get(info.data, " — SYNTHETIC" if info.synthetic else "")
+            status = "included" + (f" ({info.date})" if info.date else "") + kind
             toc.append([str(n), sec.title, status, src_link(info)])
     parts += [_md_table(["#", "section", "status", "source"], toc), ""]
     if missing:

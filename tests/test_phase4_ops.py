@@ -221,6 +221,20 @@ def test_the_healthcheck_reads_only_this_agents_log_dir(tmp_path: Path) -> None:
     assert shadow["environment"]["WTA_MODE"] == "shadow" and _healthcheck("shadow") == code
 
 
+def test_compose_pins_wta_live_to_0_in_every_service() -> None:
+    """env_file exports .env into each container; a WTA_LIVE=1 there must not arm the live guard."""
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
+    assert compose["x-common"]["env_file"] == ".env"
+    for name, service in compose["services"].items():
+        assert service["environment"]["WTA_LIVE"] == "0", name
+    from wta.config import Settings
+    from wta.safety import live_guard_reason
+
+    settings = Settings(_env_file=None, wallex_api_key="k" * 20)
+    reason = live_guard_reason(True, True, settings, env={"WTA_LIVE": compose["services"]["agent"]["environment"]["WTA_LIVE"]})
+    assert reason is not None and "WTA_LIVE=1" in reason
+
+
 # ---------------------------------------------------------------- run_forever.sh
 
 
@@ -233,8 +247,11 @@ if [ "$1" = "alert" ]; then
 fi
 if [ "${FAKE_CRASH:-0}" = "1" ]; then exit 3; fi
 trap 'sleep 1.5; date +%s.%N > "$OUT/child.done"; exit 0' TERM
-echo started > "$OUT/child.started"
-while true; do sleep 0.1; done
+echo started >> "$OUT/child.started"
+while true; do
+  if [ -n "${FAKE_BEAT:-}" ]; then touch "$FAKE_BEAT"; fi
+  sleep 0.1
+done
 """
 
 
@@ -276,6 +293,41 @@ def test_run_forever_passes_the_config_arguments_to_the_crash_loop_alert(tmp_pat
     assert args[:6] == ["alert", "--set", "alerts.telegram_enabled=true", "--overlay", "configs/live_halfsize.yaml",
                         "--set=engine.rng_seed=7"]
     assert args[6] == "--" and "giving up" in args[7]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="bash script")
+def test_run_forever_watchdog_restarts_a_child_without_heartbeats(tmp_path: Path) -> None:
+    """PRD-06 §2: alive but no heartbeat for WATCHDOG_S -> SIGTERM and a restart; the hourly cap still applies."""
+    log_dir = tmp_path / "lg"
+    _touch(log_dir / "health-20261022.jsonl", 1000)  # an old heartbeat of an earlier process never counts
+    env = {**_fake_python(tmp_path), "WATCHDOG_S": "1", "WATCHDOG_GRACE_S": "0", "WATCHDOG_POLL_S": "0.2",
+           "WATCHDOG_KILL_S": "5", "MAX_RESTARTS_PER_HOUR": "1"}
+    cmd = ["bash", str(ROOT / "scripts" / "run_forever.sh"), "run", "--mode", "shadow", "--log-dir", str(log_dir)]
+    assert subprocess.run(cmd, env=env, timeout=40, check=False).returncode == 1  # 2 restarts > cap 1: gave up
+    log = (tmp_path / "rf.log").read_text()
+    assert log.count("starting:") == 2 and log.count("watchdog: no heartbeat in") == 2
+    assert f"{log_dir}/health-*.jsonl" in log and "(limit 1s); SIGTERM to" in log
+    assert "giving up" in log and "SIGKILL" not in log  # the child stopped on SIGTERM
+    assert (tmp_path / "child.done").exists()  # it got SIGTERM (its trap ran), it was not killed hard
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="bash script")
+def test_run_forever_watchdog_leaves_a_beating_child_alone(tmp_path: Path) -> None:
+    log_dir = tmp_path / "lg"
+    log_dir.mkdir()
+    env = {**_fake_python(tmp_path), "WATCHDOG_S": "1", "WATCHDOG_GRACE_S": "0", "WATCHDOG_POLL_S": "0.2",
+           "FAKE_BEAT": str(log_dir / "health-20261023.jsonl")}
+    cmd = ["bash", str(ROOT / "scripts" / "run_forever.sh"), "run", "--mode", "shadow", f"--log-dir={log_dir}"]
+    proc = subprocess.Popen(cmd, env=env)
+    try:
+        time.sleep(3.5)  # > 3 x WATCHDOG_S
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=10) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    log = (tmp_path / "rf.log").read_text()
+    assert "watchdog:" not in log and log.count("starting:") == 1 and log.rstrip().endswith("stopped")
 
 
 def test_wta_alert_accepts_the_forwarded_arguments(

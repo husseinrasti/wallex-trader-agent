@@ -9,7 +9,7 @@
 
 Code is the reference. Where it differs from `PRD-02-risk-execution.md`, this document follows the
 code and lists the differences in §16. Every config name below is the key in
-`configs/default.yaml`, shown with its default value. Code reference: tag `v0.5-backtest` (`85acc16`).
+`configs/default.yaml`, shown with its default value. Code reference: tag `v0.6-ops` (the risk layer is unchanged since `v0.5-backtest`, `85acc16`).
 
 ---
 
@@ -339,8 +339,12 @@ Caps at the reference equity of 5,000,000 TMN:
 **Half size for the first 6 h of live trading:** `wta run ... --overlay configs/live_halfsize.yaml`
 sets `risk.max_order_pct_equity: 0.125` and `strategies.s1_crossbook.size_pct_equity: 0.10`. The
 overlay keys are pinned (the reviewer's runtime overlay cannot override them), the `start` event
-names the overlay, and every decision carries the new `config_hash` (`7f11464cec5c` with an empty
-`CHALLENGE_END_UTC`; the hash changes with every `${VAR}` value).
+names the overlay, and every decision carries the new `config_hash`. The hash depends on every
+`${VAR}` value: `python -m wta config hash --overlay configs/live_halfsize.yaml` prints `34b9c987b6b3`
+with `.env.example` (all empty), and `7f11464cec5c` with the developer's
+`OPENROUTER_MODEL_FAST=openai/gpt-5.4-mini`, `OPENROUTER_MODEL_STRONG=openai/gpt-6-luna-pro`,
+`GEMINI_MODEL=gemini-4-argon` and empty `CHALLENGE_*_UTC`. Live gets yet another hash once
+`CHALLENGE_END_UTC` is filled in.
 
 Stops and time stops per strategy: S1 revert uses `revert_stop_pct` 1.0 % and `revert_max_hold_s`
 1200 s. S3 uses `stop_atr_mult` 1.5 ATR, a software target at `target_atr_mult` 2.5 ATR, and

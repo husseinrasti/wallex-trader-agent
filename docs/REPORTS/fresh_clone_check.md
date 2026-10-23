@@ -120,7 +120,8 @@ relative link resolves.
    #19), and `make live` would refuse until the folder is gone. The README names that output path, so this is
    documented behaviour. A judge who wants clean provenance afterwards can run
    `rm -rf docs/REPORTS/synthetic_bt_books`. Possible fixes are a gitignore entry, or an `--out` under `logs/` as
-   the Docker example already uses.
+   the Docker example already uses. **Fixed after this check (tag `v0.6-ops`):** `make backtest-synth` now writes
+   `logs/synthetic_bt_books/` (gitignored), and `make replay` writes its report to `logs/` instead of `docs/REPORTS/`.
 2. **Heartbeat before the first tick.** In a 75-s `make shadow` with the API unreachable, the markets retries took
    about 56 s and Ctrl-C came before the first engine tick. The stop-time log line then read `fresh_books=21/21`, while the
    same health record had `book_age_s: {}`, `ticks: 0` and `reasons: ["rest: no fresh data ...", "ws: no fresh

@@ -55,10 +55,14 @@ failed, 2 cannot run (bad arguments, a guard, the account lock), 130 interrupted
 | `make shadow` | `wta run --mode shadow --log-dir logs/shadow` (real feed, paper account `shadow`) |
 | `make shadow-synth` | `wta run --mode shadow --feed synthetic --log-dir logs/shadow_synth --set data.sqlite_path=data/shadow_synth.sqlite` (state DB `data/shadow_synth.state_shadow_synthetic.sqlite`); never evidence |
 | `make live` | `WTA_LIVE=1 wta run --mode live --i-understand-live`: **full size**, foreground. The checklist uses its own command with the half-size overlay instead |
-| `make backtest` | 30-day candle backtest, S2+S3, `AI=off` (override `FROM`, `TO`, `AI`); needs a candle backfill |
+| `make backtest` | 30-day candle backtest of real candles, S2+S3 with `allow_rules_only` (as the shipped candle reports), `AI=off` (override `FROM`, `TO`, `AI`); writes `docs/REPORTS/bt_candles_30d_real/`; needs a candle backfill |
 | `make backtest-books` | book backtest, S1+S2, over the recorded books (`BOOKS_FROM`, `BOOKS_TO`, `AI`) |
-| `make backtest-synth` | the book backtest on a generated 6-h SYNTHETIC DB (writes `docs/REPORTS/synthetic_bt_books`) |
-| `make replay` | `scripts/replay_check.py --decisions logs/decisions.jsonl`: the live run if one exists, else the newest shadow run under `logs/` (today: `logs/shadow_synth_4h`); writes `docs/REPORTS/replay_<date>.md` and the index; exit 1 on any mismatch |
+| `make backtest-synth` | the book backtest on a generated 6-h SYNTHETIC DB (writes `logs/synthetic_bt_books`, gitignored) |
+| `make backtest-cache` | the AI ablation's real-LLM run (6-h SYNTHETIC books) from its committed LLM cache with `--ai cache`: no key, no provider call, a miss is exit 1 (writes `logs/bt_cache_synth24h_6h`) |
+| `make market-db` | `scripts/market_db.py`: unpacks the committed real market data `deliverables/market/wta.sqlite.xz` into `data/wta.sqlite` (checksum verified; never overwrites) |
+| `make replay` | `scripts/replay_check.py --decisions logs/decisions.jsonl --reports-dir logs --no-index`: the live run if one exists, else the newest shadow run under `logs/` (today: `logs/shadow_synth_4h`); report in `logs/replay_<date>.md`; exit 1 on any mismatch |
+| `make replay-report` | the same, but writes `docs/REPORTS/replay_<date>.md` and the reports index (to regenerate the committed proof) |
+| `make final-report` | `scripts/assemble_report.py`: the reports index, `deliverables/REPORT.md` and its deliverables index, from `docs/REPORTS` |
 | `make replay-deliverable` | `scripts/replay_check.py --bundle deliverables/replay/shadow_synth_4h`: the same replay from the committed bundle (checksums verified, unpacked to a temporary directory, replayed, removed); needs no `logs/` or `data/` |
 | `make deliverables` | `scripts/make_deliverables.py --run-dir $(DELIVER_RUN) --bundle --replay`: copies a recorded run (default `logs/shadow_synth_4h`) into `deliverables/` with its replay bundle, secrets-scanned |
 | `make report` | `wta report --source $(REPORT_SOURCE) --out $(REPORT_OUT)` (default `logs/shadow` → `docs/REPORTS/shadow_report`) |
@@ -74,7 +78,7 @@ failed, 2 cannot run (bad arguments, a guard, the account lock), 130 interrupted
 
 | Script | Purpose |
 |---|---|
-| `scripts/check_account.py [--probe-order]` | API and account probe; writes `docs/REPORTS/api_probe.md`. `--probe-order` places and cancels two far-from-market orders: **operator only**, after typing `PROBE` |
+| `scripts/check_account.py [--probe-order]` | API and account probe; writes `logs/api_probe.md` (gitignored: it holds raw balance payloads; account ids appear only as their last 4 characters). `--probe-order` places and cancels two far-from-market orders: **operator only**, after typing `PROBE` |
 | `scripts/flatten_now.py [--i-understand-live] [--feed] [--log-dir] [--phase1-seconds 60] [--timeout 600]` | the engine's own flatten, now (§9.3) |
 | `scripts/replay_check.py [--log-dir DIR \| --decisions FILE \| --bundle DIR] [--reports-dir ''] [--json]` | the judges' replay check (`make replay`, `make replay-deliverable`) |
 | `scripts/run_forever.sh <wta args>` | restart loop for bare metal (§4) |
@@ -116,17 +120,22 @@ docker compose build
 docker compose up -d recorder           # market data only
 docker compose up -d recorder agent     # + agent in WTA_MODE (shadow unless .env says otherwise)
 docker compose logs -f agent
-docker compose run --rm agent python -m wta logs check --dir logs/shadow    # one-off commands
+docker compose run --rm --no-deps agent python -m wta logs check --dir logs/shadow    # one-off commands (--no-deps: no recorder)
 docker compose down                     # SIGTERM; the running tick finishes before the agent stops
 ```
 
 What `docker-compose.yml` does:
 
-* image `python:3.11-slim`, non-root user, `tini` as PID 1, env from `.env`;
+* image `python:3.11-slim`, non-root user, `tini` as PID 1, env from `.env`, except `WTA_LIVE`: each
+  service pins `WTA_LIVE: "0"` in its own `environment`, so a `WTA_LIVE=1` left in `.env` never arms
+  the live guard inside a container;
 * volumes `./data`, `./logs` and `./configs/runtime` are shared by all services;
 * agent: `python -m wta run --mode ${WTA_MODE:-shadow} --log-dir logs/${WTA_MODE:-shadow}`,
   `restart: always`; healthcheck every 60 s: unhealthy when no `logs/$WTA_MODE/health-*.jsonl` was
-  modified in the last 180 s (compose only marks it; it does not restart for that);
+  modified in the last 180 s. **Compose only marks the container unhealthy; it does not restart it**
+  (plain Docker has no restart-on-unhealthy). A hung agent under compose therefore needs
+  `docker compose restart agent` by hand, an autoheal sidecar, or the bare-metal
+  `scripts/run_forever.sh`, whose watchdog does restart it (§4);
 * optional `shadow` profile (`docker compose --profile shadow up -d shadow`): a second engine with
   `--set alerts.telegram_commands_enabled=false`, meant to run next to a live agent.
 
@@ -160,7 +169,16 @@ bash scripts/ps.sh                       # or: make ps
 `scripts/run_forever.sh <wta args>` restarts the command 10 s after it exits (`BACKOFF_S`). More than
 20 restarts within one hour (`MAX_RESTARTS_PER_HOUR`) stops the loop and sends `wta alert` (with the
 wrapped command's `--set` / `--overlay` arguments, so a Telegram enabled by `--set` reaches the alert
-too). Every start, exit code and the give-up line go to `logs/run_forever.log`. A `SIGTERM` to the
+too). Every start, exit code and the give-up line go to `logs/run_forever.log`.
+
+**Watchdog (PRD-06 §2).** A child that is alive but silent is restarted too. For `run` the heartbeat
+is the newest `<--log-dir>/health-*.jsonl`, for `record` the newest `logs/recorder-*.jsonl`; both are
+written every 60 s. When the newest one is more than `WATCHDOG_S` (180 s) old, checked every
+`WATCHDOG_POLL_S` (15 s) once `WATCHDOG_GRACE_S` (300 s) have passed since the start (start-up with an
+unreachable API takes about 2.5 min), the loop logs `watchdog: no heartbeat in ... for Ns`, sends
+`wta alert`, SIGTERMs the child (SIGKILL after `WATCHDOG_KILL_S`, 30 s) and restarts it like after a
+crash: the back-off and the hourly cap apply. A heartbeat file older than the child's start never
+counts. `WATCHDOG_S=0` turns the watchdog off. A `SIGTERM` to the
 loop's pid is forwarded to the child, and the loop waits until the child has finished its tick:
 
 ```bash

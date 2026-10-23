@@ -126,6 +126,21 @@ def test_backtest_runner_errors_exit_2(use_settings, tmp_path: Path, capsys) -> 
     assert code == cli.EXIT_CANNOT_RUN and "S1 cannot be backtested on candles" in capsys.readouterr().err
 
 
+def test_backtest_ai_cache_errors(use_settings, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:
+    from wta.ai.cache import CacheMissError
+
+    def miss(cfg: Any, **kwargs: Any) -> BacktestResult:
+        raise CacheMissError("LLM cache miss for key abc (strict cache)")
+
+    monkeypatch.setattr(bt, "run_backtest", miss)
+    argv = ["backtest", "--from", "2026-10-22", "--to", "2026-10-23", "--ai", "cache", "--out", str(tmp_path / "o"),
+            "--log-level", "WARNING"]
+    assert cli.main(argv) == cli.EXIT_FAILED  # a miss is a failed check, never a provider call
+    assert "--ai cache: LLM cache miss for key abc" in capsys.readouterr().err
+    assert cli.main([*argv, "--param-grid", "strategies.s1_crossbook.margin_min_pct=0.001,0.002"]) == cli.EXIT_CANNOT_RUN
+    assert "--ai cache cannot run a --param-grid walk-forward" in capsys.readouterr().err
+
+
 def test_backtest_param_grid_goes_to_the_walk_forward(use_settings, monkeypatch: pytest.MonkeyPatch,
                                                       tmp_path: Path, capsys) -> None:
     seen: dict[str, Any] = {}

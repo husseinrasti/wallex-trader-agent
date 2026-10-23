@@ -13,7 +13,7 @@ import os
 import re
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import orjson
 import yaml
@@ -62,6 +62,23 @@ class Settings(BaseSettings):
             self.telegram_bot_token.get_secret_value(),
         ]
         return [v for v in vals if v]
+
+    # not a secret the engine scrubs from its logs, but an account identifier that must never reach
+    # git or a deliverable (the challenge sub-account; SUBMISSION_CHECKLIST §2 treats it like a key)
+    SCANNED_IDENTIFIERS: ClassVar[tuple[str, ...]] = ("wallex_sub_account_client_id",)
+
+    def scan_values(self) -> dict[str, str]:
+        """``{field name: value}`` for the secrets scan (``wta logs check --secrets``,
+        ``scripts/make_deliverables.py``): every ``SecretStr`` field plus ``SCANNED_IDENTIFIERS``.
+        Empty values are kept (the scanner skips them); the values are never printed."""
+        out: dict[str, str] = {}
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            if isinstance(value, SecretStr):
+                out[name] = value.get_secret_value()
+            elif name in self.SCANNED_IDENTIFIERS:
+                out[name] = str(value or "")
+        return out
 
     def masked(self) -> dict[str, Any]:
         out: dict[str, Any] = {}

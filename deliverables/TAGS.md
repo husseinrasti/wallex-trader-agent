@@ -50,12 +50,14 @@ The convention (`docs/00-OVERVIEW.md` §8, `GO_LIVE_CHECKLIST.md` §5):
    ```
    The time in the name is UTC. Live mode refuses a dirty tree (untracked files count; `--allow-dirty` is for
    development only). The `start` event records `git_commit`, `git_dirty: false` and `git_tag`.
-2. **Every deliberate live start gets a new tag.** That includes the planned switch from half size to full size after
-   6 h (`GO_LIVE_CHECKLIST.md` §6) and any restart on a different commit or config. Automatic restarts on the same
-   commit (`scripts/run_forever.sh`, compose `restart: always`) keep the tag. They show up as `start` events with
-   `reason: restart`.
+2. **Every live start is a deliberate start and gets a new tag.** Live is started by hand
+   (`GO_LIVE_CHECKLIST.md` §5), never under `scripts/run_forever.sh` or docker compose (`docs/RUNBOOK.md` §3–§4: a
+   crash loop on the real account must stop, not retry). That includes the planned switch from half size to full
+   size after 6 h (`GO_LIVE_CHECKLIST.md` §6) and any restart, on the same commit or another. A restart on prior
+   state shows up as a `start` event with `reason: restart`.
 3. **The time range** of a tag runs from its `start` event to the `stop` event of the same process segment, as
-   found in `deliverables/events-*.jsonl`.
+   found in `deliverables/<run>/events-*.jsonl` (for example `deliverables/live/` after
+   `scripts/make_deliverables.py --run-dir logs --name live`).
 4. **Who:** the operator only. The assistant never creates a `live-*` tag and never starts live mode.
 
 Live tags so far:
