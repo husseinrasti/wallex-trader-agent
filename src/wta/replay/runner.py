@@ -1202,9 +1202,9 @@ class _Runner:
         self.kills = sorted({run.tick_index(_ts_of(e) or 0.0) for e in run.events
                              if e.get("kind") == "kill" and (e.get("data") or {}).get("source") == "kill_file"})
         for kind, what in (("reset_kill_applied", "a manual kill reset (wta reset-kill)"),
-                           ("telegram", "Telegram commands")):
+                           ("telegram", "Telegram commands"), ("web", "web dashboard kills")):
             hits = [e for e in run.events if e.get("kind") == kind
-                    or (kind == "telegram" and (e.get("data") or {}).get("source") == "telegram")]
+                    or (kind in ("telegram", "web") and (e.get("data") or {}).get("source") == kind)]
             if hits:
                 self.notes.append(f"The recorded run applied {what} ({len(hits)}x); these are not replayed.")
         if run.mode == "live":

@@ -61,7 +61,7 @@ MAX_NOTES_CHARS = 600  # plan notes, wrapped (about 7 lines in the plan panel)
 TRADE_KINDS = frozenset({"intent", "veto", "order"})  # plan/no_trade/event records are not trades
 NOTABLE_EVENTS = frozenset(
     {
-        "start", "stop", "restart", "pause", "resume", "kill", "reset_kill", "reset_kill_applied",
+        "start", "stop", "restart", "pause", "resume", "kill", "kill_request", "reset_kill", "reset_kill_applied",
         "flatten", "final_state", "tick_error", "day_start", "config_change",
     }
 )

@@ -25,6 +25,7 @@ from wta.config import Config, Settings, load_config
 from wta.data.store import Store
 from wta.data.synthetic import SyntheticFeed, SyntheticParams
 from wta.engine import (
+    KV_KILL_REQUEST,
     KV_KILL_RESET,
     KV_PAPER,
     VETO_REPEAT_S,
@@ -33,6 +34,7 @@ from wta.engine import (
     load_injected_intents,
     parse_injected_line,
     parse_paper_balances,
+    request_kill,
     request_kill_reset,
     run_engine,
 )
@@ -383,6 +385,45 @@ async def test_kill_file_kills_and_heartbeats_continue(tmp_path: Path) -> None:
     record = rig.engine.write_heartbeat(rig.clock.now())
     assert record.killed and "killed: kill file" in record.reasons
     rig.close()
+
+
+async def test_web_kill_request_kills_once_and_a_reset_supersedes_a_pending_one(tmp_path: Path) -> None:
+    rig = await make_rig(tmp_path)
+    await rig.tick()
+
+    def other_process(fn: Callable[[Store, EventsLog, float], Any]) -> Any:  # the web dashboard's own Store
+        store, events = Store(rig.store.path), EventsLog(rig.logs, rig.clock)
+        try:
+            return fn(store, events, rig.clock.now())
+        finally:
+            store.close()
+            events.close()
+
+    other_process(lambda st, ev, now: request_kill(st, ev, "demo of the kill-switch", now))
+    await rig.tick()
+    eng = rig.engine
+    assert eng.flags.killed and eng.flags.kill_reason == "web dashboard kill: demo of the kill-switch"
+    (kill,) = rig.events("kill")
+    assert kill["data"]["source"] == "web"
+    assert [e["reason"] for e in rig.events("kill_request")] == ["demo of the kill-switch"]
+    assert rig.store.kv_get(KV_KILL_REQUEST)["applied"] is True
+    assert rig.store.kv_get(KV_FLAGS)["killed"] is True  # persisted at once, so a reset finds it
+
+    # a second Kill while killed is ignored (and marked applied, so it never fires after the reset)
+    other_process(lambda st, ev, now: request_kill(st, ev, "twice", now))
+    await rig.tick()
+    assert len(rig.events("kill")) == 1 and rig.store.kv_get(KV_KILL_REQUEST)["applied"] is True
+    assert any("already active" in e["reason"] for e in rig.events("operator_command_ignored"))
+
+    # a Kill written but not applied yet is superseded by a reset: the reset never kills again
+    other_process(lambda st, ev, now: request_kill(st, ev, "pending", now))
+    record = other_process(lambda st, ev, now: request_kill_reset(st, ev, "drill over", now))
+    assert record is not None
+    await rig.tick(2)
+    assert not eng.flags.killed and len(rig.events("kill")) == 1
+    assert rig.store.kv_get(KV_KILL_REQUEST)["superseded_by_reset_ts"] is not None
+    rig.close()
+    assert check_logs(rig.logs).ok
 
 
 async def test_exception_storm_kills_but_the_engine_keeps_running(tmp_path: Path) -> None:

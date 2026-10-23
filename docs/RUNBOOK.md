@@ -327,7 +327,10 @@ in order. The flatten runs **only while the engine process runs**. Operator chec
 ```bash
 touch KILL                  # repo root; under compose: docker compose exec agent touch KILL
 ```
-Or Telegram `/kill` (when configured). At the next fast tick (≤ 2 s) the engine persists
+Or Telegram `/kill` (when configured), or the **Kill** button of the web dashboard (`wta web`,
+http://localhost:8080). The button kills only the engine of that dashboard's state DB (kv
+`kill_request`, applied on its next tick, `source: web`); the `KILL` file kills every engine of the
+checkout. At the next fast tick (≤ 2 s) the engine persists
 `killed=true` (committed at once), writes a `kill` event, cancels its entry/rebalance orders and
 flattens every non-TMN balance to TMN (phase 1 rules). The process keeps running: heartbeats continue
 and only exit/stop/flatten SELLs pass the RiskManager. A kill also fires automatically on a drawdown
@@ -340,6 +343,8 @@ rm KILL                                                     # first; reset-kill 
 .venv/bin/python -m wta reset-kill --mode live --log-dir logs --reason "why it is safe to resume"
 .venv/bin/python -m wta reset-kill --mode shadow --log-dir logs/shadow --reason "..."      # paper
 ```
+The web dashboard's **Reset kill** button does the same for its own account (reason required,
+confirm by typing `RESET SHADOW` / `RESET LIVE`; refused while the `KILL` file exists).
 Without `--mode`/`--feed` it resets the account that is killed (it refuses to guess between two).
 It writes a `reset_kill` event into `<log dir>/events.jsonl` (default `logs`: pass the engine's own
 log dir) and a kv record into that account's state DB. A running engine applies it on its next tick

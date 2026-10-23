@@ -290,6 +290,7 @@ STARTUP_BOOKS_POLL_S = 0.2
 
 KV_PAPER = "paper_state"  # PaperExchange.state() of a shadow run
 KV_KILL_RESET = "kill_reset"  # the last manual kill reset (written by ``wta reset-kill``)
+KV_KILL_REQUEST = "kill_request"  # the last manual kill from another process (the web dashboard's Kill)
 KILL_FILE = ROOT / "KILL"  # create it to kill the running engine
 VETO_REPEAT_S = 60.0  # identical vetoes of the same intent are logged at most this often
 FEEDS = ("live", "synthetic")
@@ -696,6 +697,9 @@ def request_kill_reset(store: Store, events_log: EventsLog, reason: str, now: fl
     flags = store.kv_get(KV_FLAGS) or {}
     if not flags.get("killed"):
         return None
+    pending = store.kv_get(KV_KILL_REQUEST)
+    if pending and not pending.get("applied"):  # a kill not applied yet must not kill again after the reset
+        store.kv_set(KV_KILL_REQUEST, {**pending, "applied": True, "superseded_by_reset_ts": now}, now)
     latest = store.latest_equity()
     peak = latest["equity_tmn"] if latest else None
     store.kv_set(KV_FLAGS, {**flags, "killed": False, "kill_reason": ""}, now)
@@ -714,6 +718,22 @@ def request_kill_reset(store: Store, events_log: EventsLog, reason: str, now: fl
     store.add_event(now, "reset_kill", {"reason": reason, **data})
     store.flush()
     events_log.log("reset_kill", reason, data)
+    return record
+
+
+def request_kill(store: Store, events_log: EventsLog, reason: str, now: float, source: str = "web") -> dict[str, Any]:
+    """The web dashboard's Kill: ask the engine of THIS state DB to kill itself on its next tick.
+
+    It writes kv ``kill_request`` (``applied: false``) and a ``kill_request`` event; the running
+    engine kills through the normal path (cancel entries, flatten to TMN, keep monitoring) and marks
+    it applied, like Telegram /kill. Unlike the ``KILL`` file, which kills every engine of the
+    checkout, only this account's engine sees it. An engine that is down applies it at its next start.
+    """
+    record = {"ts": now, "reason": reason, "source": source, "applied": False}
+    store.kv_set(KV_KILL_REQUEST, record, now)
+    store.add_event(now, "kill_request", {"reason": reason, "source": source})
+    store.flush()
+    events_log.log("kill_request", reason, {"source": source})
     return record
 
 
@@ -1419,6 +1439,8 @@ class Engine:
             # first, while nothing of this tick is written yet: the read then takes no write lock
             # for the rest of the tick (``wta reset-kill`` writes the same database)
             await self._poll_kill_reset(now)
+        if self.mode in ("shadow", "live"):  # only a running account has a dashboard that writes this
+            await self._poll_kill_request(now)
         if self._operator_requests:  # Telegram /pause /resume /kill (operational, never a trade)
             await self._apply_operator_requests(now)
         books = self._snapshot()
@@ -1626,6 +1648,24 @@ class Engine:
             return
         if record and not record.get("applied"):
             await self._apply_kill_reset(record, now)
+
+    async def _poll_kill_request(self, now: float) -> None:
+        """Apply a Kill that the web dashboard wrote to the store (``request_kill``)."""
+        try:
+            record = self.store.kv_get(KV_KILL_REQUEST)
+        except Exception:  # noqa: BLE001 - try again next tick
+            log.exception("engine: could not read the kill request")
+            return
+        if not record or record.get("applied"):
+            return
+        why = str(record.get("reason") or "operator request")
+        source = str(record.get("source") or "web")
+        if self.flags.killed:
+            self._event("operator_command_ignored", "web kill: the kill-switch is already active",
+                        {"source": source, "reason": why})
+        else:
+            await self._kill(f"web dashboard kill: {why}", now, source=source)
+        self.store.kv_set(KV_KILL_REQUEST, {**record, "applied": True, "applied_ts": now}, now)
 
     async def _restore_after_kill_reset(self, now: float) -> None:
         """At startup: after a manual reset, the peak is the one kept since the reset.

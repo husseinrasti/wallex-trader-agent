@@ -1,7 +1,7 @@
 """Web dashboard (``python -m wta web``): the terminal dashboard's data in a browser.
 
-Read-only, like ``wta tui``: it never writes a file, never talks to Wallex and cannot place,
-change or cancel an order. Every request re-reads the engine's logs and state DB through the TUI's
+It never talks to Wallex and cannot place, change or cancel an order. Apart from the Kill and
+Reset-kill buttons (below) it only reads. Every request re-reads the engine's logs and state DB through the TUI's
 ``build_snapshot`` (so both dashboards always show the same numbers) and returns JSON; the page
 (``web_static/index.html``, plain HTML/JS, no CDN) polls it every 2 s.
 
@@ -14,6 +14,15 @@ Routes:
 * ``/api/decision/<id>``      one full decision record (intent, all risk checks, order, outcome)
 * ``/api/reports``            the report folders of ``docs/REPORTS`` with their PNGs
 * ``/reports/<path>``         a file of ``docs/REPORTS`` (png, md, csv, json; no path escapes)
+* ``POST /api/control/kill``        Kill button: ``request_kill`` on this dashboard's state DB
+* ``POST /api/control/reset-kill``  Reset-kill button: ``request_kill_reset`` (same as ``wta reset-kill``)
+
+The two POST routes are the only writes. They never place an order themselves: the engine applies
+the request on its next tick (a kill cancels entries and flattens to TMN; a reset lets the
+strategies trade again). There is no route that starts an engine or switches it to live: going
+live stays a terminal command behind its own guards. ``--read-only`` turns the POST routes off.
+Each POST needs the per-process token embedded in the page, a localhost ``Host`` and a same-origin
+``Origin``, so another web page open in the browser cannot trigger them.
 
 It binds to 127.0.0.1 by default; ``--host 0.0.0.0`` is for the Docker service only.
 """
@@ -22,15 +31,17 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import secrets
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 
+from wta import engine as engine_mod
 from wta.config import Config, canonical_json
 from wta.dashboard.tui import (
     DASH,
@@ -55,12 +66,19 @@ from wta.dashboard.tui import (
     s1_diagnostics,
     s1_edges,
 )
+from wta.data.store import Store
+from wta.logging_.decision_log import EventsLog
+from wta.utils.timeutil import SystemClock
 
 ROOT = Path(__file__).resolve().parents[3]
 STATIC = Path(__file__).resolve().parent / "web_static"
 REPORTS_DIR = ROOT / "docs" / "REPORTS"
 SERVED_SUFFIXES = {".png", ".md", ".csv", ".json", ".jsonl", ".txt"}
 EQUITY_POINTS = 400
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+TOKEN_PLACEHOLDER = "__WTA_CONTROL_TOKEN__"
+MAX_POST_BYTES = 4096
+MAX_REASON_CHARS = 300
 
 
 # ---------------------------------------------------------------- the JSON view of one snapshot
@@ -404,12 +422,16 @@ class Dashboard:
     def __init__(self, log_dir: str | Path, state_db: str | Path | None, cfg: Config | None = None,
                  equity_hours: float = 6.0, reports_dir: Path = REPORTS_DIR,
                  clock: Callable[[], float] = time.time,
-                 resolve: Callable[[], tuple[Path, Path | None]] | None = None) -> None:
+                 resolve: Callable[[], tuple[Path, Path | None]] | None = None,
+                 controls: bool = True, secret_values: list[str] | None = None) -> None:
         self.log_dir = Path(log_dir)
         self.state_db = state_db
         # ``resolve`` re-picks (log dir, state DB) on every request, so a page left open follows the
         # engine when it restarts on another feed (``wta web`` without --mode/--feed/--log-dir)
         self.resolve = resolve
+        self.controls = controls
+        self.secret_values = secret_values or []
+        self.token = secrets.token_urlsafe(24)  # embedded in the page; every POST must echo it
         self.settings = DashboardSettings.from_config(cfg) if cfg is not None else DashboardSettings()
         self.equity_hours = equity_hours
         self.reports_dir = reports_dir
@@ -427,13 +449,21 @@ class Dashboard:
         snap = build_snapshot(self.log_dir, self.state_db, now=self.clock(), settings=self.settings)
         with self._lock:
             self._records = {str(r.get("decision_id")): r for r in snap.decisions}
-        return snapshot_view(snap)
+        view = snapshot_view(snap)
+        view["controls"] = {
+            "enabled": self.controls,
+            "state_db": str(self.state_db) if self.state_db else None,
+            "db_found": snap.db_found,
+            "reset_confirm": f"RESET {snap.mode.upper()}",
+        }
+        return view
 
     def handle(self, raw_path: str) -> tuple[int, str, bytes]:
         url = urlparse(raw_path)
         path = url.path
         if path in ("/", "/index.html"):
-            return 200, "text/html; charset=utf-8", (STATIC / "index.html").read_bytes()
+            page = (STATIC / "index.html").read_text(encoding="utf-8").replace(TOKEN_PLACEHOLDER, self.token)
+            return 200, "text/html; charset=utf-8", page.encode()
         if path == "/api/snapshot":
             return self._json(self.snapshot())
         if path == "/api/equity":
@@ -462,8 +492,81 @@ class Dashboard:
         return 404, "text/plain; charset=utf-8", b"not found"
 
     @staticmethod
-    def _json(obj: Any) -> tuple[int, str, bytes]:
-        return 200, "application/json", canonical_json(obj)
+    def _json(obj: Any, status: int = 200) -> tuple[int, str, bytes]:
+        return status, "application/json", canonical_json(obj)
+
+    # ------------------------------------------------------------ the two control routes
+
+    def request_allowed(self, headers: Mapping[str, str]) -> str | None:
+        """Why a POST must be refused (None when it may run): token, localhost Host, same Origin."""
+        headers = {k.lower(): v for k, v in headers.items()}  # HTTP header names are case-insensitive
+        if not self.controls:
+            return "controls are off (wta web --read-only)"
+        if not secrets.compare_digest(headers.get("x-wta-token", ""), self.token):
+            return "missing or wrong control token: reload the page"
+        host = headers.get("host", "")
+        hostname = urlsplit(f"http://{host}").hostname or ""
+        if hostname not in LOCAL_HOSTS:
+            return f"Host {host!r} is not localhost"
+        origin = headers.get("origin")
+        if origin is not None and urlsplit(origin).netloc != host:
+            return f"Origin {origin!r} is not this dashboard"
+        if not headers.get("content-type", "").startswith("application/json"):
+            return "Content-Type must be application/json"
+        return None
+
+    def handle_post(self, raw_path: str, headers: Mapping[str, str], body: bytes) -> tuple[int, str, bytes]:
+        path = urlparse(raw_path).path
+        if path not in ("/api/control/kill", "/api/control/reset-kill"):
+            return self._json({"ok": False, "error": "not found"}, 404)
+        refused = self.request_allowed(headers)
+        if refused:
+            return self._json({"ok": False, "error": refused}, 403)
+        try:
+            data = json.loads(body or b"{}")
+        except ValueError:
+            return self._json({"ok": False, "error": "body is not JSON"}, 400)
+        reason = " ".join(str((data or {}).get("reason") or "").split())[:MAX_REASON_CHARS]
+        if not reason:
+            return self._json({"ok": False, "error": "a reason is required (it is logged for the judges)"}, 400)
+        self._refresh_paths()
+        if not self.state_db or not Path(self.state_db).is_file():
+            return self._json({"ok": False, "error": f"no engine state database at {self.state_db}"}, 409)
+        if path == "/api/control/kill":
+            return self._kill(reason)
+        return self._reset_kill(reason, str(data.get("confirm") or ""))
+
+    def _write(self, fn: Callable[[Store, EventsLog, float], Any]) -> Any:
+        clock = SystemClock()
+        events = EventsLog(self.log_dir, clock, self.secret_values)
+        store = Store(self.state_db)
+        try:
+            return fn(store, events, clock.now())
+        finally:
+            store.close()
+            events.close()
+
+    def _kill(self, reason: str) -> tuple[int, str, bytes]:
+        with self._lock:
+            self._write(lambda store, events, now: engine_mod.request_kill(store, events, reason, now))
+        return self._json({"ok": True, "message": "kill requested: the engine cancels its entries and flattens "
+                           "to TMN on its next tick (a stopped engine does it at its next start)"})
+
+    def _reset_kill(self, reason: str, confirm: str) -> tuple[int, str, bytes]:
+        snap = build_snapshot(self.log_dir, self.state_db, now=self.clock(), settings=self.settings)
+        expected = f"RESET {snap.mode.upper()}"
+        if confirm.strip() != expected:
+            return self._json({"ok": False, "error": f"type {expected} to confirm"}, 400)
+        if engine_mod.KILL_FILE.exists():
+            return self._json({"ok": False, "error": f"the kill file {engine_mod.KILL_FILE} is present: remove it "
+                               "first, or the engine kills again at once"}, 409)
+        with self._lock:
+            record = self._write(lambda store, events, now: engine_mod.request_kill_reset(store, events, reason, now))
+        if record is None:
+            return self._json({"ok": False, "error": "the kill-switch is not active: nothing to reset"}, 409)
+        return self._json({"ok": True, "message": "kill-switch reset requested: the engine applies it on its next "
+                           "tick; drawdown is measured from the latest equity",
+                           "previous_kill_reason": record.get("previous_kill_reason") or ""})
 
 
 def make_handler(dashboard: Dashboard) -> type[BaseHTTPRequestHandler]:
@@ -483,6 +586,26 @@ def make_handler(dashboard: Dashboard) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def do_POST(self) -> None:  # noqa: N802 - http.server API
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > MAX_POST_BYTES:
+                    status, ctype, body = dashboard._json({"ok": False, "error": "body too large"}, 413)
+                else:
+                    raw = self.rfile.read(length) if length > 0 else b""
+                    status, ctype, body = dashboard.handle_post(self.path, dict(self.headers.items()), raw)
+                    if status == 200:
+                        print(f"web dashboard: {self.path} accepted", flush=True)
+            except Exception as exc:  # noqa: BLE001 - answer, never drop the connection
+                status, ctype = 500, "application/json"
+                body = json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
         def log_message(self, fmt: str, *args: Any) -> None:  # quiet: one line per request is noise
             return None
 
@@ -492,7 +615,8 @@ def make_handler(dashboard: Dashboard) -> type[BaseHTTPRequestHandler]:
 def serve(dashboard: Dashboard, host: str = "127.0.0.1", port: int = 8080) -> None:
     server = ThreadingHTTPServer((host, port), make_handler(dashboard))
     shown = "localhost" if host in ("0.0.0.0", "127.0.0.1") else host
-    print(f"web dashboard: http://{shown}:{port}  (read-only; logs {dashboard.log_dir}, state DB "
+    access = "Kill / Reset-kill buttons on" if dashboard.controls else "read-only"
+    print(f"web dashboard: http://{shown}:{port}  ({access}; logs {dashboard.log_dir}, state DB "
           f"{dashboard.state_db or '-'}; Ctrl-C stops)", flush=True)
     try:
         server.serve_forever()
