@@ -12,7 +12,7 @@ REPLAY_ARGS   ?= --decisions logs/decisions.jsonl --reports-dir logs --no-index
 REPLAY_REPORT_ARGS ?= --decisions logs/decisions.jsonl
 DELIVER_RUN   ?= logs/shadow_synth_4h
 
-.PHONY: smoke-real smoke-real-quick install test lint record survey shadow shadow-synth live backtest backtest-books backtest-synth backtest-cache market-db replay replay-report replay-deliverable deliverables final-report report export flatten flatten-live status tui ps docker
+.PHONY: smoke-real smoke-real-quick install test lint record survey shadow shadow-synth live backtest backtest-books backtest-synth backtest-cache market-db replay replay-report replay-deliverable deliverables final-report report export flatten flatten-live status tui web ps docker
 
 install:
 	$(PYTHON) -m venv $(VENV) && $(VENV)/bin/pip install -U pip && $(VENV)/bin/pip install -e ".[dev]"
@@ -85,6 +85,9 @@ status:
 
 tui:
 	$(PY) -m wta tui
+
+web:
+	$(PY) -m wta web
 
 ps:
 	bash scripts/ps.sh

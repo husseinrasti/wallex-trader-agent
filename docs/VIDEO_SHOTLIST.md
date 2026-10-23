@@ -21,9 +21,9 @@ Related: [`scripts/demo.sh`](../scripts/demo.sh) (the helper), [`deliverables/VI
 | before | 0 Preparation | not recorded: preflight, three background jobs | `--scene 0` (0.1–0.5) |
 | 0:00–0:40 | 1 Problem & approach | slide: capital, 3 days, TMN valuation, fees, thesis, three layers | 1.1 |
 | 0:40–1:40 | 2 Architecture | the diagram from `ARCHITECTURE.md`; `python -m wta --help` | 2.1, 2.2 |
-| 1:40–3:00 | 3 Live dashboard | `wta tui` on the running synthetic shadow; one frame of the 4-h run; its last plan; one `decisions.jsonl` line, field by field | 3.1–3.4 |
+| 1:40–3:00 | 3 Live dashboard | `wta tui` on the running synthetic shadow (or the web dashboard `wta web`, http://localhost:8080, on the real-feed shadow of `docker compose up -d recorder agent web`: click a decision row for its 23 risk checks); one frame of the 4-h run; its last plan; one `decisions.jsonl` line, field by field | 3.1–3.4 |
 | 3:00–3:40 | 4 Risk in action | a FEE_BUDGET veto; the kill-switch drill (shock, kill, flatten); the KILLED veto; `wta reset-kill` | 4.1–4.4 |
-| 3:40–4:30 | 5 Evidence | results table; survey chart; backtest equity and ablation tables; shadow PNGs; walk-forward table; "no live curve yet" | 5.1–5.6 |
+| 3:40–4:30 | 5 Evidence | results table; survey chart; backtest equity and ablation tables; shadow PNGs; walk-forward table; "no live curve yet" (the web dashboard's Evidence tab shows the same reports and charts) | 5.1–5.6 |
 | 4:30–4:50 | 6 Reproducibility | `make replay-deliverable`: "40/40 decisions reproduced"; git tag ↔ decision-log commit; final balance | 6.1–6.3 |
 | 4:50–5:00 | 7 Wrap-up | closing card; stop the background jobs | 7.1, 7.2 |
 

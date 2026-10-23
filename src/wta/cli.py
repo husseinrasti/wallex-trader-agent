@@ -750,6 +750,19 @@ def cmd_tui(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
     return tui.run(log_dir, state_db, refresh_s=args.refresh, once=args.once, cfg=cfg, console=console)
 
 
+def cmd_web(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
+    from wta.dashboard import web
+
+    def resolve() -> tuple[Path, Path | None]:
+        log_dir, _mode, _feed, state_db = _ops_paths(args, cfg)
+        return log_dir, state_db
+
+    log_dir, state_db = resolve()
+    dashboard = web.Dashboard(log_dir, state_db, cfg=cfg, equity_hours=args.equity_hours, resolve=resolve)
+    web.serve(dashboard, host=args.host, port=args.port)
+    return 0
+
+
 def cmd_plan(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
     """One analyst cycle (``engine.plan_once``); prints ``{"plan", "analyst", "ai_source", ...}``."""
     cfg, settings = apply_ai_choice(getattr(args, "ai", None), cfg, settings)
@@ -1205,6 +1218,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--refresh", type=float, default=2.0, help="seconds between refreshes (default 2)")
     p.add_argument("--once", action="store_true", help="print one frame and exit")
     p.add_argument("--width", type=int, default=None, help="screen width (default: the terminal's; 200 fits all)")
+
+    p = add("web", cmd_web, "web dashboard on http://localhost:8080 (read-only, separate process)")
+    ops_options(p)
+    p.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1; 0.0.0.0 inside Docker)")
+    p.add_argument("--port", type=int, default=8080, help="port (default 8080)")
+    p.add_argument("--equity-hours", type=float, default=6.0, help="hours of equity history in the chart (default 6)")
 
     p = add("plan", cmd_plan, "ONE analyst cycle on the shadow account's data; prints the plan JSON")
     p.add_argument("--mode", choices=("shadow",), default="shadow", help="shadow only (nothing is traded)")

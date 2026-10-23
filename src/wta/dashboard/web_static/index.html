@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallex Trader Agent</title>
+<style>
+:root {
+  --bg: #0b0f17; --panel: #121826; --panel2: #172033; --line: #243049; --text: #e6ebf5; --dim: #8b97b0;
+  --good: #22c55e; --bad: #ef4444; --warn: #f59e0b; --info: #38bdf8; --accent: #a78bfa;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+header { position: sticky; top: 0; z-index: 5; background: linear-gradient(180deg, #0e1422, #0b0f17); border-bottom: 1px solid var(--line); padding: 10px 20px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+header h1 { font-size: 17px; margin: 0; letter-spacing: .3px; }
+header h1 span { color: var(--accent); }
+.badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--line); background: var(--panel2); white-space: nowrap; }
+.badge.good { color: #0b0f17; background: var(--good); border-color: var(--good); }
+.badge.bad { color: #fff; background: var(--bad); border-color: var(--bad); }
+.badge.warn { color: #0b0f17; background: var(--warn); border-color: var(--warn); }
+.badge.info { color: #0b0f17; background: var(--info); border-color: var(--info); }
+.meta { color: var(--dim); font-size: 12px; font-family: var(--mono); }
+nav { margin-left: auto; display: flex; gap: 6px; }
+nav button { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 6px 14px; cursor: pointer; font-weight: 600; }
+nav button.active { background: var(--accent); color: #0b0f17; border-color: var(--accent); }
+.banner { background: repeating-linear-gradient(45deg, #3b2a05, #3b2a05 12px, #4a3506 12px, #4a3506 24px); color: #fde68a; text-align: center; font-weight: 700; padding: 6px; letter-spacing: .5px; }
+.banner.kill { background: #7f1d1d; color: #fff; }
+main { padding: 16px 20px 40px; }
+.grid { display: grid; gap: 14px; }
+.g3 { grid-template-columns: 340px 1fr 300px; }
+.g2 { grid-template-columns: 1.25fr 1fr; }
+@media (max-width: 1200px) { .g3, .g2 { grid-template-columns: 1fr; } }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; min-width: 0; }
+.card h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); display: flex; align-items: center; gap: 8px; }
+.big { font-size: 30px; font-weight: 700; font-family: var(--mono); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; font-size: 13px; }
+.kv .k { color: var(--dim); }
+.kv .v { font-family: var(--mono); text-align: right; }
+.bar { height: 6px; background: var(--panel2); border-radius: 4px; overflow: hidden; margin-top: 3px; }
+.bar > i { display: block; height: 100%; background: var(--info); }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th { text-align: left; color: var(--dim); font-weight: 600; border-bottom: 1px solid var(--line); padding: 5px 6px; white-space: nowrap; }
+td { padding: 4px 6px; border-bottom: 1px solid #1a2336; font-family: var(--mono); white-space: nowrap; }
+td.text { font-family: inherit; white-space: normal; }
+td.r, th.r { text-align: right; }
+tr.click { cursor: pointer; }
+tr.click:hover td { background: #1b2540; }
+.good { color: var(--good); } .bad { color: var(--bad); } .warn { color: var(--warn); } .info { color: var(--info); } .dim { color: var(--dim); }
+.hit { background: rgba(34,197,94,.18); color: var(--good); font-weight: 700; border-radius: 4px; }
+.reason { max-width: 640px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: inherit; }
+.notes { font-style: italic; color: #cfd8ea; border-left: 3px solid var(--accent); padding: 6px 10px; margin-top: 10px; background: var(--panel2); border-radius: 0 8px 8px 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.chip { border: 1px solid var(--line); background: var(--panel2); border-radius: 8px; padding: 4px 8px; font-size: 12px; }
+.chip b { font-family: var(--mono); }
+.trend_up { color: var(--good); } .trend_down { color: var(--bad); } .range { color: var(--info); } .chaos { color: #e879f9; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 6px; background: var(--dim); }
+.dot.ok { background: var(--good); box-shadow: 0 0 8px var(--good); } .dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); }
+.list { margin: 6px 0 0; padding: 0; list-style: none; font-size: 12px; }
+.list li { padding: 3px 0; border-bottom: 1px dashed #1f2a40; }
+svg.chart { display: block; max-width: 100%; }
+.empty { color: var(--dim); font-style: italic; padding: 8px 0; }
+#modal { position: fixed; inset: 0; background: rgba(3,6,12,.75); display: none; align-items: flex-start; justify-content: center; z-index: 20; overflow: auto; padding: 40px 16px; }
+#modal .box { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; width: min(1100px, 100%); padding: 18px 22px; }
+#modal .close { float: right; cursor: pointer; background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 4px 12px; }
+pre { background: #0a0e16; border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow: auto; font-size: 12px; max-height: 360px; }
+.reports { display: grid; grid-template-columns: 300px 1fr; gap: 14px; }
+.reports .item { padding: 8px 10px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
+.reports .item:hover, .reports .item.sel { background: var(--panel2); border-color: var(--line); }
+.md h1, .md h2, .md h3 { color: var(--text); text-transform: none; letter-spacing: 0; }
+.md h1 { font-size: 20px; } .md h2 { font-size: 16px; margin-top: 18px; } .md h3 { font-size: 14px; }
+.md table { margin: 8px 0 14px; } .md td { white-space: normal; font-family: inherit; }
+.md code { font-family: var(--mono); background: var(--panel2); padding: 1px 4px; border-radius: 4px; }
+.md img { max-width: 100%; border-radius: 8px; border: 1px solid var(--line); background: #fff; }
+.md blockquote { border-left: 3px solid var(--warn); margin: 8px 0; padding: 4px 12px; color: #fde68a; }
+.pngs { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; margin: 10px 0 18px; }
+.pngs figure { margin: 0; } .pngs img { width: 100%; border-radius: 8px; background: #fff; }
+.pngs figcaption { color: var(--dim); font-size: 12px; font-family: var(--mono); }
+</style>
+</head>
+<body>
+<header>
+  <h1>WALLEX <span>TRADER AGENT</span></h1>
+  <div id="hdr-badges"></div>
+  <div class="meta" id="hdr-meta"></div>
+  <nav><button id="tab-live" class="active">Live</button><button id="tab-evidence">Evidence</button></nav>
+</header>
+<div id="banner"></div>
+
+<main id="view-live">
+  <div class="grid g3">
+    <section class="card" id="equity"></section>
+    <section class="card"><h2>Equity (TMN) <span class="meta" id="eq-range"></span></h2><div id="chart"></div></section>
+    <section class="card" id="health"></section>
+  </div>
+  <div class="grid g2" style="margin-top:14px">
+    <section class="card"><h2>Markets <span class="meta">live order books · best bid / ask</span></h2><div id="books"></div></section>
+    <section class="card"><h2>S1 CrossBook <span class="meta">edge / need in %, need = fees + margin</span></h2><div id="edges"></div></section>
+  </div>
+  <div class="grid g2" style="margin-top:14px">
+    <section class="card" id="plan"></section>
+    <section class="card" id="positions"></section>
+  </div>
+  <section class="card" style="margin-top:14px"><h2>Last decisions <span class="meta">every intent passes 23 risk checks · click a row</span></h2><div id="decisions"></div></section>
+</main>
+
+<main id="view-evidence" style="display:none">
+  <div class="reports">
+    <section class="card"><h2>Reports</h2><div id="report-list"></div></section>
+    <section class="card md" id="report-view"><div class="empty">Pick a report on the left.</div></section>
+  </div>
+</main>
+
+<div id="modal"><div class="box"><button class="close" onclick="closeModal()">Close</button><div id="modal-body"></div></div></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const cls = (level) => level === "good" ? "good" : level === "bad" ? "bad" : level === "warn" ? "warn" : level === "info" ? "info" : "";
+const signed = (v) => v == null ? "" : v > 0 ? "good" : v < 0 ? "bad" : "";
+let lastSnap = null;
+
+function badge(text, level) { return `<span class="badge ${level || ""}">${esc(text)}</span>`; }
+function dot(state) { return `<span class="dot ${state === "ok" ? "ok" : state === "bad" ? "bad" : state === "warn" ? "warn" : ""}"></span>`; }
+function bar(frac, color) { const w = Math.max(0, Math.min(1, frac || 0)) * 100; return `<div class="bar"><i style="width:${w}%;background:${color}"></i></div>`; }
+
+function renderHeader(h) {
+  let b = badge(h.mode.toUpperCase(), "info") + " " + badge("feed " + h.feed, h.synthetic ? "warn" : "good") + " ";
+  b += h.killed ? badge("KILLED", "bad") : h.paused ? badge("PAUSED", "warn") : h.stopped ? badge("STOPPED", "") : h.running ? badge("RUNNING", "good") : badge("STALE", "warn");
+  if (h.ai_source) b += " " + badge("AI " + h.ai_source, h.ai_source === "llm" ? "good" : h.ai_source === "offline-rules" ? "warn" : "");
+  $("hdr-badges").innerHTML = b;
+  $("hdr-meta").innerHTML = `commit ${esc(h.commit)}${h.dirty ? " (dirty)" : ""}${h.tag ? " · " + esc(h.tag) : ""} · config ${esc(h.config)} · markets ${esc(h.markets || "?")} · deadline ${esc(h.deadline)} · flatten ${esc(h.flatten)}`;
+  let ban = "";
+  if (h.synthetic) ban += `<div class="banner">⚠ ${esc(h.banner)} — an offline exercise; nothing here is evidence of performance ⚠</div>`;
+  if (h.killed) ban += `<div class="banner kill">KILL-SWITCH ACTIVE — ${esc(h.kill_reason)} — only flatten / exit / stop orders are allowed</div>`;
+  else if (h.paused) ban += `<div class="banner">PAUSED — ${esc(h.pause_reason)} — no new entries</div>`;
+  $("banner").innerHTML = ban;
+}
+
+function renderEquity(e) {
+  const dd = e.drawdown_value || 0, kill = parseFloat(e.kill_at) / 100 || 0.05;
+  const fees = e.fees_used_value || 0;
+  $("equity").innerHTML = `<h2>Account</h2>
+    <div class="big">${e.equity ? esc(e.equity) : "—"} <span class="dim" style="font-size:14px">TMN</span></div>
+    <div class="${signed(e.return_value)}" style="font-family:var(--mono);margin-bottom:10px">${esc(e.return)} vs ${esc(e.initial)}</div>
+    <div class="kv">
+      <div class="k">Peak</div><div class="v">${esc(e.peak)}</div>
+      <div class="k">Drawdown</div><div class="v ${cls(e.drawdown_level)}">${esc(e.drawdown)} <span class="dim">kill at ${esc(e.kill_at)}</span>${bar(dd / kill, dd / kill > .6 ? "var(--bad)" : dd / kill > .3 ? "var(--warn)" : "var(--good)")}</div>
+      <div class="k">Daily PnL</div><div class="v ${signed(e.daily_value)}">${esc(e.daily)} <span class="dim">pause at ${esc(e.pause_at)}</span></div>
+      <div class="k">Realized</div><div class="v ${signed(e.realized_value)}">${esc(e.realized)}</div>
+      <div class="k">Fees / budget</div><div class="v">${esc(e.fees)} <span class="dim">${esc(e.fees_used)}</span>${bar(fees, fees > .8 ? "var(--bad)" : fees > .5 ? "var(--warn)" : "var(--info)")}</div>
+      <div class="k">USDT share</div><div class="v">${esc(e.usdt_share)}${e.usdt_target ? ` <span class="dim">target ${esc(e.usdt_target)}</span>` : ""}</div>
+      <div class="k">Coin exposure</div><div class="v">${esc(e.coin_exposure)} <span class="dim">cap ${esc(e.coin_cap)}</span></div>
+      <div class="k">Orders today</div><div class="v">${esc(e.orders_today)}</div>
+    </div>`;
+}
+
+function renderHealth(h) {
+  const row = (k, state, text) => `<div class="k">${k}</div><div class="v">${dot(state)}${esc(text)}</div>`;
+  let html = `<h2>Health</h2><div class="kv">
+    <div class="k">Heartbeat</div><div class="v ${h.heartbeat_stale ? "bad" : ""}">${esc(h.heartbeat)}</div>
+    ${row("REST", h.rest, h.rest)}${row("WebSocket", h.ws, h.ws)}${row("LLM", h.llm.state, h.llm.text)}${row("MCP", h.mcp, h.mcp)}
+    <div class="k">API errors 1m</div><div class="v ${h.api_errors ? "bad" : ""}">${h.api_errors ?? "—"}</div>
+    <div class="k">Restarts</div><div class="v">${h.restarts}</div>
+    <div class="k">Crashes</div><div class="v">${esc(h.crashes)}</div></div>`;
+  const items = h.reasons.map((r) => `<li class="${/^(killed|api|rest|ws)/.test(r) ? "bad" : "warn"}">• ${esc(r)}</li>`)
+    .concat(h.events.map((e) => `<li class="dim">${esc(e.time)} ${esc(e.kind)}: ${esc(e.reason)}</li>`))
+    .concat(h.problems.map((p) => `<li class="warn">! ${esc(p)}</li>`));
+  html += items.length ? `<ul class="list">${items.join("")}</ul>` : `<ul class="list"><li class="good">no warnings</li></ul>`;
+  $("health").innerHTML = html;
+}
+
+function renderMarkets(m) {
+  if (!m.books.length) { $("books").innerHTML = `<div class="empty">no books yet</div>`; }
+  else {
+    $("books").innerHTML = `<table><tr><th>Market</th><th class="r">Bid</th><th class="r">Ask</th><th class="r">Spread</th><th class="r">Age</th></tr>` +
+      m.books.map((b) => b.bid == null ? `<tr><td>${esc(b.symbol)}</td><td class="r dim">—</td><td class="r dim">—</td><td class="r dim">—</td><td class="r bad">no book</td></tr>` :
+        `<tr><td><b>${esc(b.symbol)}</b></td><td class="r good">${esc(b.bid)}</td><td class="r bad">${esc(b.ask)}</td><td class="r">${esc(b.spread)}</td><td class="r ${b.age_s > 30 ? "bad" : b.age_s > 10 ? "warn" : "dim"}">${esc(b.age)}</td></tr>`).join("") + `</table>`;
+  }
+  const cell = (v, need, hit) => v == null ? `<td class="r dim">—</td>` : `<td class="r ${hit ? "hit" : v > 0 ? "" : "dim"}">${v > 0 ? "+" : ""}${v.toFixed(3)} / ${need == null ? "—" : need.toFixed(3)}</td>`;
+  let html = m.edges.length ? `<table><tr><th>Coin</th><th class="r">TMN book cheap</th><th class="r">USDT book cheap</th><th>State</th></tr>` +
+    m.edges.map((r) => `<tr><td><b>${esc(r.coin)}</b></td>${cell(r.tmn_cheap, r.tmn_need, r.tmn_hit)}${cell(r.usdt_cheap, r.usdt_need, r.usdt_hit)}<td class="${r.status.includes("▶") ? "good" : "dim"}">${esc(r.status)}</td></tr>`).join("") + `</table>` :
+    `<div class="empty">no S1 diagnostics yet</div>`;
+  html += `<div class="meta" style="margin-top:8px">${m.edges_estimated ? "estimated from the books (no S1 diagnostics yet)" : "from the S1 diagnostics of the last heartbeat"} · green = edge ≥ need → lock-in</div>`;
+  if (m.s1_status) html += `<div class="warn" style="margin-top:4px;font-size:12px">S1: ${esc(m.s1_status)}</div>`;
+  $("edges").innerHTML = html;
+}
+
+function renderPlan(p) {
+  if (!p) { $("plan").innerHTML = `<h2>AI plan</h2><div class="warn"><b>rules-only</b></div><div class="empty">no plan yet: every strategy runs on its rules-only defaults</div>`; return; }
+  const model = p.offline ? badge("offline rules — not an LLM", "warn") : badge(p.model || "LLM", "good");
+  let html = `<h2>AI plan (Regime Analyst) ${model} ${p.cached ? badge("cached", "info") : ""} ${p.tools_source && p.tools_source !== "none" ? badge("tools " + p.tools_source, "") : ""} <span class="meta">age ${esc(p.age)}</span></h2>`;
+  html += `<div class="kv" style="grid-template-columns:repeat(4,auto 1fr)">
+    <div class="k">Enabled</div><div class="v">${p.enabled.length ? esc(p.enabled.join(" ")) : '<span class="bad">none</span>'}</div>
+    <div class="k">Size</div><div class="v">×${esc(p.size_multiplier)}</div>
+    <div class="k">USDT target</div><div class="v">${esc(p.usdt_target)}</div>
+    <div class="k">S1 margin ≥</div><div class="v">${esc(p.s1_margin)}</div></div>`;
+  html += `<div class="chips">` + p.regimes.map((r) => `<span class="chip" title="${esc(r.evidence)}"><b>${esc(r.symbol)}</b> <span class="${esc(r.regime)}">${esc(r.regime)}</span> ${r.confidence == null ? "" : r.confidence.toFixed(2)}</span>`).join("") + `</div>`;
+  if (p.risk_flags.length) html += `<div class="bad" style="margin-top:8px;font-size:12px">Risk flags: ${esc(p.risk_flags.join(", "))}</div>`;
+  if (p.clamped.length) html += `<div class="warn" style="font-size:12px">Clamped to bounds: ${esc(p.clamped.join(", "))}</div>`;
+  if (p.notes) html += `<div class="notes">${esc(p.notes)}</div>`;
+  html += `<div class="meta" style="margin-top:6px">plans are bounded envelopes: they never place orders; every value is clamped and every order still passes the RiskManager</div>`;
+  $("plan").innerHTML = html;
+}
+
+function renderPositions(p) {
+  let html = `<h2>Positions & open orders</h2>`;
+  if (!p.db_found) { $("positions").innerHTML = html + `<div class="empty">state DB not available</div>`; return; }
+  html += p.positions.length ? `<table><tr><th>Strat</th><th>Symbol</th><th class="r">Qty</th><th class="r">Entry</th><th class="r">Now</th><th class="r">uPnL</th><th class="r">Stop</th><th class="r">Held</th></tr>` +
+    p.positions.map((x) => `<tr><td>${esc(x.strategy)}</td><td>${esc(x.symbol)}</td><td class="r">${esc(x.qty)}</td><td class="r">${esc(x.entry)}</td><td class="r">${esc(x.now)}</td><td class="r ${signed(x.upnl_value)}">${esc(x.upnl)}</td><td class="r">${esc(x.stop)}</td><td class="r">${esc(x.held)}</td></tr>`).join("") + `</table>` :
+    `<div class="empty">No open positions</div>`;
+  html += p.orders.length ? `<table style="margin-top:8px"><tr><th>Strat</th><th>Symbol</th><th>Side</th><th>Type</th><th>Purpose</th><th class="r">Filled/Qty</th><th class="r">Price</th><th>Status</th><th class="r">Age</th></tr>` +
+    p.orders.map((o) => `<tr><td>${esc(o.strategy)}</td><td>${esc(o.symbol)}</td><td class="${o.side === "BUY" ? "good" : "bad"}">${esc(o.side)}</td><td>${esc(o.type)}</td><td>${esc(o.purpose)}</td><td class="r">${esc(o.filled)}</td><td class="r">${esc(o.price)}</td><td>${esc(o.status)}</td><td class="r">${esc(o.age)}</td></tr>`).join("") + `</table>` :
+    `<div class="empty">No open orders</div>`;
+  $("positions").innerHTML = html;
+}
+
+function renderDecisions(rows) {
+  if (!rows.length) { $("decisions").innerHTML = `<div class="empty">no trade decisions logged yet</div>`; return; }
+  $("decisions").innerHTML = `<table><tr><th>Time</th><th>Kind</th><th>Strat</th><th>Symbol</th><th>Side</th><th class="r">Qty</th><th>Risk</th><th>Reason</th><th>Outcome</th></tr>` +
+    rows.map((d) => {
+      const risk = d.risk.approved === true ? `<span class="good">✓ ${d.risk.n_checks} checks</span>` : d.risk.approved === false ? `<span class="bad">✗ ${esc(d.risk.failed.join(",") || "veto")}</span>` : `<span class="dim">—</span>`;
+      return `<tr class="click" data-id="${esc(d.id)}"><td class="dim">${esc(d.time)}</td><td>${esc(d.kind)}</td><td><b>${esc(d.strategy)}</b></td><td>${esc(d.symbol)}</td><td class="${d.side === "BUY" ? "good" : d.side === "SELL" ? "bad" : ""}">${esc(d.side)}</td><td class="r">${esc(d.qty)}</td><td>${risk}</td><td class="reason" title="${esc(d.reason)}">${esc(d.reason)}</td><td class="${cls(d.outcome.level)}">${esc(d.outcome.text)}</td></tr>`;
+    }).join("") + `</table>`;
+  document.querySelectorAll("tr.click").forEach((tr) => tr.onclick = () => openDecision(tr.dataset.id));
+}
+
+async function openDecision(id) {
+  const r = await fetch("/api/decision/" + encodeURIComponent(id)); if (!r.ok) return;
+  const d = await r.json(); const intent = d.intent || {}; const risk = d.risk || {}; const checks = risk.checks || [];
+  let html = `<h2 style="margin-top:0">${esc(d.kind)} · ${esc(d.strategy)} · ${esc(d.symbol)} <span class="meta">${esc(d.decision_id)}</span></h2>`;
+  html += `<div class="meta">${esc(d.ts)} · mode ${esc(d.mode)} · commit ${esc((d.git_commit || "").slice(0, 12))} · config ${esc(d.config_hash)}</div>`;
+  if (intent.reason) html += `<div class="notes" style="font-style:normal">${esc(intent.reason)}</div>`;
+  html += `<h3>Risk: ${risk.approved ? '<span class="good">approved</span>' : '<span class="bad">vetoed</span>'} ${risk.adjusted_qty ? `<span class="meta">adjusted qty ${esc(risk.adjusted_qty)}</span>` : ""}</h3>`;
+  html += `<table><tr><th>#</th><th>Check</th><th>Result</th><th>Detail</th></tr>` + checks.map((c, i) => `<tr><td class="dim">${i + 1}</td><td><b>${esc(c.code)}</b></td><td class="${c.passed ? "good" : "bad"}">${c.passed ? "pass" : "FAIL"}</td><td class="text">${esc(c.detail)}</td></tr>`).join("") + `</table>`;
+  if (d.order) html += `<h3>Order</h3><pre>${esc(JSON.stringify(d.order, null, 2))}</pre>`;
+  if (d.outcome) html += `<h3>Outcome</h3><pre>${esc(JSON.stringify(d.outcome, null, 2))}</pre>`;
+  html += `<h3>Full record (one line of decisions.jsonl)</h3><pre>${esc(JSON.stringify(d, null, 2))}</pre>`;
+  $("modal-body").innerHTML = html; $("modal").style.display = "flex";
+}
+function closeModal() { $("modal").style.display = "none"; }
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
+
+function renderChart(points) {
+  if (!points.length) { $("chart").innerHTML = `<div class="empty">no equity rows yet</div>`; $("eq-range").textContent = ""; return; }
+  const W = Math.max(320, $("chart").clientWidth || 900), H = 210, P = 74;
+  const xs = points.map((p) => p[0]), ys = points.map((p) => p[1]);
+  let x0 = Math.min(...xs), x1 = Math.max(...xs); if (x1 === x0) x1 = x0 + 1;
+  let y0 = Math.min(...ys), y1 = Math.max(...ys); const pad = Math.max((y1 - y0) * .15, y1 * .0005); y0 -= pad; y1 += pad;
+  const X = (x) => P + (x - x0) / (x1 - x0) * (W - P - 8), Y = (y) => 8 + (1 - (y - y0) / (y1 - y0)) * (H - 30);
+  const path = points.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join("");
+  const area = path + `L${X(x1).toFixed(1)},${H - 22}L${X(x0).toFixed(1)},${H - 22}Z`;
+  const fmt = (v) => Math.round(v).toLocaleString("en-US"), t = (s) => new Date(s * 1000).toISOString().slice(11, 16);
+  const last = ys[ys.length - 1], up = last >= ys[0];
+  let grid = ""; for (let i = 0; i <= 3; i++) { const v = y0 + (y1 - y0) * i / 3; grid += `<line x1="${P}" x2="${W - 8}" y1="${Y(v)}" y2="${Y(v)}" stroke="#1f2a40"/><text x="${P - 6}" y="${Y(v) + 4}" fill="#8b97b0" font-size="10" text-anchor="end">${fmt(v)}</text>`; }
+  $("chart").innerHTML = `<svg class="chart" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">${grid}
+    <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${up ? "#22c55e" : "#ef4444"}" stop-opacity=".35"/><stop offset="1" stop-color="${up ? "#22c55e" : "#ef4444"}" stop-opacity="0"/></linearGradient></defs>
+    <path d="${area}" fill="url(#g)"/><path d="${path}" fill="none" stroke="${up ? "#22c55e" : "#ef4444"}" stroke-width="2"/>
+    <text x="${P}" y="${H - 6}" fill="#8b97b0" font-size="10">${t(x0)} UTC</text><text x="${W - 8}" y="${H - 6}" fill="#8b97b0" font-size="10" text-anchor="end">${t(x1)} UTC · last ${fmt(last)}</text></svg>`;
+  $("eq-range").textContent = `${points.length} points`;
+}
+
+async function refresh() {
+  try {
+    const s = await (await fetch("/api/snapshot")).json(); lastSnap = s;
+    renderHeader(s.header); renderEquity(s.equity); renderHealth(s.health); renderMarkets(s.markets);
+    renderPlan(s.plan); renderPositions(s.positions); renderDecisions(s.decisions);
+  } catch (e) { $("banner").innerHTML = `<div class="banner kill">dashboard server unreachable: ${esc(e)}</div>`; }
+}
+let lastPoints = [];
+async function refreshChart() { try { lastPoints = (await (await fetch("/api/equity")).json()).points; renderChart(lastPoints); } catch (e) {} }
+window.addEventListener("resize", () => renderChart(lastPoints));
+
+// ---------------------------------------------------------------- evidence tab
+function md(text, base) {
+  const inline = (s) => esc(s).replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (m, a, src) => `<img alt="${a}" src="${/^https?:/.test(src) ? src : "/reports/" + base + src}">`)
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, a, href) => /^https?:/.test(href) ? `<a href="${href}" target="_blank">${a}</a>` : a)
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>");
+  const lines = text.split("\n"); let out = "", i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    if (l.startsWith("```")) { let code = ""; i++; while (i < lines.length && !lines[i].startsWith("```")) code += lines[i++] + "\n"; i++; out += `<pre>${esc(code)}</pre>`; continue; }
+    if (/^\|/.test(l) && i + 1 < lines.length && /^\|[\s:-]+\|/.test(lines[i + 1])) {
+      const cells = (r) => r.replace(/^\||\|$/g, "").split(/(?<!\\)\|/).map((c) => c.trim());
+      out += "<table><tr>" + cells(l).map((c) => `<th>${inline(c)}</th>`).join("") + "</tr>"; i += 2;
+      while (i < lines.length && /^\|/.test(lines[i])) out += "<tr>" + cells(lines[i++]).map((c) => `<td>${inline(c)}</td>`).join("") + "</tr>";
+      out += "</table>"; continue;
+    }
+    const h = l.match(/^(#{1,4})\s+(.*)/); if (h) { out += `<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`; i++; continue; }
+    if (/^>\s?/.test(l)) { let q = ""; while (i < lines.length && /^>\s?/.test(lines[i])) q += lines[i++].replace(/^>\s?/, "") + " "; out += `<blockquote>${inline(q)}</blockquote>`; continue; }
+    if (/^\s*([-*]|\d+\.)\s+/.test(l)) { out += "<ul>"; while (i < lines.length && /^\s*([-*]|\d+\.)\s+/.test(lines[i])) out += `<li>${inline(lines[i++].replace(/^\s*([-*]|\d+\.)\s+/, ""))}</li>`; out += "</ul>"; continue; }
+    if (l.trim()) { let p = ""; while (i < lines.length && lines[i].trim() && !/^(#|\||>|```|\s*([-*]|\d+\.)\s)/.test(lines[i])) p += lines[i++] + " "; out += `<p>${inline(p)}</p>`; continue; }
+    i++;
+  }
+  return out;
+}
+async function loadReports() {
+  const list = (await (await fetch("/api/reports")).json()).reports;
+  $("report-list").innerHTML = list.map((r, i) => `<div class="item" data-i="${i}"><b>${esc(r.title)}</b><br><span class="meta">${esc(r.name)}</span> ${r.synthetic ? badge("SYNTHETIC", "warn") : badge("real data / proof", "good")}</div>`).join("") || `<div class="empty">no reports</div>`;
+  document.querySelectorAll(".reports .item").forEach((el) => el.onclick = async () => {
+    document.querySelectorAll(".reports .item").forEach((x) => x.classList.remove("sel")); el.classList.add("sel");
+    const r = list[+el.dataset.i]; const base = r.md.includes("/") ? r.md.slice(0, r.md.lastIndexOf("/") + 1) : "";
+    const text = await (await fetch("/reports/" + r.md)).text();
+    const extra = r.pngs.filter((p) => !text.includes(p.slice(p.lastIndexOf("/") + 1)));  // not already in the markdown
+    const pngs = extra.length ? `<div class="pngs">${extra.map((p) => `<figure><img src="/reports/${p}"><figcaption>${esc(p)}</figcaption></figure>`).join("")}</div>` : "";
+    $("report-view").innerHTML = pngs + md(text, base);
+  });
+}
+
+$("tab-live").onclick = () => { $("view-live").style.display = ""; $("view-evidence").style.display = "none"; $("tab-live").classList.add("active"); $("tab-evidence").classList.remove("active"); };
+$("tab-evidence").onclick = () => { $("view-live").style.display = "none"; $("view-evidence").style.display = ""; $("tab-evidence").classList.add("active"); $("tab-live").classList.remove("active"); loadReports(); };
+refresh(); refreshChart(); setInterval(refresh, 2000); setInterval(refreshChart, 15000);
+</script>
+</body>
+</html>

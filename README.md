@@ -92,12 +92,14 @@ for live trading. Market data is public.
 | 6 | `make backtest-cache` | nothing (the LLM cache is in git; builds a SYNTHETIC 24-h book DB first) | ~3 min | the AI ablation's real-LLM run again, with no key: `ai=cache`, `return +0.121%`, `model calls 132 (132 cached)` ([REPRODUCE §4.1](docs/REPRODUCE.md#41-offline-synthetic-data)) |
 | 7 | `make market-db` | nothing (the recorded books are in git) | ~1 s | `SHA256SUMS verified; wrote data/wta.sqlite (REAL recorded Wallex market data)`: 6,131 books, 1,476 candles. Then the real-data reports rerun offline ([REPRODUCE §4.2](docs/REPRODUCE.md#42-on-real-data-the-shipped-market-db)) |
 | 8 | `python -m wta status` / `python -m wta tui` | a run's logs | instant | one-screen summary / live dashboard (Ctrl-C quits, `--once` prints one frame) |
+| 9 | `python -m wta web` (`make web`) | a run's logs | instant | the same dashboard in a browser on http://localhost:8080: Live tab (equity curve, books, S1 edges, AI plan, positions, decisions with all 23 risk checks on click, health) and Evidence tab (every report of `docs/REPORTS` with its charts). Read-only, no CDN |
 
 `make status` and `make tui` read the logs of `make shadow` (`logs/shadow`). For the synthetic run of step 1:
 
 ```bash
 python -m wta status --log-dir logs/shadow_synth --set data.sqlite_path=data/shadow_synth.sqlite
 python -m wta tui    --log-dir logs/shadow_synth --set data.sqlite_path=data/shadow_synth.sqlite
+python -m wta web    --log-dir logs/shadow_synth --set data.sqlite_path=data/shadow_synth.sqlite
 ```
 
 `make replay` (no bundle) replays the newest run under `logs/` instead, for example the one you just
@@ -112,6 +114,7 @@ make smoke-real                               # read-only: markets, account, WS 
                                               # 3-min paper shadow on the real feed -> PASS / WARN / FAIL
 python -m wta run --mode shadow --ai offline  # paper shadow on real data; --ai offline when OpenRouter is
 python -m wta tui --mode shadow               # not reachable from that network (labelled, not an LLM)
+python -m wta web --mode shadow               # the same in a browser: http://localhost:8080
 bash scripts/demo.sh --feed live --ai offline --scene 0   # the demo with the dashboard on real data
 ```
 
@@ -130,6 +133,7 @@ docker compose run --rm --no-deps agent python -m wta run --mode shadow --feed s
   --log-dir logs/shadow_synth --set data.sqlite_path=data/shadow_synth.sqlite --seconds 120
 
 docker compose up -d recorder agent                   # long-running: recorder + shadow agent on the real feed
+docker compose up -d web                              # + read-only web dashboard on http://localhost:8080 (127.0.0.1 only)
 docker compose logs -f agent
 docker compose down
 ```

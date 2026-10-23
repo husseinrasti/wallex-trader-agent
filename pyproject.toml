@@ -33,6 +33,7 @@ include = ["wta*", "backtest*"]
 
 [tool.setuptools.package-data]
 "wta.ai" = ["prompts/*.md"]
+"wta.dashboard" = ["web_static/*"]
 
 [tool.ruff]
 line-length = 110

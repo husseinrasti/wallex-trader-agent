@@ -69,6 +69,7 @@ make test                     # ruff + pytest, ~2 min, exit 0
 | ۶ | `make backtest-cache` | هیچ (کش LLM در git است) | حدود ۳ دقیقه | اجرای LLM واقعیِ آزمون ablation دوباره و بدون کلید: `ai=cache`، `return +0.121%`، `model calls 132 (132 cached)` |
 | ۷ | `make market-db` | هیچ (دادهٔ ضبط‌شده در git است) | حدود ۱ ثانیه | `SHA256SUMS verified; wrote data/wta.sqlite`؛ پس از آن گزارش‌های دادهٔ واقعی آفلاین دوباره اجرا می‌شوند ([REPRODUCE §4.2](docs/REPRODUCE.md)) |
 | ۸ | `python -m wta status` / `python -m wta tui` | لاگ یک اجرا | فوری | خلاصهٔ یک‌صفحه‌ای / داشبورد زنده (Ctrl-C برای خروج) |
+| ۹ | `python -m wta web` (`make web`) | لاگ یک اجرا | فوری | همان داشبورد در مرورگر روی http://localhost:8080: زبانه‌ی Live (منحنی equity، دفتر سفارش، edgeهای S1، برنامه‌ی AI، پوزیشن‌ها، تصمیم‌ها با هر ۲۳ چک ریسک) و زبانه‌ی Evidence (همه‌ی گزارش‌ها و نمودارها). فقط‌خواندنی |
 
 برای اجرای مصنوعیِ مرحلهٔ ۱:
 
@@ -77,6 +78,7 @@ make test                     # ruff + pytest, ~2 min, exit 0
 ```bash
 python -m wta status --log-dir logs/shadow_synth --set data.sqlite_path=data/shadow_synth.sqlite
 python -m wta tui    --log-dir logs/shadow_synth --set data.sqlite_path=data/shadow_synth.sqlite
+python -m wta web    --log-dir logs/shadow_synth --set data.sqlite_path=data/shadow_synth.sqlite
 ```
 
 <div dir="rtl">
