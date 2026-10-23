@@ -4,7 +4,11 @@
 2. **S1 CrossBook** (core edge, direction-neutral): converts a coin's TMN price to USDT through the USDTTMN book and buys in the cheaper book. It sells those coins (less the BUY fee, which Wallex takes in the coin) in the other book seconds later, but only when the gap beats both taker fees plus a 0.15 % margin (plus a small charge for the sub-step remainder leg 2 cannot sell).
 3. **S2 USDTAlloc** (always on): holds 25–70 % of equity in USDT according to the dollar regime. It rebalances only when the share is ≥ 15 pp off target and no more often than every 30 min. This states the unavoidable dollar bet openly and provides the regular activity.
 4. **S3 RegimeMomentum** (**off by default**) buys 15-minute breakouts on BTC/ETH/SOL-USDT only when the AI calls `trend_up` with ≥ 0.6 confidence, and protects them with an exchange-side stop. **FLATTEN** converts everything to TMN from T−2h, because only TMN counts at the end.
-5. **Status:** S1 and S2 (and S3 when enabled) run in the engine's fast loop through the `StrategyRouter` (`engine._strategy_step`), every decision goes through the RiskManager, and each heartbeat carries their diagnostics (`health.extra.strategies`). Only the AI plan is not wired yet, so the strategies run rules-only. The code has never seen real Wallex data, because `api.wallex.ir` is unreachable from the development machine. Every run so far used the synthetic feed, and every evidence section below is still a TODO.
+5. **Status (2026-10-23, Phase 5):**
+   * S1 and S2 (and S3 when enabled) run in the engine's fast loop through the `StrategyRouter` (`engine._strategy_step`), and every decision goes through the RiskManager.
+   * The AI plan (Regime Analyst, real OpenRouter LLM) and the hourly Reviewer are wired in (Phase 4).
+   * Real Wallex data is still almost absent. `api.wallex.ir` is reachable only now and then, so the recorder has stored 6,131 REST book snapshots. Only 0.33 h of them align across the books S1 needs, and there are 2.2 h of 1-minute candles.
+   * Section 11 lists every PRD-05 result. Each one says whether it ran on that real data (too short to judge the strategies) or on SYNTHETIC data (mechanics only, never evidence of performance).
 
 > ### How to explain in 2 minutes
 >
@@ -20,10 +24,10 @@
 >
 > **The AI.** Every 5 minutes an LLM reads the market through tools and writes a plan: the regime per market, which strategies may run, a size multiplier in [0, 1], an S1 margin that can only go **up**, and a USDT target inside 25–70 %. It never places orders. Without a fresh plan the rules run alone. Without an LLM key, a deterministic *offline rules provider* fills the same slot, and it is labelled everywhere as not an LLM.
 >
-> **Why trust it.** Every order has a decision record: the numbers behind it, all 23 risk checks, the order sent and the outcome. Replay reproduces the records. Honest status: we have no recorded Wallex data yet.
+> **Why trust it.** Every order has a decision record: the numbers behind it, all 23 risk checks, the order sent and the outcome. Replay reproduces the records (section 11.7). Honest status: we have only 20 minutes of aligned real Wallex books and 2.2 h of real candles. Every longer test so far ran on synthetic data, so nothing here proves the strategies make money.
 
 **Contents.** [1 Costs](#1-costs-and-decision-path) · [2 S1](#2-s1-crossbook--core-edge) · [3 S2](#3-s2-usdtalloc--explicit-dollar-bet-and-regular-activity) · [4 S3](#4-s3-regimemomentum--bounded-upside-disabled-by-default) · [5 FLATTEN](#5-flatten--everything-back-to-tmn) · [6 AI plan](#6-how-the-ai-plan-changes-each-strategy) · [7 Sizing](#7-sizing-at-5000000-tmn) ·
-[8 Example record](#8-example-decision-record-illustrative) · [9 Expected behaviour](#9-expected-behaviour) · [10 Tuning](#10-tuning-discipline-survey-walk-forward-overfitting-guard) · [11 Evidence](#11-evidence-todo) · [12 vs PRD-03](#12-where-the-code-differs-from-prd-03) · [13 Limitations](#13-known-limitations)
+[8 Example record](#8-example-decision-record-illustrative) · [9 Expected behaviour](#9-expected-behaviour) · [10 Tuning](#10-tuning-discipline-survey-walk-forward-overfitting-guard) · [11 Evidence](#11-evidence-phase-5-2026-10-23) · [12 vs PRD-03](#12-where-the-code-differs-from-prd-03) · [13 Limitations](#13-known-limitations)
 
 Formulas are written from `src/wta/strategies/` and `src/wta/features/engine.py`; **where code and PRD-03 differ, the
 code is what trades** (section 12). The S1 rules below were checked against the final `s1_crossbook.py` and
@@ -429,11 +433,12 @@ USDT target from S2's table; S1 margin from config. It is labelled everywhere (m
 `s2.rebalance_threshold_pp` ∈ [10, 25] pp, `s3.min_regime_confidence` ∈ [0.5, 0.9] and `engine.slow_loop_interval_s` ∈
 [180, 900] s: ≤ 2 changes per review, ≥ 1 h apart, each logged as a new `config_hash`. Risk parameters are never editable.
 
-> **Status:** the strategies run in the engine's fast loop; the analyst, reviewer and offline provider are merged and
-> unit-tested but **not wired into the engine yet**. Until they are, there is no plan, the strategies run rules-only and
-> `plan_snapshot` is `null`. The engine applies the same freshness rule as the strategies: a decision record's
-> `plan_snapshot` and the health line's `strategies.plan` show only a plan ≤ `ai.plan_stale_s` old (a stale one appears
-> as `strategies.plan_stale`). `TODO(phase-4)`: replace the illustrative plan in section 8 with a real cached plan.
+> **Status:** the analyst and the reviewer are wired into the engine (Phase 4); the offline provider covers the no-key
+> case. The engine applies the same freshness rule as the strategies: a decision record's `plan_snapshot` and the
+> health line's `strategies.plan` show only a plan ≤ `ai.plan_stale_s` old (a stale one appears as
+> `strategies.plan_stale`). Real LLM plans exist from the recorded-book backtest and from synthetic runs (section 11.3);
+> in the recorded window the LLM disabled S1 in all 6 plans, and in a synthetic 6-h window it raised S1's margin to
+> 0.18 % in 45 of 73 plans. A real cached plan is in `docs/ARCHITECTURE.md` §8.8 (synthetic feed).
 
 ---
 
@@ -464,7 +469,9 @@ mid, a self-cross (wash-trade prevention) or a duplicate. Exposure limits never 
 > code, the real FeatureEngine (an hour of made-up deviation samples) and the real RiskManager on **made-up books**
 > (BTC rising in BTCUSDT while BTCTMN lags). The plan is invented; the order response and outcome are illustrative
 > values consistent with the code's accounting; identity fields are placeholders and some keys are elided.
-> `TODO(phase-5)`: replace with a real shadow/live record.
+> No S1 cycle has completed on real Wallex books yet: the 0.33 h of aligned recorded books never had an edge above
+> cost (section 11.1). Real-engine S1 records on synthetic data are in `docs/REPORTS/bt_books_synth24h_ai_off/`
+> (`decisions.jsonl`). `TODO(phase-6)`: replace with a real-feed shadow/live record.
 
 Situation: USDTTMN 266,720 / 266,758; BTCUSDT 83,450.00 / 83,510.00; BTCTMN 22,073,000,000 / 22,100,000,000;
 account 2,500,000 TMN + 9.40 USDT (≈ 50 % USDT).
@@ -554,16 +561,26 @@ gap waits for the next rebalance." `MAX_ORDER_PCT` then shrinks the order from 1
 ## 10. Tuning discipline (survey, walk-forward, overfitting guard)
 
 **The defaults here were set by design** from fees, one observed spread snapshot and the PRDs. **They were not fitted
-to data**, because no Wallex data has been recorded yet. Any change must follow these rules:
+to data.** The only real data (0.33 h of aligned books, 2.2 h of candles) is far too little to fit anything, and the
+Phase-5 walk-forward kept the defaults (section 11.4). Any change must follow these rules:
 
 1. **S1 survey rule** (PRD-05 §2). From recorded books, count distinct lock-in opportunities (edge ≥ cost + m, ≥ 60 s
    apart) for m ∈ {0.05, 0.10, 0.15, 0.25, 0.40} %, taker and maker leg 1. Lock-in is **viable** at ≥ 3 a day at
    m ≥ 0.10 %. With fewer than 2 a day at 0.15 %, lower `margin_min_pct` to 0.08 % and/or set `leg1_taker: false`;
    that change must then pass rule 2 when the data allows.
-2. **Walk-forward split** (PRD-05 §3.4). Every grid is evaluated in-sample on the first **70 %** of the window and
-   out-of-sample on the last **30 %**; the report shows both. The best in-sample value is adopted only if out-of-sample
-   it **does not degrade by more than 50 %**, else the pre-grid default stays. Our reading: out-of-sample net return per
-   day after fees ≥ 50 % of the in-sample one, and a non-positive in-sample return is never adopted.
+2. **Walk-forward split** (PRD-05 §3.4; `backtest/walkforward.py`, `wta backtest --param-grid`). The rule as implemented:
+   * **Split.** In-sample is the first **70 %** of the window's data ticks and out-of-sample is the rest. Gaps in recorded books do not count. Each half is its own backtest on a fresh paper account, and the OOS half preloads the candles before it only as indicator warm-up.
+   * **One end rule.** Every run of a walk-forward (both halves of every candidate, and the final run) ends the same way: no end-of-window flatten, holdings valued at the bid. (The runner's automatic rule, flatten in windows ≥ 8 h, would flatten only the longer in-sample half of a 24-h grid, cost it its last 2 h and the sell-to-TMN fees, and so bias the guard towards accepting.) `--flatten-at-end` applies the deadline flatten to all of them instead.
+   * **Candidates.** The pre-grid default is always a candidate next to the grid values.
+   * **Choice.** The candidate with the best in-sample return wins. A tie goes to the lower in-sample drawdown, then to the default.
+   * **Guard (`accept_rule`).** Returns are compared **per day of data**, i.e. return ÷ (the half's ticks × the tick step). A grid value is adopted only if:
+     - its in-sample return per day is **positive**;
+     - its out-of-sample return per day is **not negative**;
+     - out of sample it **does not degrade by more than 50 %**: (IS − OOS) / IS ≤ 0.5.
+
+     Otherwise the pre-grid default stays. A missing return (insufficient data) also keeps the default.
+   * **Why per day.** The two halves differ in length. Comparing the 70 % total with the 30 % total would reject a perfectly steady strategy, whose OOS total is only 3/7 of its IS total.
+   * **Report.** `walkforward.md` shows every candidate's IS and OOS return, the return per day, drawdown and trades, and the decision.
 3. **Small grids.** ≤ **8 values per parameter**, ≤ **2 parameters at a time**. Planned: `s1.margin_min_pct ∈ {0.08,
    0.12, 0.15, 0.25} %` × `leg1_taker`, and `s2.rebalance_threshold_pp ∈ {10, 15, 20, 25} pp`; S3 not until enabled.
 4. **Same bounds as the AI** (the Reviewer's, `configs/llm.yaml`); risk parameters are never tuned for return. Every
@@ -571,23 +588,43 @@ to data**, because no Wallex data has been recorded yet. Any change must follow 
 
 ---
 
-## 11. Evidence (TODO)
+## 11. Evidence (Phase 5, 2026-10-23)
 
-Every number here must come from a report under `docs/REPORTS/` that a command regenerates. **Synthetic-feed runs and
-offline-rules-provider runs never count as evidence.** List the placeholders with `grep -n "TODO(" docs/STRATEGY.md`.
+Every number here comes from a report under `docs/REPORTS/` that a command regenerates. The commands are in
+`docs/REPORTS/phase5_acceptance.md`.
 
-| # | Evidence | Source | Status |
-|---|---|---|---|
-| 11.1 | **S1 survey**: distinct lock-in opportunities/day per coin at m ∈ {0.05, 0.10, 0.15, 0.25, 0.40} %, median duration, maker-leg-1 count; spreads/depth per market; USDTTMN time per regime; computed recommendation block | `make survey` → `docs/REPORTS/survey_<date>.md` | `TODO(phase-5)` |
-| 11.2 | **Candle backtest** (30 d, S2+S3, AI off): return, max DD, trades, win rate, fees | `docs/REPORTS/bt_candles_30d/` | `TODO(phase-5)` |
-| 11.3 | **Book backtest + ablation** (recorded window, S1+S2, AI off vs on with a real LLM): the same metrics plus vetoes by code and S3 trades gated by regime | `docs/REPORTS/bt_books_<window>/` | `TODO(phase-5)` |
-| 11.4 | **Walk-forward** per grid (section 10): best in-sample value, in/out-of-sample return per day, degradation, adopted? | backtest `--param-grid` report | `TODO(phase-5)` |
-| 11.5 | **Shadow ≥ 4 h, real feed**: equity curve, trades, vetoes by code, S1 opportunities seen vs taken, S2 initial allocation | `docs/REPORTS/shadow_<date>/` | `TODO(phase-5)` |
-| 11.6 | **Live run**: return, max DD, trades per strategy/day, fees vs budget, final TMN share and dust, live tags | `deliverables/REPORT.md`, `TAGS.md` | `TODO(phase-6)` |
-| 11.7 | **Replay proof**: "N/N decisions reproduced" | `make replay` → `docs/REPORTS/replay_<date>.md` | `TODO(phase-5)` |
+**Read the Data column first.**
+* **real**: recorded Wallex data, which so far is 0.33 h of aligned books and 2.2 h of candles.
+* **SYNTHETIC**: generated data. It exercises the mechanics only and is **never evidence of performance**.
 
-S1 is **not** backtested on candles (they carry no cross-book information); its evidence is the survey, the book-driven
-window and the live logs.
+Offline-rules-provider runs never count as LLM evidence. The survey, the backtests, the shadow report and the replay
+were last regenerated on `e25b87b` plus the uncommitted Phase-5 review fixes (`phase5_acceptance.md` §8), so
+their reports say `git_dirty: yes`; the 4-h shadow run itself ran on the clean commit `7e8f2f5`.
+
+| # | Evidence | Data | Result | Source |
+|---|---|---|---|---|
+| 11.1 | **S1 survey** | real, 0.33 h aligned of 72 h asked | **Insufficient data** (< 1 h aligned): 0 distinct lock-in opportunities at every margin 0.05–0.40 %, taker and maker leg 1. Largest edges: TMN-cheap BTC +0.100 %, USDT-cheap DOGE +0.154 %, against a 0.43 % taker cost. Median spreads: USDTTMN 0.007 %, BTCTMN 0.109 %, BTCUSDT 0.183 %, ETHTMN 0.186 %, ETHUSDT 0.147 %, SOLUSDT 0.276 % (wider than the snapshot reference on the USDT books). Recommendation block: keep `margin_min_pct` 0.15 % and `leg1_taker` true; lock-in viability unknown | `survey_20261022.md` |
+| 11.2a | **Candle backtest 30 d**, S2+S3 (S3 `allow_rules_only` for this run), AI off | **SYNTHETIC** (no real 30-day backfill exists) | Return −4.46 %, max DD 5.20%. Fees 104,683 TMN (2.09 %). S2 made 57 rebalances in 8 days (no hysteresis, see 13), used up the 72-h fee budget (76 FEE_BUDGET vetoes) and was stopped by the **kill-switch on simulated day 9** (DD 5.02 %). After that the engine flattened and only monitored. S3: 6 breakout entries, 3 filled (1 target +0.89 %, 2 stops −1.37 % / −1.57 %), win rate 33 %, −19,663 TMN. 91,583 TMN of unsellable dust at the end (mostly SOL) | `bt_candles_30d/` |
+| 11.2b | Candle backtest, all real candles (2.2 h), S2+S3 | real, 2.25 h | +0.09 % (S2's initial 50 % USDT while the dollar rose), 4 S2 orders. S3 cannot warm up (needs about 5 h of 15-min bars) | `bt_candles_recorded_ai_off/` |
+| 11.3a | **Book backtest + ablation**, all recorded books, S1+S2, AI off vs on (real LLM `gpt-5.4-mini`) | real, 0.32 h | Off and on are **identical**: −0.055 %, 0 trades, 3 S2 orders, 0 vetoes. The LLM enabled S2 only in all 6 plans and kept the 50 % USDT target, so the AI changed nothing. S1 had no edge | `bt_books_recorded_ai_{off,on}/`, `ablation_20261023.md` §1 |
+| 11.3b | Book backtest 24 h, S1+S2, AI off vs offline rules | **SYNTHETIC** | −0.56 %, max DD 0.90 %, 4 S1 cycles (all lost 0.14–0.34 % after fees; S1 −9,126 TMN after 11,749 TMN of fees), 43 orders. 38 vetoes: RATE_HOUR 34 (30 of them S2's, after S1's orders used the hourly cap), RATE_DAY 4, USDT_BOUNDS 2. Offline provider = rules-only exactly (zero delta, by design) | `bt_books_synth24h_ai_{off,offline}/` |
+| 11.3c | Book backtest, 6-h sub-window, AI off vs on (real LLM, 73 cycles, 132 calls) | **SYNTHETIC** | AI **+0.09 pp** (+0.12 % vs +0.03 %), 6 fewer orders, 6,772 TMN less fees, 0 vs 1 closed trade. Mechanism: the LLM raised S1's margin to 0.18 % in 45 of 73 plans and S1 skipped two marginal signals (edges 0.66 %, 0.60 %). One window: not a statistic. S3 gating is not exercised (S3 off in book runs) | `bt_books_synth24h_6h_ai_{off,on}/`, `ablation_20261023.md` §2 |
+| 11.4 | **Walk-forward** `s1.margin_min_pct` ∈ {0.08, 0.12, 0.15, 0.25} %, 70/30 | **SYNTHETIC** 24 h books | **Default kept; no change adopted.** Every run ends under the same rule (no end-of-window flatten, valued at the bid). S1+S2: the best IS was 0.25 % (+0.20 %/day IS, 2 trades), rejected because its OOS return per day is negative (−2.01 %/day, 0 OOS trades: the loss is S2's dollar exposure); the other three candidates lost in-sample. S1-only (no dollar exposure): 0.08 % was the only candidate with an IS trade (+0.016 %/day), rejected because OOS made nothing (100 % degradation). The final S1-only run's 13 leg-1 orders all expired unfilled, because the synthetic gaps vanish within one 2-s step | `walkforward_s1_margin/`, `walkforward_s1_margin_s1only/` |
+| 11.5 | **Shadow ≥ 4 h**, S1+S2, AI on (real LLM `gpt-5.4-mini`), paper fills | **SYNTHETIC** feed, 4.08 h (14,700 s, 7,292 ticks) | +0.05 %, max DD 0.38 %, 0 closed trades, 0 vetoes. 2 S2 orders, the initial 50 % USDT allocation in two steps cut by `MAX_ORDER_PCT`; fees 6,240 TMN (6.24 % of the 72-h budget, all in the first 31 min). **S1: 20 opportunity ticks** in 72,920 coin-ticks (ETH 10, BTC 4, DOGE 4, LTC 2; best excess +0.138 %), **0 entries**: the analyst left S1 out of all 38 plans (edges negative after fees; each plan set S1's margin to 0.18 %). 11 of 49 analyst cycles gave no plan (1 invalid answer, then a provider outage from 02:10Z): the last plan went stale at 02:25Z and the engine ran rules-only for the last 0.56 h, as specified | `shadow_20261023_synth4h/` |
+| 11.6 | **Live run** | — | **None yet** (live trading is started only by the operator). No live order has been placed | `deliverables/REPORT.md`, live section |
+| 11.7 | **Replay proof** | the 4-h shadow run's recorded inputs (SYNTHETIC) | **40/40 decisions reproduced** over all 7,292 ticks (= the stop event's count; strict pass 40/40: every field, time stamps, fees, fills and features included, part of the verdict), 38/38 plans re-derived from the LLM cache, **0 socket attempts, 0 LLM provider calls**. Final equity, fees, plan freshness and S1's per-coin tick counters equal too (16/16), so the ticks without a decision were reproduced as well | `replay_20261023.md` |
+
+**What this evidence supports.**
+* The engine, the risk rules (kill-switch, fee budget, rate caps, USDT bounds) and the AI plumbing behave as specified, end to end, on 30 synthetic days and on the real recorded window.
+* The run is reproducible (11.7): the delivered code re-made every decision of a 4-h run from its recorded inputs,
+  without network.
+* A failing LLM degrades to rules-only as designed (11.5): the last plan holds for `ai.plan_stale_s`, then the rules.
+
+**What it does not support.** Any claim about S1/S2/S3 profitability on Wallex. The real data is far too short, and
+the synthetic data has no real cross-book structure.
+
+S1 is **not** backtested on candles, because candles carry no cross-book information. Its evidence is the survey, the
+book-driven window and the live logs.
 
 ---
 
@@ -609,15 +646,33 @@ The details are in sections 2–4; in short, the code is stricter than the PRD:
 
 ## 13. Known limitations
 
-- **No real Wallex data yet.** `api.wallex.ir` drops the TLS handshake from the development machine (likely IP
-  filtering; `docs/DECISIONS.md`, `docs/REPORTS/api_probe.md`); the recorder retries forever and, at the time of writing,
-  has stored no market data. **Every run so far used the synthetic feed** (deterministic, seeded from one snapshot in
-  `configs/markets_snapshot.yaml`): it exercises the engine end to end, is never evidence of performance, and every
-  `start` event and heartbeat says so. We do not know whether S1 opportunities occur several times a day or not for days.
+- **Almost no real Wallex data.** `api.wallex.ir` is reachable only now and then from the development machine
+  (`docs/DECISIONS.md`, `docs/REPORTS/api_probe.md`). The recorder has stored 6,131 REST book snapshots (2026-10-22: one
+  ~20-min window, 14:20:05–14:40:15Z, plus a 1-second burst of 28 snapshots at 20:16:12Z; 0.33 h aligned across the S1
+  books) and 2.2 h of 1-minute candles. Everything longer ran on synthetic
+  data: the synthetic feed or a synthetic market DB, deterministic and seeded from one snapshot in
+  `configs/markets_snapshot.yaml`. That data exercises the engine end to end and is never evidence of performance; every
+  report, `start` event and heartbeat says so. We still do not know whether S1 opportunities occur several times a day,
+  or not for days.
 - **Defaults, not fits** (section 10). Step sizes and min quantities in `configs/markets_snapshot.yaml` are
   `verified: false`; `/v1/markets` and `/v1/account/fee` have never been reached from this machine.
-- **AI layer not integrated yet.** S1, S2 (and S3 when enabled) run in the fast loop through the router; the analyst,
-  reviewer and offline provider are unit-tested but not plugged in, so every run is rules-only. `TODO(phase-4)`.
+- **The AI's value is unmeasured.** The analyst and the reviewer are wired in (Phase 4). On the 0.32 h of real books
+  the LLM changed no order; on one synthetic 6-h window it added +0.09 pp by raising S1's margin (section 11.3); in the
+  synthetic 4-h shadow run it kept S1 off in every plan, so 20 opportunity ticks went untraded (section 11.5). None of
+  this is a measurement of value.
+- **S2 has no hysteresis** (found in the synthetic 30-day run, section 11.2a):
+  - The rules regime flips between `range` and `trend_down` each time the 24-h dollar return crosses ±0.80 %, and every flip moves the target 20 pp.
+  - On a choppy dollar this means many rebalances: 57 in 8 days against the 1–4 a day of section 9. That used up the 72-h fee budget and ended in the kill-switch.
+  - A fix is to leave a trend only below 0.4 % or to require a minimum dwell time. It is not implemented, because it should be tuned on real data.
+- **Lock-ins vs latency.** On synthetic books the cross-book gaps vanished within one 2-s step:
+  - most crossing leg-1 orders expired unfilled (all 13 in the S1-only walk-forward);
+  - the 4 cycles that completed lost 0.14–0.34 % each after fees.
+
+  How long real gaps last is not measured yet.
+- **The trade-rate cap is shared.** S1's expiring entries and leg-2 retries can use up the 10-per-hour placement cap,
+  after which S2's rebalances are vetoed (RATE_HOUR; 30 vetoes in the synthetic 24-h run).
+- **Real spreads are wider than the reference snapshot on the USDT books** (survey: BTCUSDT 0.18 % vs 0.077 %, SOLUSDT
+  0.28 % vs 0.08 %, ETHTMN 0.19 % vs 0.031 %). Synthetic runs use the reference spreads, so they are optimistic on cost.
 - **S1 legs are not atomic.** Leg 2 follows the leg-1 fill ≈ 2–4 s later. An unfilled crossing leg 1 is never
   re-crossed: it rests at its limit for `limit_reprice_after_s` (15 s), then expires, and S1 re-evaluates the edge on a
   later tick; an unfilled leg 2 is likewise given up and re-decided by S1 at the new bid. The leg-2 rule bounds the
@@ -633,12 +688,18 @@ The details are in sections 2–4; in short, the code is stricter than the PRD:
   remainder and charges `u × 3 %` for it (2.2), which raises BTC's lock-in need to ≈ 0.64 % at 1M TMN and ≈ 0.70 % at
   half size and practically excludes DOGE (u ≈ 4.5 %). The remainder is valued in PnL and sold by FLATTEN once the
   dust of a coin reaches the minimum order; anything below the 50,000 TMN minimum at the end does not count as TMN.
+  S3 on SOL is hit hardest: the coin-paid fee leaves up to one 0.001-SOL step (≈ 0.7 % of equity) per trade that neither
+  SOLTMN (50,000 TMN minimum) nor SOLUSDT (1 USDT minimum) can take. The synthetic 30-day run ended with 66,330 TMN of
+  SOL dust after two SOL trades (if the snapshot's step is right: `verified: false`).
 - **S2's dollar bet can lose**: at 50 % USDT a 2 % dollar move is ±1 % of equity. In a flat market, buying 2.5M TMN of
   USDT and flattening it costs ≈ 0.25–0.28 % of equity (+ ≈ 0.04 % per rebalance). Activity is not guaranteed (section 9).
 - **S3** has no evidence and needs ≈ 52.5 % wins at ATR 0.5 %; its stop and target are fixed from the signal price; a
   STOP_LIMIT can be gapped through (the PositionManager then exits as taker); at ≈ 0.000044 BTC, steps are coarse.
-- **Paper fills** are pessimistic (next tick, ≤ 80 % of the level) but cannot model queue position. **Three days** is
-  short: Sharpe-like statistics are reported, not over-interpreted (PRD-05 §4).
+- **Paper fills** are pessimistic (next tick, ≤ 80 % of the level) but cannot model queue position. The book backtest
+  also counts what our earlier fills took from a level while the recorded level is still shown (recorded snapshots do
+  not reflect our fills), charges the taker fee on every fill of an order that crossed at placement, and never fills an
+  order on a snapshot after a recording gap (> 30 s). **Three days** is short: Sharpe-like statistics are reported, not
+  over-interpreted (PRD-05 §4).
 
 **Code map.** `src/wta/strategies/` (`base.py`, `router.py`, `s1_crossbook.py`, `s2_usdtalloc.py`, `s3_momentum.py`) ·
 `src/wta/features/engine.py` · `src/wta/risk/` (`manager.py`: 23 checks; `flatten.py`) · `src/wta/execution/`

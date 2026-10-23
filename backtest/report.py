@@ -28,9 +28,10 @@ Honesty rules: the requested window and the data actually present are both state
 (``meta["synthetic"]``, or a ``data_source`` that says "synthetic") gets a loud banner before any
 number and a watermark on every chart; an empty store yields an "insufficient data" report instead
 of an error; limitations are filled in automatically from meta and metrics. Output is
-deterministic: no wall-clock reads (the report date comes from ``meta["generated_at"]`` or the
-window end), sorted keys, fixed file names, Agg-rendered PNGs without version metadata, and no
-absolute paths in the assembled report.
+deterministic: no wall-clock reads (the report date comes from ``meta["report_date"]`` — the
+backtest runner and ``wta report`` pass ``--report-date`` or the commit date of the code — else
+``meta["generated_at"]``, else, labelled as such, the data's end), sorted keys, fixed file names,
+Agg-rendered PNGs without version metadata, and no absolute paths in the assembled report.
 """
 
 from __future__ import annotations
@@ -59,6 +60,7 @@ from matplotlib.patches import Patch
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 from backtest.metrics import vetoes_by_code as _vetoes_by_code_from_decisions
+from wta.logging_.jsonl import family_files
 
 # ---------------------------------------------------------------- file names (fixed)
 
@@ -931,10 +933,35 @@ def _window(
 
 
 def _report_date(meta: Mapping[str, Any], window: Mapping[str, Any]) -> str | None:
+    """``YYYY-MM-DD``: ``meta["report_date"]`` (when the report was made: the runner's
+    ``--report-date`` or commit date), else ``meta["generated_at"]``, else the data's end (a
+    fallback the header says it is, never presented as the day the report was written)."""
+    given = meta.get("report_date")
+    if given:
+        epoch = _to_epoch(given)
+        return _date_text(epoch) if epoch is not None else str(given)[:10]
     for epoch in (_to_epoch(meta.get("generated_at")), window["requested_to"], window["data_to"]):
         if epoch is not None:
             return _date_text(epoch)
     return None
+
+
+def _data_end(meta: Mapping[str, Any], window: Mapping[str, Any]) -> str:
+    """The data's end: ``meta["data_end"]`` (the window end the runner ran to), else the data present,
+    else the requested window."""
+    for epoch in (_to_epoch(meta.get("data_end")), window["data_to"], window["requested_to"]):
+        if epoch is not None:
+            return _iso(epoch)
+    return "n/a"
+
+
+def _report_date_note(meta: Mapping[str, Any]) -> str:
+    if meta.get("report_date"):
+        source = meta.get("report_date_source")
+        return f" ({source})" if source else ""
+    if meta.get("generated_at"):
+        return ""
+    return " (no report date given: the data's end)"
 
 
 def _span_text(a: float | None, b: float | None, hours: float | None) -> str:
@@ -1286,13 +1313,28 @@ def _limitations(
             "the survey, the book-driven window and the live logs."
         )
         auto.append(
-            "Candle-driven fills use a synthetic book (mid = close, the market's median observed spread, "
-            "unlimited depth at the best level); queue position and depth are not modelled."
+            f"Candle-driven fills use a synthetic book: mid = close, {_spread_text(meta.get('spreads'))}, "
+            "unlimited depth at the best level; queue position and depth are not modelled."
         )
-    if mode == "backtest" or driver in {"books", "candles"}:
         auto.append(
-            "Fills come from the pessimistic fill model (orders act one step later, at most 80% of the "
-            "best-level quantity, taker fee when crossing); real queue position is not modelled."
+            "Fills come from the pessimistic candle fill model: an order acts one bar later; MARKET and crossing "
+            "orders fill at close ± half the spread ± 0.02% slippage; the taker fee is paid on every fill of an "
+            "order that crossed at placement (STOP orders always), the maker fee only by a LIMIT resting when "
+            "placed; real queue position is not modelled."
+        )
+    elif driver == "books":
+        auto.append(
+            "Fills come from the pessimistic book fill model: an order is matched only against a newer snapshot "
+            "than the one it was placed on, and takes at most 80% of each level's quantity per snapshot, minus "
+            "what our earlier fills took from that level while it is still shown (recorded snapshots do not "
+            "reflect our fills); the taker fee is paid on every fill of an order that was crossing at placement "
+            "(STOP_LIMIT: at its trigger), the maker fee only by a LIMIT resting when placed; real queue "
+            "position is not modelled."
+        )
+    elif mode == "backtest":
+        auto.append(
+            "Fills come from the pessimistic fill model of backtest/fills.py (orders act one step later); real "
+            "queue position is not modelled."
         )
     if mode == "shadow":
         auto.append(
@@ -1348,6 +1390,42 @@ def _limitations(
     return out
 
 
+def _spread_text(spreads: Any) -> str:
+    """How the candle driver's spread was set, from ``meta["spreads"]`` (``{symbol: {spread_pct,
+    source, books?, from?, to?}}``): observed medians (with their sample) and/or reference spreads."""
+    if not isinstance(spreads, Mapping) or not spreads:
+        return "the spread per symbol of meta.spreads (not recorded for this run)"
+    by_source: dict[str, list[str]] = {}
+    sample: list[Mapping[str, Any]] = []
+    for sym in sorted(spreads):
+        info = spreads[sym] if isinstance(spreads[sym], Mapping) else {}
+        source = str(info.get("source") or "unknown")
+        by_source.setdefault(source, []).append(sym)
+        if source == "observed":
+            sample.append(info)
+    words = {
+        "observed": "the median spread of recorded books",
+        "reference": "the reference spread of configs/markets_snapshot.yaml",
+        "bar": "a spread given with the bar",
+        "default": "the default spread (0.1%)",
+    }
+    parts = []
+    for source in ("observed", "reference", "bar", "default", *sorted(set(by_source) - set(words))):
+        syms = by_source.get(source)
+        if not syms:
+            continue
+        what = words.get(source, f"spread source {source}")
+        if source == "observed" and sample:
+            n = sum(int(i.get("books") or 0) for i in sample)
+            lo = min((str(i["from"]) for i in sample if i.get("from")), default=None)
+            hi = max((str(i["to"]) for i in sample if i.get("to")), default=None)
+            if n and lo and hi:
+                what += f" ({n:,} books, {lo} → {hi}, none after the window end)"
+        everywhere = len(by_source) == 1
+        parts.append(f"{what} {'for every symbol' if everywhere else 'for ' + ', '.join(syms)}")
+    return "spread = " + "; ".join(parts)
+
+
 # ================================================================= write_report
 
 
@@ -1366,8 +1444,9 @@ def write_report(
     """Write ``report.md``, ``summary.json``, ``trades.csv``, ``equity.csv`` and the PNGs; return the md path.
 
     ``meta`` keys used: ``config_hash, git_commit, mode, driver, window_from, window_to, data_source,
-    synthetic, ai, strategies`` and optionally ``data_from, data_to, data_hours, generated_at,
-    initial_equity_tmn, fee_budget_pct``; any other scalar keys are listed in the header table.
+    synthetic, ai, strategies`` and optionally ``data_from, data_to, data_hours, report_date (+
+    report_date_source), generated_at, spreads, initial_equity_tmn, fee_budget_pct``; any other scalar
+    keys are listed in the header table.
     ``limitations`` are shown first, before the automatic ones. Never raises on empty inputs: an
     empty store produces an "insufficient data" report.
     """
@@ -1514,6 +1593,9 @@ _HEADER_META_KEYS = frozenset(
         "data_to",
         "data_hours",
         "generated_at",
+        "data_end",
+        "report_date",
+        "report_date_source",
         "insufficient_data",
     }
 )
@@ -1535,13 +1617,27 @@ def _header(run: _Run) -> list[str]:
         ["Data source", str(meta.get("data_source") or "n/a") + (" (SYNTHETIC)" if run.synthetic else "")],
         ["AI", "on" if ai_flag else ("off" if ai_flag is False else str(meta.get("ai") or "n/a"))],
         ["Strategies", ", ".join(_strategies(meta)) or "n/a"],
-        ["Report date", run.report_date or "n/a"],
+        ["Data end (UTC)", _data_end(meta, window)],
+        ["Report date", (run.report_date + _report_date_note(meta)) if run.report_date else "n/a"],
     ]
     for key in sorted(meta, key=str):
         if key in _HEADER_META_KEYS or isinstance(meta[key], Mapping | list | tuple):
             continue
         rows.append([str(key), _fmt(_guess_kind(str(key), meta[key]), meta[key])])
     return [_md_table(["run", "value"], rows), ""]
+
+
+def _log_links(out: Path) -> str:
+    """Links to every daily file of the run's decision log in ``out`` (the engine's ``decisions.jsonl``
+    is a link to the newest day only, so linking it alone would show part of the run)."""
+    files = [p.name for p in family_files(out, "decisions")]
+    if not files:
+        return ""
+    links = ", ".join(f"[{n}]({n})" for n in files)
+    if len(files) == 1:
+        return f" ({links})"
+    return (f" ({len(files)} daily files, together the whole run: {links}; `decisions.jsonl` links only the newest "
+            "day; orders and events are in the matching `orders-*` / `events-*` files)")
 
 
 def _trades_section(run: _Run) -> list[str]:
@@ -1752,9 +1848,9 @@ def _render_markdown(run: _Run) -> str:
         parts += ["_No vetoes recorded._", ""]
     if decisions:
         kinds = Counter(str(d.get("kind")) for d in decisions)
-        link = " ([decisions.jsonl](decisions.jsonl))" if (run.out / "decisions.jsonl").exists() else ""
         parts += [
-            f"Decision records{link}: " + ", ".join(f"{k} {v:,}" for k, v in sorted(kinds.items())) + ".",
+            f"Decision records{_log_links(run.out)}: " + ", ".join(f"{k} {v:,}" for k, v in sorted(kinds.items()))
+            + ".",
             "",
         ]
 
@@ -1808,13 +1904,15 @@ def _report_info(md_path: Path, name: str) -> ReportInfo:
     text = md_path.read_text(encoding="utf-8", errors="replace")
     summary: dict[str, Any] = {}
     summary_path = md_path.parent / SUMMARY_JSON
-    if md_path.name == REPORT_MD and summary_path.exists():
+    if summary_path.exists():  # the run's own summary (also next to e.g. walkforward.md: its date, not its title)
         try:
             loaded = json.loads(summary_path.read_text(encoding="utf-8"))
             summary = loaded if isinstance(loaded, dict) else {}
         except (OSError, ValueError):
             summary = {}
-    title = str(summary.get("title") or _first_heading(text) or name)
+    own = md_path.name == REPORT_MD
+    title = str((summary.get("title") if own else None) or _first_heading(text) or name)
+    # the report's date, never a data date found in the text when the run's summary.json has one
     when = summary.get("report_date") or _date_from(name) or _date_from("\n".join(text.splitlines()[:30]))
     synthetic = (
         summary.get("synthetic")
@@ -1884,11 +1982,15 @@ def update_index(reports_dir: Path | str) -> Path:
 
 @dataclass(frozen=True)
 class FinalSection:
-    """One section of ``deliverables/REPORT.md``; ``patterns`` are globs relative to ``reports_dir``."""
+    """One section of ``deliverables/REPORT.md``; ``patterns`` are globs relative to ``reports_dir``.
+    ``status_if_missing`` / ``text_if_missing`` replace the "not available yet" status and body when no
+    report matches and that is expected (e.g. no live run yet: only the operator starts one)."""
 
     key: str
     title: str
     patterns: tuple[str, ...]
+    status_if_missing: str | None = None
+    text_if_missing: str | None = None
 
 
 DEFAULT_FINAL_SECTIONS: tuple[FinalSection, ...] = (
@@ -2023,13 +2125,13 @@ def assemble_final_report(
     def src_link(info: ReportInfo) -> str:
         return f"[{info.path.relative_to(root).as_posix()}]({_rel(info.path, out.parent)})"
 
-    missing = [s.title for s in secs if chosen[s.key] is None]
+    missing = [s.title for s in secs if chosen[s.key] is None and not s.text_if_missing]
     any_synthetic = any(i is not None and i.synthetic for i in chosen.values())
     parts: list[str] = [
         f"# {title}",
         "",
         f"Assembled by `backtest/report.py` (`assemble_final_report`) from `{root_rel}`; edit the source "
-        "reports, not this file. Order: survey → backtests (candles 30 d, books window, ablation) → shadow → "
+        "reports, not this file. Order: survey → backtests (candles, order books, AI ablation, walk-forward) → shadow → "
         "live → replay proof.",
         "",
     ]
@@ -2043,7 +2145,7 @@ def assemble_final_report(
     for n, sec in enumerate(secs, 1):
         info = chosen[sec.key]
         if info is None:
-            toc.append([str(n), sec.title, NOT_AVAILABLE, "—"])
+            toc.append([str(n), sec.title, sec.status_if_missing or NOT_AVAILABLE, "—"])
         else:
             status = (
                 "included"
@@ -2059,7 +2161,8 @@ def assemble_final_report(
         parts += ["---", "", f"## {n}. {sec.title}", ""]
         if info is None:
             pats = ", ".join(f"`{p}`" for p in sec.patterns)
-            parts += [f"_{NOT_AVAILABLE.capitalize()}: no report matching {pats} in `{root_rel}`._", ""]
+            parts += [sec.text_if_missing or f"_{NOT_AVAILABLE.capitalize()}: no report matching {pats} in `{root_rel}`._",
+                      ""]
             continue
         parts += [
             f"_Source: {src_link(info)} — {info.title}"

@@ -399,6 +399,73 @@ async def test_books_driver_skips_gaps_and_drops_stale_books(tmp_path: Path) -> 
     assert "requested window is 2.0 h" in (tmp_path / "out" / "report.md").read_text()
 
 
+async def test_books_driver_an_order_resting_before_a_recording_gap_is_not_filled_after_it(tmp_path: Path) -> None:
+    def book(ts: float, bid: int, ask: int) -> BookSnapshot:
+        return BookSnapshot(symbol="USDTTMN", ts=ts, source="synthetic", bids=[Level(price=D(bid), qty=D("500"))],
+                            asks=[Level(price=D(ask), qty=D("500"))])
+
+    # 6 s of books, a 1-hour recording gap, then an ask BELOW S2's resting maker BUY
+    books = [book(T + 2 * k, 266_700, 266_760) for k in range(4)]
+    books += [book(T + 3600 + 2 * k, 266_500, 266_560) for k in range(30)]
+    db = write_db(tmp_path / "gap.sqlite", books=books)
+    out = tmp_path / "out"
+    res = await bt(load_config(env={}), driver="books", from_ts=T, to_ts=T + 3700, strategies="S2", market_db=db,
+                   out_dir=out)
+    assert res.meta["orders_stopped_by_gaps"] == 1 and res.meta["ticks"] == 34
+    orders = list(iter_family(out, "orders"))
+    first = next(o for o in orders if o["action"] == "place")["client_id"]
+    mine = [o for o in orders if o["client_id"] == first]
+    # live, the order would have been re-priced or canceled long before the next snapshot: no fill an
+    # hour later (before the fix it filled at 01:00:00, 3,600 s after placement)
+    assert not any(o["action"] == "fill" for o in mine)
+    cancel = next(o for o in mine if o["action"] == "cancel")
+    assert cancel["ts"] == "2026-10-01T01:00:00.000Z" and cancel["data"]["why"] == "EXPIRED_UNFILLED"
+    assert any("1 order(s) were open across a recording gap" in x for x in res.limitations)
+
+
+async def test_candle_spreads_come_only_from_books_up_to_the_window_end(tmp_path: Path) -> None:
+    # recorded books AFTER the window (wide spread) must not calibrate the window's synthetic book
+    inside = [make_book("USDTTMN", T + 60 * k, U_MID, 0.0002, "500", 0) for k in range(10)]
+    after = [make_book("USDTTMN", T + 7200 + 60 * k, U_MID, 0.01, "500", 0) for k in range(50)]
+    db = write_db(tmp_path / "m.sqlite", {"USDTTMN": dollar_series(60)}, books=inside + after,
+                  places={"USDTTMN": 0})
+    res = await bt(load_config(env={}), driver="candles", from_ts=T + 60, to_ts=T + 1800, strategies="S2",
+                   market_db=db, out_dir=tmp_path / "out")
+    info = res.meta["spreads"]["USDTTMN"]
+    assert info["source"] == "observed" and info["books"] == 10
+    assert info["from"] == "2026-10-01T00:00:00.000Z" and info["to"] == "2026-10-01T00:09:00.000Z"
+    assert D(info["spread_pct"]) < D("0.001")  # the 1 % spreads recorded after the window are not used
+    text = (tmp_path / "out" / "report.md").read_text()
+    assert "the median spread of recorded books (10 books" in text and "none after the window end" in text
+    # no book at or before the window end: the reference spread, and the report says so
+    late = write_db(tmp_path / "late.sqlite", {"USDTTMN": dollar_series(60)}, books=after, places={"USDTTMN": 0})
+    res = await bt(load_config(env={}), driver="candles", from_ts=T + 60, to_ts=T + 1800, strategies="S2",
+                   market_db=late, out_dir=tmp_path / "out_late")
+    assert res.meta["spreads"]["USDTTMN"]["source"] == "reference"
+
+
+async def test_report_date_is_never_the_data_end(tmp_path: Path, dollar_db: Path) -> None:
+    from wta.utils import gitinfo
+
+    res = await bt(load_config(env={}), driver="candles", from_ts=T + 60, to_ts=T + 1500, strategies="S2",
+                   market_db=dollar_db, out_dir=tmp_path / "a")
+    meta = res.meta
+    assert "generated_at" not in meta and meta["data_end"] == "2026-10-01T00:25:00.000Z"
+    assert meta["report_date"] == gitinfo.commit_date() and meta["report_date_source"].startswith("commit date of ")
+    text = (tmp_path / "a" / "report.md").read_text()
+    assert "| Data end (UTC) | 2026-10-01T00:25:00Z |" in text
+    assert f"| Report date | {gitinfo.commit_date()} (commit date of " in text
+    summary = json.loads((tmp_path / "a" / "summary.json").read_text())
+    assert summary["report_date"] == gitinfo.commit_date()
+    res = await bt(load_config(env={}), driver="candles", from_ts=T + 60, to_ts=T + 1500, strategies="S2",
+                   market_db=dollar_db, out_dir=tmp_path / "b", report_date="2026-10-23")
+    assert res.meta["report_date"] == "2026-10-23" and res.meta["report_date_source"] == "given with --report-date"
+    assert "| Report date | 2026-10-23 (given with --report-date) |" in (tmp_path / "b" / "report.md").read_text()
+    with pytest.raises(ValueError, match="report date"):
+        await bt(load_config(env={}), driver="candles", from_ts=T + 60, to_ts=T + 1500, strategies="S2",
+                 market_db=dollar_db, out_dir=tmp_path / "c", report_date="yesterday")
+
+
 # ---------------------------------------------------------------- AI
 
 

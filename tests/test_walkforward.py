@@ -234,3 +234,24 @@ async def test_walkforward_end_to_end_real_runner(tmp_path: Path, cfg: Config, c
     hashes = {json.loads(line)["config_hash"] for line in (out / "decisions.jsonl").read_text().splitlines()
               if '"config_hash"' in line}
     assert hashes == {res.final.meta["config_hash"]}
+
+
+async def test_every_walkforward_run_ends_under_the_same_rule(tmp_path: Path, cfg: Config,
+                                                              candle_db: dict[str, Any]) -> None:
+    """The runner's automatic end rule (flatten in windows >= 8 h) would flatten only the longer
+    in-sample half of a 24-h grid: every half and the final run must get the same flatten_at_end."""
+    runner = Scripted({0.15: (0.001, 0.001), 0.1: (0.004, 0.003)}, [])
+    res = await arun_walkforward(cfg, grid={KEY: [0.1]}, driver="candles", from_ts=candle_db["from_ts"],
+                                 to_ts=candle_db["to_ts"], out_dir=tmp_path / "wf", strategies="S2",
+                                 market_db=candle_db["path"], runner=runner, flatten_at_end=None)
+    assert [c["flatten_at_end"] for c in runner.calls] == [False] * len(runner.calls) == [False] * 5
+    assert res.flatten_at_end is False and res.to_dict()["flatten_at_end"] is False
+    md = (tmp_path / "wf" / "walkforward.md").read_text()
+    assert "no end-of-window flatten; holdings at the end are valued at the bid" in md
+
+    runner = Scripted({0.15: (0.001, 0.001), 0.1: (0.004, 0.003)}, [])
+    res = await arun_walkforward(cfg, grid={KEY: [0.1]}, driver="candles", from_ts=candle_db["from_ts"],
+                                 to_ts=candle_db["to_ts"], out_dir=tmp_path / "wf2", strategies="S2",
+                                 market_db=candle_db["path"], runner=runner, flatten_at_end=True)
+    assert {c["flatten_at_end"] for c in runner.calls} == {True} and res.flatten_at_end is True
+    assert "the deadline flatten in its last 2 h" in (tmp_path / "wf2" / "walkforward.md").read_text()

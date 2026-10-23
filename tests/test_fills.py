@@ -776,12 +776,78 @@ async def test_books_next_snapshot_only_and_80_percent_cap(bx: BacktestExchange,
     fills = bx.on_tick()
     assert [(f.price, f.qty, f.is_maker) for f in fills] == [(D("82900"), D("0.008"), False)]  # 80 % of 0.01
     assert bx.on_tick() == []  # the rest of that level stays taken in this snapshot
-    feed.set(bids=[("82800", "1")], asks=[("82900", "0.01")])
+    feed.set(bids=[("82800", "1")], asks=[("82900", "0.02")])  # the level grew by 0.01
     fills = bx.on_tick()
-    assert [(f.price, f.qty, f.is_maker) for f in fills] == [(D("82900"), D("0.008"), True)]  # rests: maker
+    # crossing at placement: the remainder is a TAKER too (PRD-05 §3.2), at the level price; the
+    # 0.008 taken before still counts against the level: 80 % of 0.02 - 0.008 = 0.008
+    assert [(f.price, f.qty, f.is_maker) for f in fills] == [(D("82900"), D("0.008"), False)]
+    assert fills[0].fee == D("0.008") * D("0.0013")  # BTCUSDT taker fee (maker would be 0.10 %)
     o = await bx.get_order("b1")
     assert o.status == "PARTIALLY_FILLED" and o.remaining_qty == D("0.004")
     await assert_balances_consistent(bx, START)
+
+
+async def test_books_resting_limit_is_maker_at_its_limit(bx: BacktestExchange, feed: Feed) -> None:
+    feed.set(bids=[("82800", "1")], asks=[("83000", "1")])
+    await bx.place_order(req("b1", "BUY", "LIMIT", "0.005", price="82900"))  # resting
+    feed.set(bids=[("82800", "1")], asks=[("82850", "1")])  # the market came down through the limit
+    fills = bx.on_tick()
+    assert [(f.price, f.qty, f.is_maker) for f in fills] == [(D("82900"), D("0.005"), True)]
+
+
+async def test_books_a_repeated_level_is_not_offered_again(bx: BacktestExchange, feed: Feed) -> None:
+    # a 0.01 ask level shown unchanged on two snapshots: recorded snapshots never show our own fills
+    feed.set(bids=[("82800", "1")], asks=[("82900", "0.01"), ("83100", "1")])
+    await bx.place_order(req("b1", "BUY", "LIMIT", "0.03", price="82900"))  # crossing
+    for _ in range(3):
+        feed.set(bids=[("82800", "1")], asks=[("82900", "0.01"), ("83100", "1")])
+        bx.on_tick()
+    o = await bx.get_order("b1")
+    assert o.filled_qty == D("0.008")  # 80 % of the level once, not 0.008 per snapshot (was 0.024)
+    feed.set(bids=[("82800", "1")], asks=[("82900", "0.009"), ("83100", "1")])  # shrank: nothing new
+    assert bx.on_tick() == []
+    feed.set(bids=[("82800", "1")], asks=[("83100", "1")])  # the level is gone ...
+    assert bx.on_tick() == []
+    feed.set(bids=[("82800", "1")], asks=[("82900", "0.01"), ("83100", "1")])  # ... and back: fresh
+    assert [f.qty for f in bx.on_tick()] == [D("0.008")]
+    await assert_balances_consistent(bx, START)
+
+
+async def test_books_an_order_open_across_a_recording_gap_never_fills(
+    markets: dict[str, MarketInfo], clock: SimClock, feed: Feed
+) -> None:
+    ex = BacktestExchange(markets, clock, driver="books", books=feed, max_gap_s=30.0, initial_balances=dict(START))
+    feed.set(bids=[("82800", "1")], asks=[("83000", "1")])
+    await ex.place_order(req("rest", "BUY", "LIMIT", "0.005", price="82900"))  # resting
+    for _ in range(25):  # 50 s of continuous snapshots: a long rest is no gap
+        feed.set(bids=[("82800", "1")], asks=[("83000", "1")])
+        assert ex.on_tick() == []
+    feed.set(bids=[("82800", "1")], asks=[("82850", "1")])
+    assert [f.qty for f in ex.on_tick()] == [D("0.005")]  # 52 s after placement, consecutive snapshots
+    await ex.place_order(req("gap", "BUY", "LIMIT", "0.005", price="82900"))
+    feed.set(bids=[("82800", "1")], asks=[("83000", "1")])
+    assert ex.on_tick() == []
+    feed._ts += 6 * 3600  # a 6-hour hole in the recording ...
+    feed.set(bids=[("82000", "1")], asks=[("82100", "1")])  # ... after which the ask is below the limit
+    assert ex.on_tick() == [] and ex.on_tick() == []  # was: filled 21,600 s after placement
+    o = await ex.get_order("gap")
+    assert o.status == "NEW" and ex.gap_blocked == 1 and o.raw["recording_gap_s"] == pytest.approx(21602.0)
+    feed.set(bids=[("82000", "1")], asks=[("82100", "1")])
+    assert ex.on_tick() == []  # never again (the OrderManager re-prices or cancels it)
+    restored = BacktestExchange(markets, clock, driver="books", books=feed, max_gap_s=30.0, state=ex.state())
+    feed.set(bids=[("82000", "1")], asks=[("82100", "1")])
+    assert restored.on_tick() == [] and restored.gap_blocked == 1
+    # an untriggered stop still triggers after a gap (at the post-gap price), then fills normally
+    await ex.cancel_order("gap")
+    feed.set(bids=[("82800", "1")], asks=[("82900", "1")])
+    await ex.place_order(req("stop", "SELL", "STOP_LIMIT", "0.001", price="80000", stop="81000"))
+    feed._ts += 3600
+    feed.set(bids=[("80500", "1")], asks=[("80600", "1")])
+    assert ex.on_tick() == []  # triggers on this snapshot
+    feed.set(bids=[("80500", "1")], asks=[("80600", "1")])
+    assert [f.qty for f in ex.on_tick()] == [D("0.001")]
+    with pytest.raises(ValueError, match="max_gap_s"):
+        BacktestExchange(markets, clock, driver="books", books=feed, max_gap_s=0)
 
 
 async def test_books_level_fraction_is_configurable(

@@ -9,11 +9,16 @@ AI as recorded with the strict LLM cache) and driven over the recorded inputs: t
 candles the engine stored in its state DB, the recorded exchange answers (``ReplayExchange``) and the
 cached analyst plans. Every internet connection attempt is refused and counted during the replay.
 The decision log it writes is compared with the recorded one (``wta.replay.runner``), the result is
-printed and written to ``docs/REPORTS/replay_<YYYYMMDD>.md``.
+printed and written to ``docs/REPORTS/replay_<YYYYMMDD>.md`` (the UTC day of the last replayed tick).
 
-Exit codes: 0 = every compared decision reproduced, zero network calls; 1 = a mismatch, a missing or
-extra decision, an exchange divergence, a determinism failure (LLM cache miss) or a network call;
-2 = nothing to replay or bad arguments (no recorded run, no state DB, output directory not empty).
+Exit codes: 0 = every decision reproduced on the PRD-05 fields AND in the strict pass (every field,
+time stamps, fees, fills and outcome PnL included), every plan re-derived identically, zero network
+calls; 1 = a mismatch, a missing or extra decision, a plan re-derived differently, an exchange
+divergence, a replayed crash the recorded run did not have, a determinism failure (LLM cache miss),
+a partial recording (no stop event, fewer ticks in the state DB than the stop event counts, records
+after the last committed tick; ``--allow-partial`` replays the committed prefix instead) or a network
+call; 2 = nothing to replay or compare, or bad arguments (no recorded run, no state DB, output
+directory not empty, a recorded window without any decision).
 """
 
 from __future__ import annotations
@@ -74,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--overlay", action="append", default=[], metavar="FILE", help="the recorded run's overlays")
     ap.add_argument("--lenient", action="store_true",
                     help="keep going after an LLM cache miss / unmatched config (still exits 1 on a mismatch)")
+    ap.add_argument("--allow-partial", action="store_true",
+                    help="replay the committed prefix of a run that is still being written, crashed or whose "
+                         "state DB copy is incomplete (a PARTIAL replay; without it that is a failure)")
     ap.add_argument("--no-index", action="store_true", help="do not regenerate docs/REPORTS/README.md")
     ap.add_argument("--json", action="store_true", help="print the full result as JSON")
     ap.add_argument("-v", "--verbose", action="store_true", help="engine log lines on stderr")
@@ -95,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"replay: {log_dir} ({why})")
     try:
         result = run_replay(cfg, log_dir=log_dir, state_db=args.state_db, out_dir=out, reports_dir=reports,
-                            strict=not args.lenient, segment=args.segment)
+                            strict=not args.lenient, segment=args.segment, allow_partial=args.allow_partial)
     except ReplayInputError as exc:
         print(f"replay: cannot replay {log_dir}: {exc}", file=sys.stderr)
         return 2
@@ -108,14 +116,16 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001 - the index is a convenience, the verdict stands
             print(f"replay: reports index not updated: {exc}", file=sys.stderr)
 
+    code = 0 if result.ok else (2 if result.n_reference == 0 else 1)
     if args.json:
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True, default=str))
-        return 0 if result.ok else 1
+        return code
     r = result.run
     rec, win, net, ai = r["recorded"], r["window"], r["network"], r["ai"]
     label = " — SYNTHETIC, not evidence of performance" if rec["synthetic"] else ""
     print(f"recorded: mode {rec['mode']}, feed {rec['feed']}{label}; segment {rec['segment']} of {rec['segments']}"
-          + ("; run still being written (replayed up to its last committed tick)" if rec["in_progress"] else ""))
+          + ("; PARTIAL (committed prefix only, --allow-partial)" if rec.get("partial") and args.allow_partial
+             else ""))
     conf = r["config"]
     same = "= recorded" if conf["equal"] else f"DIFFERS from recorded {conf['recorded_hash']}"
     print(f"window:   {win['first']} -> {win['last']} ({win['hours']:.2f} h, {win['ticks']} ticks); "
@@ -135,10 +145,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"missing:  {d['decision_id']} ({d['kind']} {d['strategy']} {d['symbol']})")
     for d in result.extra[:5]:
         print(f"extra:    {d['decision_id']} ({d['kind']} {d['strategy']} {d['symbol']})")
-    print(f"strict:   {result.strict_check.get('summary')} (every field but time stamps)")
+    print(f"strict:   {result.strict_check.get('summary')} (every field, time stamps included)")
+    end = r.get("end_state") or {}
+    if end.get("compared"):
+        rows = end.get("rows") or []
+        print(f"end:      {sum(1 for x in rows if x['equal'])}/{len(rows)} final-heartbeat values equal "
+              "(equity, fees, plan freshness, S1 tick counters; informational)")
     print(f"result:   {result.summary} -> {'PASS' if result.ok else 'FAIL'}")
     print(f"report:   {result.report_file or out / 'replay_report.md'}  (replay output: {out})")
-    return 0 if result.ok else 1
+    return code
 
 
 if __name__ == "__main__":

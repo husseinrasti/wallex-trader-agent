@@ -1,0 +1,2 @@
+entry_ts,closed_ts,strategy,symbol,pnl_tmn,pnl_pct,fees_tmn,hold_s,exit_reason,position_id,decision_id
+1790818234.0,1790818290.0,S1,ETHTMN,-1298.95368026798,-0.001303546062513563097683549315,4279.27001334798,56.0,lockin,p_S1_ETHTMN_1790818234000_1,d_1790818232000_S1_ETHTMN_1

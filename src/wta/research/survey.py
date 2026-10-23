@@ -648,8 +648,8 @@ def recommend(
             f"leg1_taker {str(s1.leg1_taker).lower()})"
         )
         why = (
-            f"insufficient data: {coverage_h:.2f} h of aligned cross-book data "
-            f"(at least {min_coverage_h:g} h of XTMN + XUSDT + USDTTMN books needed)"
+            f"insufficient data: no coin has at least {min_coverage_h:g} h of aligned cross-book data "
+            f"(XTMN + XUSDT + USDTTMN books; best coin: {coverage_h:.2f} h)"
         )
         return Recommendation("insufficient_data", s1.margin_min_pct, s1.leg1_taker, None, (f"{why}; {keep}.",))
 
@@ -867,7 +867,8 @@ class SurveyResult:
 
     @property
     def coverage_h(self) -> float:
-        return max((c.aligned.coverage_s for c in self.coins if c.included), default=0.0) / 3600
+        """Aligned hours of the best-covered coin (included in the totals or not)."""
+        return max((c.aligned.coverage_s for c in self.coins), default=0.0) / 3600
 
     def to_dict(self) -> dict[str, Any]:
         p = self.params
@@ -1032,7 +1033,9 @@ def run_survey(
             continue
         coins.append(survey_coin(aligned, params))
     totals = total_cells(coins)
-    coverage_h = max((c.aligned.coverage_s for c in coins if c.included), default=0.0) / 3600
+    # the best-covered coin, included or not: the totals use only included coins (>= min_coverage_h),
+    # and when there is none the message must name the real best coverage, not 0 h
+    coverage_h = max((c.aligned.coverage_s for c in coins), default=0.0) / 3600
     fees: dict[str, tuple[Decimal, Decimal]] = {}
     for m in markets.values():
         fees.setdefault(m.quote, (m.maker_fee, m.taker_fee))

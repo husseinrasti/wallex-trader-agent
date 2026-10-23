@@ -1,0 +1,2 @@
+{"data":{"day_start_equity_tmn":"5000000.000000000"},"kind":"day_start","reason":"new UTC day 2026-10-02: daily PnL and the daily-loss limit restart","ts":"2026-10-02T00:00:00.000Z"}
+{"data":{"heartbeats":26,"ticks":43201,"uptime_s":86400.0},"kind":"stop","reason":"backtest complete: 43201 ticks","ts":"2026-10-02T00:00:00.000Z"}

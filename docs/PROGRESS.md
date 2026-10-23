@@ -25,7 +25,7 @@ Legend: [x] done and verified · [~] done offline, needs the live API to verify 
 - [x] Tag `v0.2-risk-exec`
 
 ## Phase 3 — Strategies (PRD-03)
-- [ ] Shadow >= 4 h with S1+S2 (synthetic feed run scheduled after the AI wiring; live feed pending API access)
+- [~] Shadow >= 4 h with S1+S2: 4.08 h on the synthetic feed with the real LLM (`docs/REPORTS/shadow_20261023_synth4h/`); live feed pending API access
 - [x] `docs/STRATEGY.md` (evidence sections TODO until data exists)
 - [x] S1 cycle + S2 rebalance decision records pass `logs check` (docs/REPORTS/phase3_acceptance.md, tests/test_strategies_engine.py)
 - [x] Half-size live config (`configs/live_halfsize.yaml`, `run --overlay`) + `docs/GO_LIVE_CHECKLIST.md`; tag `v0.3-strategies`
@@ -38,11 +38,16 @@ Legend: [x] done and verified · [~] done offline, needs the live API to verify 
 - [x] ARCHITECTURE "How AI is used" with a real plan; tag `v0.4-ai`
 
 ## Phase 5 — Backtest, survey, replay (PRD-05)
-- [ ] Survey report
-- [ ] 30-day candle backtest + book backtest (ai on/off) with PNGs
-- [ ] Shadow report >= 4 h
-- [ ] `make replay` reproduces decisions
-- [ ] `deliverables/REPORT.md`; tag `v0.5-backtest`
+Details, commands and numbers: `docs/REPORTS/phase5_acceptance.md`. SYNTHETIC results are never evidence of performance.
+- [x] Survey report with S1 opportunity counts and the recommendation block (`survey_20261022.md`). Verdict: **insufficient data** (0.33 h of aligned real books; 0 opportunities at every margin); defaults kept
+- [~] 30-day candle backtest (ai off) with PNGs: on SYNTHETIC candles (`bt_candles_30d/`), since no real 30-day backfill exists; all 2.25 h of real candles in `bt_candles_recorded_ai_off/`. Real backfill pending API access
+- [~] Book backtest ai on/off with PNGs: all real books (0.32 h, `bt_books_recorded_ai_{off,on}/`, identical); >= 24 h only on SYNTHETIC books (`bt_books_synth24h_*`); ablation (`ablation_20261023.md`) and walk-forward (default kept, `walkforward_s1_margin*/`)
+- [~] Shadow report >= 4 h: 4.08 h, S1+S2, real LLM, SYNTHETIC feed (`shadow_20261023_synth4h/`); a live-feed shadow is pending API access
+- [x] `make replay` reproduces decisions: 40/40 over the whole 4-h shadow run (7,292 of 7,292 ticks; the strict pass, time stamps included, is part of the verdict), 0 socket attempts, 0 LLM provider calls (`replay_20261023.md`); no live run to replay yet
+- [x] `deliverables/REPORT.md` assembled (survey → backtests → ablation → walk-forward → shadow → live: none yet → replay); `docs/REPORTS/` consolidated, index regenerated
+- [x] Review fixes (16 findings: walk-forward end rule, book fill fees / level cap / recording gaps, candle spread window, replay verdict and segment checks, report dates and texts), each with a test; affected reports rerun (`phase5_acceptance.md` §8)
+- [x] `ruff check src tests scripts backtest` clean; `pytest`: 1913 passed, 1 skipped (no network)
+- [ ] Commit the second- and third-session changes; tag `v0.5-backtest`
 
 ## Phase 6 — Ops, docs, video (PRD-06)
 - [ ] docker-compose, run_forever, Telegram, status, TUI, CI

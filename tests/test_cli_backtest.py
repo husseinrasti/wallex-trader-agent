@@ -300,10 +300,25 @@ def test_replay_wiring(use_settings, monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert kw["log_dir"] == logs and kw["state_db"] == tmp_path / "s.sqlite" and kw["out_dir"] == tmp_path / "rep"
     assert kw["reports_dir"] == str(tmp_path / "reports") and kw["strict"] is True
     assert "3/3 decisions reproduced (PASS)" in capsys.readouterr().out
-    # defaults: the runner picks the state DB from the start event; --no-strict
-    assert cli.main(["replay", "--log-dir", str(logs), "--no-strict", "--reports-dir", "", "--log-level",
-                     "WARNING"]) == 0
+    assert kw["allow_partial"] is False
+    # defaults: the runner picks the state DB from the start event; --lenient, --allow-partial
+    assert cli.main(["replay", "--log-dir", str(logs), "--lenient", "--allow-partial", "--reports-dir", "",
+                     "--log-level", "WARNING"]) == 0
     assert calls[-1]["state_db"] is None and calls[-1]["strict"] is False and calls[-1]["reports_dir"] is None
+    assert calls[-1]["allow_partial"] is True
+    assert cli.main(["replay", "--log-dir", str(logs), "--no-strict", "--log-level", "WARNING"]) == cli.EXIT_CANNOT_RUN
+
+
+def test_replay_with_nothing_to_compare_exits_2(use_settings, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                capsys) -> None:
+    module = types.ModuleType("wta.replay.runner")
+    module.run_replay = lambda cfg, **kw: types.SimpleNamespace(  # type: ignore[attr-defined]
+        ok=False, summary="0/0 decisions reproduced", n_reference=0, errors=["nothing to compare: ..."])
+    monkeypatch.setitem(sys.modules, "wta.replay.runner", module)
+    (tmp_path / "logs").mkdir()
+    assert cli.main(["replay", "--log-dir", str(tmp_path / "logs"), "--log-level", "WARNING"]) == cli.EXIT_CANNOT_RUN
+    out = capsys.readouterr().out
+    assert "(FAIL)" in out and "nothing to compare" in out
 
 
 def test_replay_mismatch_exits_1(use_settings, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:

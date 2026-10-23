@@ -31,6 +31,18 @@ def get() -> dict[str, object]:
     return {"commit": commit, "dirty": dirty, "tag": tag or None}
 
 
+def commit_date(rev: str = "HEAD") -> str | None:
+    """``YYYY-MM-DD`` (UTC) of ``rev``'s committer date; None without git. Reports use it as their
+    date when none is given: deterministic for a commit, and never after the day a report is made."""
+    from datetime import UTC, datetime
+
+    out = _git("log", "-1", "--format=%ct", rev)
+    try:
+        return datetime.fromtimestamp(int(out or ""), UTC).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
 def short_commit() -> str:
     c = str(get()["commit"])
     return c[:12] if c != "unknown" else c

@@ -509,6 +509,12 @@ def test_no_synthetic_warning_for_recorded_sources(tmp_path: Path, survey_cfg: C
     # 0.5 h of aligned data is below min_coverage_h: no totals, the configured values are kept
     assert res.recommendation.status == "insufficient_data"
     assert "Insufficient data" in md
+    # ... and the message names the best coin's real coverage (the per-coin table shows it), not 0 h
+    best = max(c.aligned.coverage_s for c in res.coins) / 3600
+    assert best > 0.4 and res.coverage_h == best
+    assert (f"no coin has at least 1 h of aligned cross-book data (XTMN + XUSDT + USDTTMN books; best coin: "
+            f"{best:.2f} h)") in res.recommendation.reasons[0]
+    assert "0.00 h of aligned" not in md
 
 
 def test_source_filter_excludes_synthetic(result: sv.SurveyResult, ro_store: Store, survey_cfg: Config) -> None:

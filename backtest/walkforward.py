@@ -10,6 +10,11 @@
    recorded books do not count) is cut 70 / 30: in-sample = the first 70 % of the ticks,
    out-of-sample = the rest. Each half is its own backtest (a fresh paper account); the OOS run
    preloads the candles before its start as indicator warm-up, like any run — no look-ahead.
+   Every run (both halves of every candidate and the final run) ends under the SAME rule: no
+   end-of-window flatten, holdings valued at the bid (``flatten_at_end=False``), unless
+   ``flatten_at_end`` is given, which then applies to all of them. The runner's automatic rule
+   (flatten in windows >= 8 h) would flatten the 70 % half and not the 30 % one, costing only the
+   in-sample half its last 2 h and the sell-to-TMN fees, which biases the guard towards accepting.
 3. The choice: the candidate with the highest **in-sample** return (``return_pct``); a tie goes to
    the lower in-sample max drawdown, then to the default, then to grid order.
 4. The guard (``accept_rule``): the chosen value is ACCEPTED only if its out-of-sample return **per
@@ -279,6 +284,7 @@ class WalkForwardResult:
     final: BacktestResult | None
     paths: dict[str, Path] = field(default_factory=dict)
     synthetic: bool = False
+    flatten_at_end: bool = False  # the end-of-window rule every run of the walk-forward used
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -296,6 +302,7 @@ class WalkForwardResult:
             "final_params": dict(self.final_params),
             "rows": [p.row() for p in self.points],
             "synthetic": self.synthetic,
+            "flatten_at_end": self.flatten_at_end,
         }
 
 
@@ -363,6 +370,9 @@ async def arun_walkforward(
         points.append(Point(dict(c), _same(c, default), len(points), is_days=is_days, oos_days=oos_days))
     if backtest_kwargs.get("ai", "off") != "off":
         backtest_kwargs.setdefault("llm_cache", out / LLM_CACHE)
+    if backtest_kwargs.get("flatten_at_end") is None:  # one end rule for every run (module docstring, 2.)
+        backtest_kwargs["flatten_at_end"] = False
+    flatten = bool(backtest_kwargs["flatten_at_end"])
     common = {"driver": driver, "strategies": strats, "market_db": market_db, "step_s": step_s, **backtest_kwargs}
     for p in points:
         pcfg = apply_changes(cfg, p.params)
@@ -384,7 +394,7 @@ async def arun_walkforward(
     result = WalkForwardResult(
         grid={k: list(v) for k, v in grid.items()}, default=default, split_ts=split, is_window=is_win,
         oos_window=oos_win, points=points, chosen=chosen, accepted=accepted, reason=reason,
-        final_params=final_params, final=None, synthetic=plan.synthetic is not None,
+        final_params=final_params, final=None, synthetic=plan.synthetic is not None, flatten_at_end=flatten,
     )
     lines = markdown(result)
     md = out / WALKFORWARD_MD
@@ -429,6 +439,11 @@ def markdown(result: WalkForwardResult) -> list[str]:
         f"out-of-sample return **per day of data** does not degrade more than {MAX_DEGRADATION:.0%} vs in-sample "
         "and is not negative, and only if the in-sample return is positive; otherwise keep the pre-grid default. "
         "Each half is a fresh paper account.",
+        "- End of every run (both halves of each candidate and the final run): "
+        + ("the deadline flatten in its last 2 h (no new entries there), then everything sold to TMN."
+           if result.flatten_at_end else
+           "no end-of-window flatten; holdings at the end are valued at the bid (unrealized), the same rule "
+           "for the in-sample and the out-of-sample half."),
     ]
     p0 = result.points[0] if result.points else None
     if p0 is not None and p0.is_days and p0.oos_days:

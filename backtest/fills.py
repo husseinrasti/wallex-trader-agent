@@ -39,7 +39,11 @@ mid = close, spread = the market's median observed spread, unlimited depth at be
 
 Book driver (recorded snapshots): the PaperExchange matching (walk the opposite levels), but a
 fill takes at most ``level_fraction`` (80 %) of a level's quantity (``walk_levels``) and only a
-snapshot newer than the one the order was placed on can fill it.
+snapshot newer than the one the order was placed on can fill it. What our fills took from a level
+stays taken on the next snapshots while that price level is still shown (recorded snapshots never
+reflect our fills), so the cap is 80 % of the level's current quantity minus all we took from it.
+Fee: taker for every fill of an order that was crossing at placement (STOP_LIMIT: at its trigger),
+at the level prices; maker at the limit for an order that was resting when placed.
 """
 
 from __future__ import annotations

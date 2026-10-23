@@ -8,7 +8,21 @@ differs, and the rules are the pessimistic ones of ``backtest/fills.py`` (PRD-05
 * ``driver="books"`` (recorded snapshots, for S1/S2 and realistic fills): PaperExchange matching,
   but a fill takes at most ``level_fraction`` (80 %) of a level's quantity, and an order is matched
   only against a snapshot of its symbol that is NEWER than the one it was placed on (or, for a
-  stop, the one it triggered on).
+  stop, the one it triggered on). Recorded snapshots do not show our own fills and often repeat the
+  same level for many seconds, so what our fills took from a level is carried to the next snapshot
+  of the symbol while that price level is still shown: the cap is ``level_fraction`` x the level's
+  current quantity minus everything we took from it since it appeared (only quantity added to the
+  level becomes available again; a level that disappears starts fresh when it comes back).
+  Recording gaps (``max_gap_s``, the runner passes ``engine.stale_data_s``): an order that is
+  live in the book (a LIMIT/MARKET, or a stop after its trigger) and whose symbol had no snapshot
+  for more than ``max_gap_s`` since the previous one it was looked at is never filled again: the
+  recorded data has a hole there, and live, the OrderManager would have re-priced or canceled it
+  within seconds (``limit_reprice_after_s``); the engine re-prices, crosses or gives it up on the
+  post-gap books. An untriggered stop still triggers after a gap (at the post-gap price). Fee:
+  an order that was crossing at placement (a STOP_LIMIT: at its trigger) pays the TAKER fee on
+  every fill and walks the levels at their prices, also for the remainder the cap left (PRD-05
+  §3.2: maker only if not crossing at placement); an order resting when it was placed is filled at
+  its limit with the maker fee.
 * ``driver="candles"`` (1-minute bars, S2/S3 over 30 days): the current bar per symbol comes from
   ``set_bar(symbol, candle, spread_pct)`` and/or a ``bars`` provider callable. The engine sees the
   synthetic book of ``make_synthetic_book`` (mid = close, spread = the market's median observed
@@ -158,7 +172,9 @@ class _BtOrder:
     """Backtest bookkeeping per open order, next to PaperExchange's ``_Working``."""
 
     ref_ts: float | None  # data time it was placed on / last matched against (bar open ts or book ts)
-    crossing: bool  # crossing when it entered the book (candle driver: taker fee for every fill)
+    crossing: bool  # crossing when it entered the book (placement / stop trigger): taker fee for every fill
+    seen_ts: float | None = None  # books driver: the snapshot ts it was last looked at (recording gaps)
+    gap_blocked: bool = False  # books driver: open across a recording gap, never filled afterwards
 
 
 @dataclass
@@ -186,6 +202,7 @@ class BacktestExchange(PaperExchange):
         spreads: Mapping[str, Decimal] | None = None,
         slippage: Decimal = DEFAULT_SLIPPAGE,
         level_fraction: Decimal = DEFAULT_LEVEL_FRACTION,
+        max_gap_s: float | None = None,
         initial_balances: dict[str, Decimal] | None = None,
         initial_equity_tmn: Decimal = DEFAULT_INITIAL_EQUITY_TMN,
         state: dict[str, Any] | None = None,
@@ -201,7 +218,11 @@ class BacktestExchange(PaperExchange):
             raise ValueError("level_fraction must be in (0, 1]")
         if D(slippage) < 0:
             raise ValueError("slippage must not be negative")
+        if max_gap_s is not None and max_gap_s <= 0:
+            raise ValueError("max_gap_s must be > 0")
         self.driver: Driver = driver
+        self.max_gap_s = max_gap_s
+        self.gap_blocked = 0  # orders kept from filling across a recording gap
         self.slippage = D(slippage)
         self.level_fraction = D(level_fraction)
         self._bars_provider = bars
@@ -209,6 +230,9 @@ class BacktestExchange(PaperExchange):
         self._spreads = {s: D(v) for s, v in sorted((spreads or {}).items())}
         self._reference: dict[str, Decimal] | None = None  # loaded on first use
         self._bt: dict[str, _BtOrder] = {}
+        # books driver: what our fills took per (side, price) level, carried across snapshots of a
+        # symbol while the level is shown: symbol -> (snapshot ts, {(side, price): qty taken})
+        self._level_taken: dict[str, tuple[float, dict[tuple[str, Decimal], Decimal]]] = {}
         fee_markets = apply_fee_snapshot(markets, fee_snapshot) if use_fee_snapshot else dict(markets)
         super().__init__(
             fee_markets,
@@ -347,6 +371,8 @@ class BacktestExchange(PaperExchange):
                 book = book_map.get(symbol)
                 if book is None or (info.ref_ts is not None and book.ts <= info.ref_ts):
                     continue  # no data, or not a newer snapshot than the one it was placed on
+                if self._across_gap(w, info, book):
+                    continue  # open across a hole in the recording: never filled after it
                 new = self._match_book(w, info, book, now)
             else:
                 bar = bars.get(symbol)
@@ -359,6 +385,20 @@ class BacktestExchange(PaperExchange):
                     self._on_fill(f)
         return fills
 
+    def _across_gap(self, w: _Working, info: _BtOrder, book: BookSnapshot) -> bool:
+        """True when ``w`` (live in the book) must not fill on ``book``: its symbol had no snapshot for
+        more than ``max_gap_s`` since the last one the order was looked at (see the module docstring)."""
+        last = info.seen_ts if info.seen_ts is not None else info.ref_ts
+        info.seen_ts = book.ts
+        if info.gap_blocked:
+            return True
+        if self.max_gap_s is None or not w.triggered or last is None or book.ts - last <= self.max_gap_s:
+            return False
+        info.gap_blocked = True
+        self.gap_blocked += 1
+        w.order.raw = {**w.order.raw, "recording_gap_s": round(book.ts - last, 3)}
+        return True
+
     def _match_book(self, w: _Working, info: _BtOrder, book: BookSnapshot, now: float) -> list[Fill]:
         if not w.triggered:
             self._check_trigger(w, book, now)
@@ -367,6 +407,13 @@ class BacktestExchange(PaperExchange):
                 info.crossing = w.takes_liquidity
             return []
         return self._match_market(w, book, now) if w.is_market else self._match_limit(w, book, now)
+
+    def _match_limit(self, w: _Working, book: BookSnapshot, now: float) -> list[Fill]:
+        """PaperExchange's limit match, but an order that was crossing when it entered the book stays
+        a taker for every fill (books driver; PaperExchange lets its remainder rest as a maker)."""
+        if self.driver == "books" and self._info(w).crossing:
+            w.takes_liquidity = True
+        return super()._match_limit(w, book, now)
 
     def _match_bar(self, w: _Working, info: _BtOrder, bar: Candle, now: float) -> list[Fill]:
         req = w.order.req
@@ -440,10 +487,11 @@ class BacktestExchange(PaperExchange):
     def _walk(
         self, w: _Working, book: BookSnapshot, price_ok: Callable[[Decimal], bool]
     ) -> list[tuple[Decimal, Decimal]]:
-        """PaperExchange's level walk, capped at ``level_fraction`` of each level's quantity."""
+        """PaperExchange's level walk, capped at ``level_fraction`` of each level's quantity minus
+        what our fills already took from that level (``_carried_taken``)."""
         req = w.order.req
         book_side = "ask" if req.side == "BUY" else "bid"
-        taken = self._taken_for(book)
+        taken = self._carried_taken(book)
         already = {price: qty for (side, price), qty in taken.items() if side == book_side}
         takes = walk_levels(
             opposite_levels(book, req.side),
@@ -456,6 +504,20 @@ class BacktestExchange(PaperExchange):
         for price, qty in takes:
             taken[(book_side, price)] = taken.get((book_side, price), D0) + qty
         return takes
+
+    def _carried_taken(self, book: BookSnapshot) -> dict[tuple[str, Decimal], Decimal]:
+        """Liquidity our fills took from ``book``'s levels: this snapshot's, plus, on a newer snapshot
+        of the symbol, what was taken from a level that is still shown at the same price (a recorded
+        snapshot never reflects our own fills). A level no longer shown is dropped."""
+        current = self._level_taken.get(book.symbol)
+        if current is not None and current[0] == book.ts:
+            return current[1]
+        taken: dict[tuple[str, Decimal], Decimal] = {}
+        if current is not None and book.ts > current[0]:
+            shown = {("ask", lv.price) for lv in book.asks} | {("bid", lv.price) for lv in book.bids}
+            taken = {key: qty for key, qty in sorted(current[1].items()) if key in shown and qty > 0}
+        self._level_taken[book.symbol] = (book.ts, taken)
+        return taken
 
     def _apply_fill(self, w: _Working, price: Decimal, qty: Decimal, is_maker: bool, now: float) -> Fill:
         fill = super()._apply_fill(w, price, qty, is_maker, now)
@@ -473,10 +535,12 @@ class BacktestExchange(PaperExchange):
             "version": BACKTEST_STATE_VERSION,
             "driver": self.driver,
             "orders": {
-                cid: {"ref_ts": info.ref_ts, "crossing": info.crossing}
+                cid: {"ref_ts": info.ref_ts, "crossing": info.crossing, "seen_ts": info.seen_ts,
+                      "gap_blocked": info.gap_blocked}
                 for cid, info in sorted(self._bt.items())
                 if cid in open_ids
             },
+            "gap_blocked": self.gap_blocked,
             "bars": {
                 sym: {
                     "candle": bar.candle.model_dump(mode="json"),
@@ -490,6 +554,7 @@ class BacktestExchange(PaperExchange):
     def load_state(self, state: dict[str, Any]) -> None:
         """Replace everything with a ``state()`` snapshot (a plain PaperExchange state also loads)."""
         super().load_state(state)
+        self._level_taken = {}
         bt = state.get("backtest") or {}
         version = bt.get("version", BACKTEST_STATE_VERSION)
         if version != BACKTEST_STATE_VERSION:
@@ -498,10 +563,12 @@ class BacktestExchange(PaperExchange):
         if saved_driver != self.driver:
             raise ValueError(f"backtest state was saved by the {saved_driver} driver, not {self.driver}")
         self._bt = {}
+        self.gap_blocked = int(bt.get("gap_blocked", 0) or 0)
         for cid, item in sorted((bt.get("orders") or {}).items()):
-            ref = item.get("ref_ts")
+            ref, seen = item.get("ref_ts"), item.get("seen_ts")
             self._bt[cid] = _BtOrder(
-                ref_ts=None if ref is None else float(ref), crossing=bool(item["crossing"])
+                ref_ts=None if ref is None else float(ref), crossing=bool(item["crossing"]),
+                seen_ts=None if seen is None else float(seen), gap_blocked=bool(item.get("gap_blocked", False)),
             )
         self._bars = {}
         for sym, item in sorted((bt.get("bars") or {}).items()):

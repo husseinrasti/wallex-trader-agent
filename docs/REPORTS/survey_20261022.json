@@ -1721,7 +1721,7 @@
       }
     }
   },
-  "config_hash": "542ea0791118",
+  "config_hash": "d599c01c0ad6",
   "db_path": "data/wta.sqlite",
   "dollar": {
     "atr_15m_pct": {
@@ -1732,7 +1732,7 @@
     "candle_source": "store",
     "candles_in_window": 135,
     "regimes": {
-      "n/a": 192
+      "n/a": 288
     },
     "ret_1h": {
       "max": 0.003149594683307148,
@@ -1745,11 +1745,11 @@
       "p95": 0.0026723928468107626
     },
     "ret_24h": null,
-    "steps": 192
+    "steps": 288
   },
   "excluded_sources": {},
-  "generated": "2026-10-22T20:57:41.370Z",
-  "git_commit": "4cbe31aa0fa60732cbc3120a0e08a60418c424ad",
+  "generated": "2026-10-23T06:37:22.749Z",
+  "git_commit": "e25b87b5248b1dddc40353ec1816acab378685d8",
   "git_dirty": true,
   "markets": [
     {
@@ -2147,7 +2147,7 @@
     "low_activity": null,
     "margin_min_pct": "0.0015",
     "reasons": [
-      "insufficient data: 0.00 h of aligned cross-book data (at least 1 h of XTMN + XUSDT + USDTTMN books needed); keep the configured values (margin_min_pct 0.0015, leg1_taker true)."
+      "insufficient data: no coin has at least 1 h of aligned cross-book data (XTMN + XUSDT + USDTTMN books; best coin: 0.33 h); keep the configured values (margin_min_pct 0.0015, leg1_taker true)."
     ],
     "status": "insufficient_data"
   },
@@ -2159,8 +2159,8 @@
   "synthetic": false,
   "totals": {},
   "window": {
-    "from": "2026-10-20T20:16:13.129Z",
-    "since_h": 48.0,
+    "from": "2026-10-19T20:16:13.129Z",
+    "since_h": 72.0,
     "to": "2026-10-22T20:16:13.129Z",
     "until": "the newest recorded order book"
   }

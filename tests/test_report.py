@@ -390,7 +390,9 @@ def test_limitations_auto_filled_and_custom_first(tmp_path: Path, inputs: dict[s
     # the inputs are synthetic: the S1 window is "generated", never called "recorded"
     assert "S1 backtest window limited to generated (synthetic) 3.0 h of order books." in lim
     assert "synthetic" in lim.lower() and "not evidence" in lim
-    assert "pessimistic fill model" in lim
+    assert "pessimistic book fill model" in lim and "at most 80% of each level's quantity per snapshot" in lim
+    assert "taker fee is paid on every fill of an order that was crossing at placement" in lim
+    assert "best-level" not in lim and "unlimited depth" not in lim  # the candle model's words, not this one's
     assert "Sharpe and Sortino are computed from" in lim and "over 3.0 h of data" in lim
     assert "was still held outside TMN (unrealized)" in lim and "not flattened" in lim
     assert lim.index("Recorder was down") < lim.index("S1 backtest window")
@@ -411,10 +413,25 @@ def test_limitations_auto_filled_and_custom_first(tmp_path: Path, inputs: dict[s
     ).read_text()
     lim = _section(candles, "## Limitations")
     assert "S1 not backtested on candles" in lim
-    assert "synthetic book (mid = close" in lim
+    assert "synthetic book: mid = close" in lim and "unlimited depth at the best level" in lim
+    assert "pessimistic candle fill model" in lim and "80%" not in lim  # no level cap in the candle driver
+    assert "median observed" not in lim  # the spread's source is stated from meta.spreads, never assumed
     assert "AI disabled (ai=off)" in lim
     assert "requested window is 720.0 h but the data present covers only 3.0 h" in lim
     assert lim.count("S1 backtest window limited") == 1
+
+    spreads = {"BTCUSDT": {"spread_pct": "0.0018", "source": "observed", "books": 290,
+                           "from": "2026-10-22T14:20:05.929Z", "to": "2026-10-22T14:40:15.724Z"},
+               "SOLUSDT": {"spread_pct": "0.0008", "source": "reference"}}
+    mixed = _write(tmp_path / "candles_spreads", inputs, plans=None, meta=_real_meta(
+        driver="candles", strategies="S2,S3", ai="off", spreads=spreads)).read_text()
+    lim = _section(mixed, "## Limitations")
+    assert ("spread = the median spread of recorded books (290 books, 2026-10-22T14:20:05.929Z → "
+            "2026-10-22T14:40:15.724Z, none after the window end) for BTCUSDT; the reference spread of "
+            "configs/markets_snapshot.yaml for SOLUSDT") in lim
+    only_ref = _write(tmp_path / "candles_ref", inputs, plans=None, meta=_real_meta(
+        driver="candles", strategies="S2,S3", ai="off", spreads={"SOLUSDT": spreads["SOLUSDT"]})).read_text()
+    assert "the reference spread of configs/markets_snapshot.yaml for every symbol" in only_ref
 
     offline = _write(tmp_path / "offline", inputs, plans=_plans(T0, T0 + 3600, model="offline-rules-v1"))
     lim = _section(offline.read_text(), "## Limitations")
@@ -752,3 +769,43 @@ def test_final_assembly_custom_sections_and_empty_dir(tmp_path: Path) -> None:
     empty = assemble_final_report(tmp_path / "missing", tmp_path / "empty" / "REPORT.md").read_text()
     assert empty.count(f"| {NOT_AVAILABLE} |") == 7
     assert SYNTHETIC_BANNER not in empty
+
+
+def test_decision_log_links_cover_every_daily_file(tmp_path: Path, inputs: dict[str, Any]) -> None:
+    """``decisions.jsonl`` is the engine's link to the newest day only: the report links every day."""
+    out = tmp_path / "bt"
+    out.mkdir()
+    for day in ("20261001", "20261002", "20261003"):
+        (out / f"decisions-{day}.jsonl").write_text('{"kind": "veto"}\n')
+    (out / "decisions.jsonl").symlink_to("decisions-20261003.jsonl")
+    text = _write(out, inputs).read_text()
+    assert ("Decision records (3 daily files, together the whole run: [decisions-20261001.jsonl]"
+            "(decisions-20261001.jsonl), [decisions-20261002.jsonl](decisions-20261002.jsonl), "
+            "[decisions-20261003.jsonl](decisions-20261003.jsonl); `decisions.jsonl` links only the newest day") in text
+    assert "([decisions.jsonl](decisions.jsonl))" not in text
+    single = tmp_path / "one"
+    single.mkdir()
+    (single / "decisions-20261001.jsonl").write_text('{"kind": "veto"}\n')
+    assert "Decision records ([decisions-20261001.jsonl](decisions-20261001.jsonl)):" in _write(single, inputs).read_text()
+
+
+def test_report_date_is_labelled_and_never_taken_for_the_data_end(tmp_path: Path, inputs: dict[str, Any]) -> None:
+    given = _write(tmp_path / "given", inputs, meta=_meta(report_date="2026-10-23", data_end="2026-10-22T13:00:00Z",
+                                                          report_date_source="commit date of abc123")).read_text()
+    assert "| Data end (UTC) | 2026-10-22T13:00:00Z |" in given
+    assert "| Report date | 2026-10-23 (commit date of abc123) |" in given
+    assert json.loads((tmp_path / "given" / SUMMARY_JSON).read_text())["report_date"] == "2026-10-23"
+    fallback = _write(tmp_path / "fallback", inputs).read_text()  # no date given: says it is the data's end
+    assert "| Report date | 2026-10-22 (no report date given: the data's end) |" in fallback
+
+
+def test_a_companion_markdown_takes_the_date_of_its_runs_summary(tmp_path: Path, inputs: dict[str, Any]) -> None:
+    """``walkforward.md`` sits next to the final run's ``summary.json``: its date is that report date,
+    not the first data date in its text (2026-10-01 here)."""
+    reports = tmp_path / "REPORTS"
+    _write(reports / "wf", inputs, meta=_meta(report_date="2026-10-23"))
+    (reports / "wf" / "README.md").unlink(missing_ok=True)
+    (reports / "wf" / "report.md").unlink()
+    (reports / "wf" / "walkforward.md").write_text("# Walk-forward: `x`\n\n- In-sample: 2026-10-01T00:00:00.000Z\n")
+    text = update_index(reports).read_text()
+    assert "| [Walk-forward: `x`](wf/walkforward.md) | 2026-10-23 |" in text

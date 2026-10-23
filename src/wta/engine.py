@@ -864,7 +864,10 @@ class Engine:
         self.s1_stats: dict[str, dict[str, Any]] = {}  # per coin: evaluated / opportunity ticks
         self._feature_state_ts = float("-inf")
         self.candles = CandleCache(self.watchlist, keep_s=CANDLE_CACHE_KEEP_S, resolution=CANDLE_RESOLUTION)
-        self._candle_seq = 0  # arrivals in ``candles`` (engine_candles.seq), monotonic per state DB
+        # arrivals in ``candles`` (engine_candles.seq), monotonic per state DB: continued from the store
+        # at once, so candles ingested before ``startup`` (a feed publishing early) never reuse the seq
+        # numbers of an earlier run on the same state DB (a replay of that run would read them)
+        self._candle_seq = self._stored_candle_seq()
         self._tick_candles: dict[str, list[Candle]] | None = None  # this tick's candle snapshot
         self._tick_candle_seq: int | None = None
         self.candle_refresher: CandleRefresher | None = None
@@ -2106,6 +2109,12 @@ class Engine:
             best = st["best_excess_pct"]
             if best is None or excess > D(best):
                 st["best_excess_pct"] = str(excess.quantize(Decimal("0.0000001")))
+
+    def _stored_candle_seq(self) -> int:
+        try:
+            return self.store.max_engine_candle_seq(self.mode)
+        except (sqlite3.Error, RuntimeError, AttributeError):  # no table yet / a stub store
+            return 0
 
     def ingest_candles(self, candles: list[Candle]) -> int:
         """Candles from the candle task or the synthetic feed: into the in-memory cache and, the

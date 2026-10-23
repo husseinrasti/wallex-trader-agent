@@ -48,9 +48,11 @@ from wta.replay.runner import (
     load_recorded_run,
     network_guard,
     pick_run_dir,
+    report_day,
     run_replay_async,
 )
 from wta.utils.decimalutil import D
+from wta.utils.timeutil import iso
 
 from .conftest import T0
 
@@ -133,25 +135,29 @@ def review_change(eng: Any, now: float) -> None:
     eng.reload_config(change.config)
 
 
-async def record(root: Path, *, review_at: int | None = None, kill_at: int | None = None) -> dict[str, Any]:
+async def record(root: Path, *, review_at: int | None = None, kill_at: int | None = None, logs: str = "logs",
+                 t0: float = T0, ticks: int = TICKS, inject: bool = True, **over: Any) -> dict[str, Any]:
     """The recording: shadow engine on the synthetic feed, SimClock, offline AI provider; optionally
-    a reviewer config change after tick ``review_at`` and a KILL file during tick ``kill_at``."""
-    cfg = rec_cfg(root)
-    clock = ReplayClock(T0)  # a SimClock; ``jump_when`` puts the startup reconcile 200 ms after the start
+    a reviewer config change after tick ``review_at`` and a KILL file during tick ``kill_at``.
+    ``logs`` / ``t0`` / ``ticks``: another log dir, start time and length (a second run on the same
+    state DB); ``inject=False``: no acceptance-test intents; ``over``: config overrides."""
+    cfg = rec_cfg(root, **over)
+    clock = ReplayClock(t0)  # a SimClock; ``jump_when`` puts the startup reconcile 200 ms after the start
     kill_file = root / "KILL"
-    eng = await build_engine(cfg, no_keys(), "shadow", feed="synthetic", log_dir=root / "logs", clock=clock,
+    eng = await build_engine(cfg, no_keys(), "shadow", feed="synthetic", log_dir=root / logs, clock=clock,
                              kill_file=kill_file if kill_at is not None else None, runtime_dir=root / "runtime",
                              mcp=None, telegram=False, paper_balances={"TMN": D("5000000"), "USDT": D("8")},
-                             injected=_injected())
-    assert eng.ai_source == "offline-rules" and eng.synthetic is not None
+                             injected=_injected() if inject else [])
+    assert eng.synthetic is not None
+    assert eng.ai_source == ("offline-rules" if cfg.ai.enabled else "disabled")
     feed = eng.synthetic
     feed.params = dataclasses.replace(feed.params, jump_rate_per_hour=40.0)  # cross-book dislocations for S1
     try:
-        feed.publish(T0)
-        clock.jump_when(lambda: eng.started_ts is not None, T0 + STARTUP_LAG_S)
+        feed.publish(t0)
+        clock.jump_when(lambda: eng.started_ts is not None, t0 + STARTUP_LAG_S)
         await eng.startup()
-        now = T0 + STARTUP_LAG_S + 0.003  # the first tick follows the startup at once, on the same books
-        for k in range(TICKS):
+        now = t0 + STARTUP_LAG_S + 0.003  # the first tick follows the startup at once, on the same books
+        for k in range(ticks):
             if k:
                 now = round(now + DT + 0.0013 * (k % 7), 6)  # uneven tick spacing, like a real loop
                 feed.step(DT)
@@ -167,7 +173,7 @@ async def record(root: Path, *, review_at: int | None = None, kill_at: int | Non
     finally:
         eng.shutdown("recording done")
         await eng.aclose()
-    return {"cfg": cfg, "logs": root / "logs", "db": Path(state_db_path(cfg, "shadow", "synthetic"))}
+    return {"cfg": cfg, "logs": root / logs, "db": Path(state_db_path(cfg, "shadow", "synthetic"))}
 
 
 @pytest.fixture(scope="module")
@@ -264,6 +270,7 @@ async def test_replay_reproduces_every_decision_with_zero_network(recorded: dict
     assert result.summary in text and "(PASS)" in text
     assert "SYNTHETIC — not evidence of performance" in text and "SYNTHETIC DATA — not evidence of performance" in text
     assert "0 socket attempts, 0 LLM provider calls" in text and "## Limitations" in text
+    assert f"| segment complete | yes: the stop event counts {TICKS} ticks = {TICKS} in the state DB |" in text
     assert json.loads((tmp_path / "rep" / "replay_report.json").read_text())["ok"] is True
 
 
@@ -318,6 +325,7 @@ async def test_a_mutated_cached_plan_is_detected(recorded: dict[str, Any], tmp_p
     info = {p["decision_id"]: p for p in result.plans}
     assert info[target["decision_id"]]["reproduced"] is False
     assert "usdt_target_share" in info[target["decision_id"]]["error"]
+    assert any(e.startswith(f"plan {target['decision_id']} re-derived differently") for e in result.errors)
     assert result.run["network"]["provider_calls"] == 0  # still served from the cache, never a provider
 
 
@@ -352,6 +360,109 @@ async def test_a_mutated_recorded_decision_is_detected(recorded: dict[str, Any],
     assert result.n_matched == result.n_reference - 1
 
 
+def _mutate_decisions(log_dir: Path, change: Any) -> list[str]:
+    """Apply ``change(record) -> bool`` to every recorded decision line; the ids it changed."""
+    changed: list[str] = []
+    for path in family_files(log_dir, "decisions"):
+        lines = path.read_text().splitlines()
+        for n, line in enumerate(lines):
+            obj = json.loads(line)
+            if change(obj):
+                changed.append(obj["decision_id"])
+                lines[n] = json.dumps(obj)
+        path.write_text("\n".join(lines) + "\n")
+    return changed
+
+
+async def test_the_strict_pass_is_part_of_the_verdict(recorded: dict[str, Any], tmp_path: Path,
+                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    rec = copy_recording(recorded, tmp_path)
+    done = {"n": 0}
+
+    def change(obj: dict[str, Any]) -> bool:  # fields the PRD list does not cover: fees, fills, features
+        if obj["kind"] != "order" or done["n"] or not (obj.get("order") or {}).get("response"):
+            return False
+        done["n"] = 1
+        obj["order"]["response"]["fee_paid"] = "123456"
+        obj["order"]["response"]["filled_qty"] = "42"
+        obj["intent"].setdefault("features", {})["equity_tmn"] = "1"
+        return True
+
+    (target,) = _mutate_decisions(rec["logs"], change)
+    result = await replay(rec, tmp_path)
+    assert result.mismatches == [] and result.n_matched == result.n_reference  # the PRD fields still agree
+    assert not result.ok and not result.strict_check["ok"]
+    fields = {m["field"] for m in result.strict_check["mismatches"] if m["decision_id"] == target}
+    assert {"order.response.fee_paid", "order.response.filled_qty", "intent.features.equity_tmn"} <= fields
+    assert any(e.startswith("strict pass failed") for e in result.errors)
+    assert "(FAIL)" in Path(result.report_file or "").read_text()
+    code = await asyncio.to_thread(_run_script, ["--log-dir", str(rec["logs"]), "--state-db", str(rec["db"]),
+                                                 "--no-index", "--reports-dir", "", "--out", str(tmp_path / "script")])
+    assert code == 1 and "-> FAIL" in capsys.readouterr().out
+
+
+async def test_time_stamps_are_compared(recorded: dict[str, Any], tmp_path: Path) -> None:
+    rec = copy_recording(recorded, tmp_path)
+    shifted: list[str] = []
+
+    def change(obj: dict[str, Any]) -> bool:  # a fill seen an hour later, a position closed an hour later
+        hit = False
+        for part, key in (("outcome", "done_ts"), ("outcome", "closed_ts"), ("order", "response")):
+            sub = obj.get(part)
+            if part == "order" and isinstance(sub, dict) and isinstance(sub.get("response"), dict):
+                resp = sub["response"]
+                if isinstance(resp.get("updated_ts"), int | float):
+                    resp["updated_ts"] += 3600.0
+                    shifted.append("order.response.updated_ts")
+                    hit = True
+            elif isinstance(sub, dict) and isinstance(sub.get(key), int | float):
+                sub[key] += 3600.0
+                shifted.append(f"{part}.{key}")
+                hit = True
+        return hit
+
+    assert _mutate_decisions(rec["logs"], change) and shifted
+    result = await replay(rec, tmp_path)
+    assert not result.ok
+    fields = {m["field"] for m in result.strict_check["mismatches"]}
+    assert fields & {"outcome.done_ts", "outcome.closed_ts", "order.response.updated_ts"}, fields
+
+
+async def test_a_crash_only_in_the_replay_fails_it(recorded: dict[str, Any], tmp_path: Path,
+                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    from wta.engine import Engine
+
+    calls = {"n": 0}
+    original = Engine._scheduled  # noqa: SLF001 - the tick's last step: the decisions are already written
+
+    async def flaky(self: Any, ctx: Any) -> None:
+        calls["n"] += 1
+        if calls["n"] in (100, 101):
+            raise RuntimeError("replay-only crash (test)")
+        await original(self, ctx)
+
+    monkeypatch.setattr(Engine, "_scheduled", flaky)
+    result = await replay(recorded, tmp_path)
+    assert result.n_matched == result.n_reference  # the decisions alone would not show it
+    assert not result.ok
+    assert any("crashed on other ticks than the recorded one" in e and "recorded on none" in e
+               for e in result.errors), result.errors
+
+
+async def test_a_window_without_decisions_is_nothing_to_compare(tmp_path: Path,
+                                                               capsys: pytest.CaptureFixture[str]) -> None:
+    rec = await record(tmp_path, ticks=60, inject=False, **{"ai.enabled": False,
+                       "strategies.s1_crossbook.enabled": False, "strategies.s2_usdtalloc.enabled": False})
+    assert not list(iter_family(rec["logs"], "decisions"))
+    result = await replay(rec, tmp_path / "out")
+    assert result.n_reference == result.n_replayed == 0 and result.summary == "0/0 decisions reproduced"
+    assert not result.ok and any(e.startswith("nothing to compare") for e in result.errors)
+    assert "(FAIL)" in Path(result.report_file or "").read_text()
+    code = await asyncio.to_thread(_run_script, ["--log-dir", str(rec["logs"]), "--state-db", str(rec["db"]),
+                                                 "--no-index", "--reports-dir", "", "--out", str(tmp_path / "script")])
+    assert code == 2 and "-> FAIL" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------- a cache miss is a failed replay
 
 
@@ -376,32 +487,102 @@ async def test_a_missing_cache_entry_in_a_lenient_replay_is_reported(recorded: d
     target = plan_records(rec["logs"])[2]
     (rec["logs"] / "llm_cache" / f"{target['plan_snapshot']['prompt_hash']}.json").unlink()
     result = await replay(rec, tmp_path, strict=False)
-    assert not result.ok and result.errors == []
+    assert not result.ok  # lenient keeps going; the verdict still fails on the missing plan
+    assert not any("cache miss" in e.lower() for e in result.errors)  # the miss itself is a note, not a stop
+    assert all(e.startswith("strict pass failed") for e in result.errors)
     assert result.run["inputs"]["ticks"] == TICKS  # lenient: ran past the gap
     assert any(target["decision_id"] in n and "cache miss" in n.lower() for n in result.notes)
 
 
-async def test_a_run_still_being_written_is_replayed_up_to_its_last_committed_tick(
-    recorded: dict[str, Any], tmp_path: Path
-) -> None:
+def _cut_ticks(db: Path, keep_until: float) -> None:
     import sqlite3
 
-    rec = copy_recording(recorded, tmp_path)
-    ticks = load_recorded_run(rec["logs"], rec["db"]).tick_ts
-    cut = ticks[int(len(ticks) * 0.6)]
-    conn = sqlite3.connect(rec["db"])
+    conn = sqlite3.connect(db)
     with conn:
-        conn.execute("DELETE FROM ticks WHERE ts > ?", (cut,))  # the engine has not committed these yet
+        conn.execute("DELETE FROM ticks WHERE ts > ?", (keep_until,))
     conn.close()
-    path = family_files(rec["logs"], "events")[0]
+
+
+def _drop_stop_event(log_dir: Path) -> None:
+    path = family_files(log_dir, "events")[0]
     path.write_text("".join(line + "\n" for line in path.read_text().splitlines() if json.loads(line)["kind"] != "stop"))
 
-    result = await replay(rec, tmp_path)
+
+async def test_a_run_still_being_written_fails_unless_a_partial_replay_is_allowed(
+    recorded: dict[str, Any], tmp_path: Path
+) -> None:
+    rec = copy_recording(recorded, tmp_path)
+    ticks = load_recorded_run(rec["logs"], rec["db"]).tick_ts
+    _cut_ticks(rec["db"], ticks[int(len(ticks) * 0.6)])  # the engine has not committed these yet
+    _drop_stop_event(rec["logs"])
+
+    failed = await replay(rec, tmp_path / "strict")  # a prefix is not a reproduction of the run
+    assert not failed.ok and failed.n_matched == failed.n_reference  # ... although every replayed decision matches
+    assert any("no stop event" in e and "--allow-partial" in e for e in failed.errors), failed.errors
+    assert "(FAIL)" in Path(failed.report_file or "").read_text()
+
+    result = await replay(rec, tmp_path / "partial", allow_partial=True)
     assert result.ok, result.to_markdown()
     recd = result.run["recorded"]
-    assert recd["in_progress"] is True and result.run["window"]["ticks"] == int(len(ticks) * 0.6) + 1
+    assert recd["in_progress"] is True and recd["partial"] is True and recd["stop"] is False
+    assert result.run["window"]["ticks"] == int(len(ticks) * 0.6) + 1
     assert recd["excluded"]["decision lines after the last tick"] > 0
-    assert any("still being written" in n for n in result.notes)
+    assert any(n.startswith("PARTIAL replay (allowed with --allow-partial)") for n in result.notes)
+    assert "PARTIAL: only the ticks committed so far" in Path(result.report_file or "").read_text()
+
+
+async def test_a_state_db_with_fewer_ticks_than_the_stop_event_counts_fails(
+    recorded: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rec = copy_recording(recorded, tmp_path)
+    run = load_recorded_run(rec["logs"], rec["db"])
+    assert run.stop is not None and run.stop_ticks == len(run.ticks) == TICKS  # the complete recording
+    _cut_ticks(rec["db"], run.tick_ts[int(TICKS * 0.3)])  # a stale / partial copy; the stop event is kept
+    cut = load_recorded_run(rec["logs"], rec["db"])
+    assert cut.stop_ticks == TICKS and len(cut.ticks) == int(TICKS * 0.3) + 1 and not cut.in_progress
+
+    result = await replay(rec, tmp_path)
+    assert not result.ok
+    assert any(f"but its stop event counts {TICKS}" in e for e in result.errors), result.errors
+    assert any("written after its last committed tick" in e for e in result.errors), result.errors
+    assert (f"| segment complete | NO: the stop event counts {TICKS} ticks, the state DB holds {int(TICKS * 0.3) + 1}"
+            in Path(result.report_file or "").read_text())
+    code = await asyncio.to_thread(_run_script, ["--log-dir", str(rec["logs"]), "--state-db", str(rec["db"]),
+                                                 "--no-index", "--reports-dir", "", "--out", str(tmp_path / "script")])
+    assert code == 1 and "-> FAIL" in capsys.readouterr().out
+
+
+async def test_a_segment_ends_at_its_own_stop_event_when_runs_share_the_state_db(tmp_path: Path) -> None:
+    # run A, then run B on the SAME state DB (one file per mode) with another log dir, 1000 s later
+    a = await record(tmp_path, logs="logs_a", ticks=150)
+    last_a = load_recorded_run(a["logs"], a["db"]).tick_ts[-1]
+    b = await record(tmp_path, logs="logs_b", t0=last_a + 1000.0, ticks=150)
+    assert a["db"] == b["db"]
+    run_a = load_recorded_run(a["logs"], a["db"])
+    assert len(run_a.ticks) == run_a.stop_ticks == 150  # B's ticks are not part of A
+    assert run_a.tick_ts[-1] == last_a and run_a.segment_end is not None and run_a.segment_end < last_a + 1000.0
+    assert all(ts <= run_a.segment_end for ts, _ in run_a.balances)
+    import sqlite3
+
+    conn = sqlite3.connect(a["db"])
+    try:  # B continued A's candle numbering (its pre-startup arrivals did not restart at seq 1)
+        n, distinct, top = conn.execute("SELECT COUNT(*), COUNT(DISTINCT seq), MAX(seq) FROM engine_candles").fetchone()
+        assert n == distinct == top
+    finally:
+        conn.close()
+    result = await replay(a, tmp_path / "rep_a")
+    assert result.ok, result.to_markdown()
+    assert result.run["window"]["ticks"] == 150 and result.errors == []
+
+    # a state DB written by an engine before that fix: a later run's arrivals reuse seq 1..6
+    conn = sqlite3.connect(a["db"])
+    with conn:
+        conn.execute("INSERT INTO engine_candles(seq, mode, symbol, resolution, ts, o, h, l, c, v) "
+                     "SELECT seq, mode, symbol, resolution, ts + 2000, o, h, l, c, v FROM engine_candles "
+                     "WHERE seq <= 6")
+    conn.close()
+    again = await replay(a, tmp_path / "rep_a_dup")
+    assert again.ok, again.to_markdown()  # the later bars (opening after A's last tick) are skipped
 
 
 # ---------------------------------------------------------------- reviewer changes and a kill file
@@ -552,6 +733,7 @@ def test_replay_check_script_exit_codes(recorded: dict[str, Any], tmp_path: Path
     assert _run_script([*common, "--out", str(tmp_path / "ok")]) == 0
     out = capsys.readouterr().out
     assert "decisions reproduced -> PASS" in out and "0 socket attempts, 0 LLM provider calls" in out
+    assert "final-heartbeat values equal" in out
     assert "SYNTHETIC" in out
 
     rec = copy_recording(recorded, tmp_path / "bad")
@@ -586,3 +768,36 @@ def test_run_dirs_newest_live_first_else_newest_shadow(tmp_path: Path) -> None:
     assert picked is not None and picked["path"] == live and picked["mode"] == "live"
     assert [r["path"].name for r in find_run_dirs(tmp_path)] == ["shadow_new", "live_run", "shadow_old"]
     assert pick_run_dir(tmp_path / "missing") is None
+
+
+# ---------------------------------------------------------------- report date, end state, analyst gaps
+
+
+def test_the_report_is_filed_under_the_day_of_the_last_tick(recorded: dict[str, Any]) -> None:
+    run = load_recorded_run(recorded["logs"], recorded["db"])
+    midnight = 1_792_713_600.0  # 2026-10-23T00:00:00Z
+    assert report_day(dataclasses.replace(run, tick_ts=[midnight - 30.0, midnight - 1.0, midnight + 5.0])) == "20261023"
+    assert report_day(dataclasses.replace(run, tick_ts=[midnight - 30.0, midnight - 1.0])) == "20261022"
+
+
+async def test_the_end_state_and_the_analyst_gaps_are_reported(recorded: dict[str, Any], tmp_path: Path) -> None:
+    result = await replay(recorded, tmp_path / "plain")
+    end = result.run["end_state"]
+    assert end["compared"] and end["equal"], end
+    fields = [r["field"] for r in end["rows"]]
+    assert fields[:2] == ["equity_tmn", "fees_paid_tmn"] and "S1 BTC counters" in fields
+    assert "## End state (informational, not part of the verdict)" in Path(result.report_file or "").read_text()
+    assert not any(n.startswith("The recorded analyst") for n in result.notes)  # the offline provider never failed
+
+    rec = copy_recording(recorded, tmp_path)
+    run = load_recorded_run(rec["logs"], rec["db"])
+    t1, t2 = iso(run.tick_ts[100]), iso(run.tick_ts[200])
+    with family_files(rec["logs"], "events")[0].open("a") as fh:
+        fh.write(json.dumps({"kind": "ai_degraded", "ts": t1, "reason": "analyst cycle failed: llm unavailable"}) + "\n")
+        fh.write(json.dumps({"kind": "plan_stale", "ts": t2, "reason": "plan is old"}) + "\n")
+    result = await replay(rec, tmp_path / "gaps")
+    assert result.ok, result.to_markdown()
+    (note,) = [n for n in result.notes if n.startswith("The recorded analyst")]
+    assert f"1 failure streak(s) from {t1}; not recovered before the end" in note
+    assert f"plan_stale event(s) ({t2}) both runs trade rules-only" in note
+    assert note in Path(result.report_file or "").read_text()

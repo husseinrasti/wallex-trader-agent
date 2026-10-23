@@ -1,0 +1,294 @@
+{
+  "ablation": {
+    "fees_paid_tmn": {
+      "delta": 0.0,
+      "off": 3122.641,
+      "on": 3122.641
+    },
+    "max_drawdown_pct": {
+      "delta": 0.0,
+      "off": 0.0006300482000000775,
+      "on": 0.0006300482000000775
+    },
+    "n_orders": {
+      "delta": 0,
+      "off": 3,
+      "on": 3
+    },
+    "n_trades": {
+      "delta": 0,
+      "off": 0,
+      "on": 0
+    },
+    "n_vetoes": {
+      "delta": 0,
+      "off": 0,
+      "on": 0
+    },
+    "note": "ai=on (llm) run `bt_books_recorded_ai_on` vs ai=off run `bt_books_recorded_ai_off`: same window 2026-10-22T14:20:00.000Z → 2026-10-22T20:17:00.000Z, same market DB `data/wta.sqlite`, same seed and config apart from ai.enabled",
+    "return_pct": {
+      "delta": 0.0,
+      "off": -0.0005511259999999574,
+      "on": -0.0005511259999999574
+    },
+    "vetoes_by_code": {}
+  },
+  "ai": {
+    "avg_size_multiplier": null,
+    "models": [],
+    "n_plan_changes_of_enabled_strategies": 0,
+    "n_plans": 0,
+    "plans_cached": null,
+    "plans_clamped": null,
+    "regime_distribution": {},
+    "regime_flip_exits": 0.0,
+    "s3_entries_gated": 0.0,
+    "source": "none"
+  },
+  "counts": {
+    "decisions": 3,
+    "decisions_by_kind": {
+      "order": 3
+    },
+    "equity_points": 122,
+    "plans": 0,
+    "trades": 0
+  },
+  "fees": {
+    "budget_used_pct": 0.03122641,
+    "budget_used_per_72h_pct": 6.941344612534733,
+    "data_hours": 0.3239,
+    "fee_budget_pct": 0.02,
+    "fee_budget_tmn": 100000.0,
+    "fees_paid_tmn": 3122.641,
+    "fees_per_72h_tmn": 694134.4612534733,
+    "initial_equity_tmn": 5000000.0,
+    "source": "given"
+  },
+  "files": [
+    "report.md",
+    "summary.json",
+    "trades.csv",
+    "equity.csv",
+    "equity.png",
+    "drawdown.png",
+    "vetoes.png",
+    "regimes.png"
+  ],
+  "insufficient_data": false,
+  "limitations": [
+    "Book window = 0.32 h of recorded data (583 ticks of 2 s with a snapshot, 6,131 snapshots) inside a requested window of 6.0 h; time without snapshots is skipped, not simulated.",
+    "S1 cross-book coverage (USDTTMN and one coin's TMN and USDT books all fresh at once): 0.32 h.",
+    "Indicator warm-up: 1,265 1-minute candles (1.9 h) from before the window were preloaded (the live engine loads up to 26 h at startup).",
+    "No end-of-window flatten: holdings at the end are valued at the bid (unrealized).",
+    "The requested window is 6.0 h but the data present covers only 0.3 h.",
+    "S1 backtest window limited to recorded 0.3 h of order books.",
+    "Fills come from the pessimistic book fill model: an order is matched only against a newer snapshot than the one it was placed on, and takes at most 80% of each level's quantity per snapshot, minus what our earlier fills took from that level while it is still shown (recorded snapshots do not reflect our fills); the taker fee is paid on every fill of an order that was crossing at placement (STOP_LIMIT: at its trigger), the maker fee only by a LIMIT resting when placed; real queue position is not modelled.",
+    "AI disabled (ai=off): rules-only defaults; the AI's contribution shows only in the ablation.",
+    "Sharpe and Sortino are computed from 7 hourly returns over 0.3 h of data: reported, but not meaningful over so short a window.",
+    "No closed trades in the window: win rate, profit factor and average PnL are undefined.",
+    "1,246,328 TMN was still held outside TMN (unrealized) at the end of the window; the challenge counts realized TMN only, so this run was not flattened."
+  ],
+  "meta": {
+    "ai": "off",
+    "ai_source": "disabled",
+    "candles_ingested": 211,
+    "config_hash": "b942685638b5",
+    "coverage_hours": 0.3239,
+    "coverage_hours_by_symbol": {
+      "ADATMN": 0.0006,
+      "ADAUSDT": 0.0006,
+      "AVAXTMN": 0.0006,
+      "AVAXUSDT": 0.0006,
+      "BTCTMN": 0.3239,
+      "BTCUSDT": 0.3239,
+      "DOGETMN": 0.3239,
+      "DOGEUSDT": 0.3239,
+      "ETHTMN": 0.3239,
+      "ETHUSDT": 0.3239,
+      "LINKTMN": 0.0006,
+      "LINKUSDT": 0.0006,
+      "LTCTMN": 0.0006,
+      "LTCUSDT": 0.0006,
+      "SOLTMN": 0.3239,
+      "SOLUSDT": 0.3239,
+      "TRXTMN": 0.0006,
+      "TRXUSDT": 0.0006,
+      "USDTTMN": 0.3239,
+      "XRPTMN": 0.3239,
+      "XRPUSDT": 0.3239
+    },
+    "data_end": "2026-10-22T20:17:00.000Z",
+    "data_from": "2026-10-22T14:20:05.929Z",
+    "data_hours": 0.3239,
+    "data_source": "recorded Wallex market data (wta.sqlite)",
+    "data_to": "2026-10-22T20:16:13.129Z",
+    "driver": "books",
+    "fee_budget_pct": 0.02,
+    "fees_source": "configs/fees_snapshot.yaml",
+    "flatten_at_end": false,
+    "git_commit": "e25b87b5248b1dddc40353ec1816acab378685d8",
+    "git_dirty": true,
+    "initial_balances": {
+      "TMN": "5000000"
+    },
+    "initial_equity_tmn": 5000000.0,
+    "market_db": "data/wta.sqlite",
+    "mode": "backtest",
+    "orders_stopped_by_gaps": 0,
+    "report_date": "2026-10-23",
+    "report_date_source": "commit date of e25b87b5248b + uncommitted changes",
+    "s1_coverage_hours": 0.3239,
+    "seed": 42,
+    "snapshots": 6131,
+    "state_db": "state_bt_books_recorded_ai_off.sqlite",
+    "step_s": 2.0,
+    "strategies": [
+      "S1",
+      "S2"
+    ],
+    "strategies_requested": [
+      "S1",
+      "S2"
+    ],
+    "symbols_without_data": [],
+    "synthetic": false,
+    "tick_crashes": 0,
+    "ticks": 583,
+    "trades_published": 300,
+    "warmup_candles": 1265,
+    "watchlist": [
+      "ADATMN",
+      "ADAUSDT",
+      "AVAXTMN",
+      "AVAXUSDT",
+      "BTCTMN",
+      "BTCUSDT",
+      "DOGETMN",
+      "DOGEUSDT",
+      "ETHTMN",
+      "ETHUSDT",
+      "LINKTMN",
+      "LINKUSDT",
+      "LTCTMN",
+      "LTCUSDT",
+      "SOLTMN",
+      "SOLUSDT",
+      "TRXTMN",
+      "TRXUSDT",
+      "USDTTMN",
+      "XRPTMN",
+      "XRPUSDT"
+    ],
+    "window_from": "2026-10-22T14:20:00.000Z",
+    "window_to": "2026-10-22T20:17:00.000Z"
+  },
+  "metrics": {
+    "avg_hold_s": null,
+    "avg_pnl_pct": null,
+    "avg_size_multiplier": null,
+    "closed_trades_pnl_tmn": 0.0,
+    "daily_returns": {
+      "2026-10-22": -0.0005511259999999574
+    },
+    "days": 0.24731481481481482,
+    "drawdown_duration_max_s": 21204.0,
+    "end_iso": "2026-10-22T20:16:14.000Z",
+    "end_ts": 1792700174.0,
+    "exit_reasons": {},
+    "fees_paid_tmn": 3122.641,
+    "fees_pct_of_equity": 0.0006245282,
+    "fees_source": "given",
+    "final_equity_tmn": 4997244.37,
+    "gross_loss_tmn": 0.0,
+    "gross_profit_tmn": 0.0,
+    "initial_equity_tmn": 5000000.0,
+    "insufficient_data": false,
+    "label": "backtest books S1,S2 ai=off",
+    "losses": 0,
+    "max_drawdown_pct": 0.0006300482000000775,
+    "n_equity_points": 122,
+    "n_hourly_returns": 7,
+    "n_orders": 3,
+    "n_plan_changes_of_enabled_strategies": 0,
+    "n_plans": 0,
+    "n_trades": 0,
+    "n_vetoes": 0,
+    "notes": [],
+    "per_day": {
+      "2026-10-22": {
+        "end_equity_tmn": 4997244.37,
+        "fees_tmn": null,
+        "n_orders": 3,
+        "n_trades": 0,
+        "n_vetoes": 0,
+        "pnl_tmn": 0.0,
+        "return_pct": -0.0005511259999999574,
+        "start_equity_tmn": 5000000.0,
+        "wins": 0
+      }
+    },
+    "per_strategy": {
+      "S2": {
+        "avg_hold_s": null,
+        "avg_pnl_pct": null,
+        "fees_tmn": null,
+        "gross_loss_tmn": 0.0,
+        "gross_profit_tmn": 0.0,
+        "losses": 0,
+        "n_orders": 3,
+        "n_trades": 0,
+        "n_vetoes": 0,
+        "pnl_tmn": 0.0,
+        "profit_factor": null,
+        "win_rate": null,
+        "wins": 0
+      }
+    },
+    "pnl_tmn": -2755.6299999998882,
+    "profit_factor": null,
+    "profit_factor_note": "",
+    "realized_vs_unrealized": {
+      "closed_trades_pnl_tmn": 0.0,
+      "coins_tmn_value": 0.0,
+      "equity_tmn": 4997244.37,
+      "flat": false,
+      "realized_tmn": -1249084.0,
+      "source": "valuation",
+      "tmn": 3750916.0,
+      "unpriced_assets": [],
+      "unrealized_share": 0.24940312654752164,
+      "unrealized_tmn": 1246328.37,
+      "usdt_tmn_value": 1246328.37
+    },
+    "regime_distribution": {},
+    "regime_gated": {
+      "regime_flip_exits": 0,
+      "s3_entries_gated": 0
+    },
+    "return_pct": -0.0005511259999999574,
+    "sharpe_annualized": -52.13519547205611,
+    "sharpe_note": "0.2 days of data (7 hourly returns) — do not over-interpret",
+    "sortino": -48.25211588036831,
+    "start_iso": "2026-10-22T14:20:06.000Z",
+    "start_ts": 1792678806.0,
+    "turnover_source": "none",
+    "turnover_tmn": null,
+    "veto_repeats_suppressed": 0,
+    "vetoes_by_code": {},
+    "win_rate": null,
+    "wins": 0
+  },
+  "report_date": "2026-10-23",
+  "synthetic": false,
+  "title": "Book backtest on ALL recorded real Wallex books (2026-10-22 14:20-20:17Z), S1+S2, ai=off",
+  "vetoes_by_code": {},
+  "window": {
+    "data_from": "2026-10-22T14:20:05.929Z",
+    "data_hours": 0.3239,
+    "data_to": "2026-10-22T20:16:13.129Z",
+    "requested_from": "2026-10-22T14:20:00Z",
+    "requested_hours": 5.95,
+    "requested_to": "2026-10-22T20:17:00Z"
+  }
+}

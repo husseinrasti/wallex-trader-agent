@@ -23,10 +23,14 @@ as ``None``.
 
 ``strict=True`` compares every field of the merged records instead, except ``IGNORE``.
 
-``IGNORE`` (never compared, in either mode):
-  * time stamps and durations: any key ``ts``, ``*_ts``, ``latency_ms`` and ``hold_s`` (line
-    times, ``intent.ts``, ``order.response.created_ts/updated_ts``, ``outcome.done_ts/closed_ts``,
-    plan times): a replay runs on the simulated clock, PRD-05 excludes them;
+Time stamps and durations (``ts``, ``intent.ts``, ``order.response.created_ts/updated_ts``,
+``outcome.done_ts/closed_ts/hold_s``, ``plan_snapshot.ts/latency_ms``, ``features.plan_ts``, ...)
+ARE compared in the strict pass, numerically: the replay clock is set to the recorded tick times,
+so they are deterministic, and a fill seen on another tick or a position closed at another time
+must show. A path proven non-deterministic would go into ``IGNORE`` by its exact dotted path,
+never by a leaf-name pattern.
+
+``IGNORE`` (exact dotted paths, never compared, in either mode):
   * ``mode`` (the replay writes its own mode) and ``plan_snapshot.cached`` (the replay is served by
     the LLM cache, so its plans say ``cached: true``);
   * ``git_commit`` and ``config_hash``: reported as provenance (equal or not), not as mismatches.
@@ -78,9 +82,7 @@ FIELDS: tuple[str, ...] = (
     "notes",
 )
 
-IGNORE: frozenset[str] = frozenset({"mode", "git_commit", "config_hash", "plan_snapshot.cached"})
-IGNORE_KEYS: frozenset[str] = frozenset({"ts", "latency_ms", "hold_s"})  # leaf key names, at any depth
-IGNORE_SUFFIX = "_ts"  # leaf keys ending like this, at any depth
+IGNORE: frozenset[str] = frozenset({"mode", "git_commit", "config_hash", "plan_snapshot.cached"})  # exact paths
 
 PROVENANCE_FIELDS = ("git_commit", "config_hash", "mode")
 _ALIGNMENT_PATHS = frozenset({"decision_id", "intent.id"})  # strict mode: the alignment reports these
@@ -155,7 +157,7 @@ class ReplayReport:
             "orphans": dict(self.orphans),
             "strict": self.strict,
             "fields": "all except IGNORE" if self.strict else list(self.fields),
-            "ignore": sorted(IGNORE) + [f"*.{k}" for k in sorted(IGNORE_KEYS)] + [f"*{IGNORE_SUFFIX}"],
+            "ignore": sorted(IGNORE),
         }
 
     def to_markdown(self, date: str | None = None, title: str | None = None) -> str:
@@ -237,9 +239,8 @@ class ReplayReport:
             "Numbers are compared as Decimals; risk checks by code (`code`, `passed`, `detail`).",
             "Ignored: "
             + ", ".join(f"`{f}`" for f in sorted(IGNORE))
-            + ", and any key "
-            + ", ".join(f"`{k}`" for k in sorted(IGNORE_KEYS))
-            + f" or `*{IGNORE_SUFFIX}` (time stamps and durations; provenance is reported above).",
+            + " (provenance is reported above). Time stamps and durations are compared (the replay clock runs "
+            "on the recorded tick times).",
             "",
         ]
         return "\n".join(lines)
@@ -408,11 +409,7 @@ def _check_tuple(c: Mapping[str, Any] | None) -> list[Any] | None:
 
 
 def _ignored(path: str) -> bool:
-    if path in IGNORE:
-        return True
-    leaf = path.rsplit(".", 1)[-1]
-    leaf = leaf.split("[", 1)[0]
-    return leaf in IGNORE_KEYS or leaf.endswith(IGNORE_SUFFIX)
+    return path in IGNORE
 
 
 def _flatten(rec: Mapping[str, Any]) -> dict[str, Any]:
@@ -450,6 +447,8 @@ def _as_number(value: Any) -> Decimal | None:
         return None
     if isinstance(value, int):
         return Decimal(value)
+    if isinstance(value, float):  # e.g. epoch seconds: compared exactly, as the float the engine wrote
+        return Decimal(value) if value == value and value not in (float("inf"), float("-inf")) else None
     if isinstance(value, str) and _NUMBER.fullmatch(value):
         try:
             return Decimal(value)

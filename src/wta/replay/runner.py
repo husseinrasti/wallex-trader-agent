@@ -4,7 +4,7 @@
 engine the recorded run used, feeds it exactly what that engine saw, tick by tick, and compares the
 decision log it writes with the recorded one (``wta.replay.compare.compare_decisions``). The result,
 ``ReplayRun`` (a ``ReplayReport``), gives ``"N/N decisions reproduced"`` and is written to
-``<reports_dir>/replay_<YYYYMMDD>.md``. ``scripts/replay_check.py`` (``make replay``) is the CLI.
+``<reports_dir>/replay_<YYYYMMDD>.md`` (the UTC day of the last replayed tick, ``report_day``). ``scripts/replay_check.py`` (``make replay``) is the CLI.
 
 Inputs, all read-only:
 
@@ -43,8 +43,16 @@ The procedure (one recorded process segment: by default the latest one that star
    tick still showing the previous plan, the first one showing this plan). Reviewer config changes
    are re-applied from their ``config_change`` events the same way (bounds from the decisions'
    ``config_hash``) and checked against the recorded new hash; the reviewer itself is not re-run.
-6. ``compare_decisions`` (the PRD-05 fields plus the plan's content) and a strict pass (every field
-   but timestamps), the exchange's divergences and the network counters make the verdict.
+6. The verdict (``ReplayRun.ok``) needs all of: ``compare_decisions`` on the PRD-05 fields plus the
+   plan's content; the strict pass (every field of every merged record, time stamps, fees, fills,
+   outcome PnL and features included); every recorded plan re-derived identically; no exchange
+   divergence; the replayed engine crashing on exactly the recorded ``tick_error`` ticks; at least
+   one recorded decision (0/0 is "nothing to compare", never a pass); a complete segment (its stop
+   event's tick count equals the ticks in the state DB, nothing written after the last committed
+   tick: ``partial_reasons``; ``allow_partial`` turns these into notes of a PARTIAL replay); and
+   zero network. The recorded final heartbeat is compared with the replay's (portfolio, fees, plan
+   freshness, S1's per-coin tick counters: ``end_state_check``), for information; analyst cycles
+   that gave no plan are listed from the recorded events (``analyst_gaps_note``).
 
 Zero network is asserted, not assumed: during the replay every ``AF_INET``/``AF_INET6`` connect and
 every ``getaddrinfo`` is refused and counted (``network_guard``), and the LLM providers are sentinels.
@@ -52,7 +60,8 @@ every ``getaddrinfo`` is refused and counted (``network_guard``), and the LLM pr
 
 ``strict=True`` (default): an LLM cache miss stops the replay (a determinism failure, surfaced as a
 failed replay with the error) and a config hash that cannot be matched is an error. ``strict=False``
-keeps going without the missing plan and only notes the config difference.
+(``--lenient``) keeps going without the missing plan and only notes the config difference; the
+verdict is still FAIL when a plan is missing or any compared field differs.
 
 Limits (also written into every report when they apply): a recorded restart (another ``start``
 event) is not reproduced: one segment is replayed and the decisions of the others are excluded and
@@ -60,8 +69,8 @@ counted; a run that resumed earlier state (start reason ``restart``) is replayed
 heartbeats, Telegram commands and ``wta reset-kill`` are not replayed; markets come from
 ``configs/markets_snapshot.yaml`` (a run that loaded ``/v1/markets`` is replayed against the
 snapshot); REST error counters of a live run are not recorded (the replay sees 0 errors); a run still
-being written is replayed up to its last committed tick. The ``ReplayExchange`` approximations are in
-its module docstring.
+being written fails as partial unless ``allow_partial`` replays its committed prefix. The
+``ReplayExchange`` approximations are in its module docstring.
 """
 
 from __future__ import annotations
@@ -354,9 +363,10 @@ class RecordedRun:
     orders: list[dict[str, Any]]
     events: list[dict[str, Any]]
     excluded: dict[str, int]
-    in_progress: bool
+    in_progress: bool  # no stop event and no later start event: the run may still be being written
     balances: list[tuple[float, Any]]
     fills: list[Any]
+    stop: dict[str, Any] | None = None  # the segment's own stop event (None: it has none)
 
     @property
     def data(self) -> dict[str, Any]:
@@ -365,6 +375,12 @@ class RecordedRun:
     @property
     def synthetic(self) -> bool:
         return self.feed == "synthetic" or bool(self.data.get("synthetic"))
+
+    @property
+    def stop_ticks(self) -> int | None:
+        """The tick count the segment's stop event recorded (None: no stop event, or no count)."""
+        n = ((self.stop or {}).get("data") or {}).get("ticks")
+        return n if isinstance(n, int) and not isinstance(n, bool) else None
 
     @property
     def first_ts(self) -> float:
@@ -407,10 +423,13 @@ def _ts_of(rec: Mapping[str, Any]) -> float | None:
 def load_recorded_run(
     log_dir: str | Path, state_db: str | Path | None = None, segment: int | None = None
 ) -> RecordedRun:
-    """Read one recorded process segment (from a ``start`` event to the next), up to its last
-    committed tick. ``segment`` (1-based) picks it; default: the latest segment that started fresh
-    (a reused log directory holds older runs; a restart's segment resumed state the replay cannot
-    rebuild), else the first."""
+    """Read one recorded process segment, up to its last committed tick. A segment runs from its
+    ``start`` event to its own ``stop`` event (+ 1 ms) or, without one, to the next ``start`` event:
+    ticks, balance rows, fills and events of a later run that shared the state DB (one file per mode,
+    whatever the log directory) are never part of it. ``segment`` (1-based) picks it; default: the
+    latest segment that started fresh (a reused log directory holds older runs; a restart's segment
+    resumed state the replay cannot rebuild), else the first. Whether the ticks are complete (the
+    stop event's tick count) is checked by the runner, which reports a partial segment."""
     log_path = Path(log_dir)
     events = list(iter_family(log_path, "events"))
     starts = [e for e in events if e.get("kind") == "start" and parse_iso(str(e.get("ts") or "")) is not None]
@@ -426,7 +445,14 @@ def load_recorded_run(
     start = starts[k]
     data = dict(start.get("data") or {})
     start_ts = float(parse_iso(str(start.get("ts"))) or 0.0)
-    segment_end = parse_iso(str(starts[k + 1].get("ts"))) if k + 1 < len(starts) else None
+    next_start = parse_iso(str(starts[k + 1].get("ts"))) if k + 1 < len(starts) else None
+    stops = [e for e in events if e.get("kind") == "stop" and start_ts <= (_ts_of(e) or 0.0)
+             and (next_start is None or (_ts_of(e) or 0.0) < next_start)]
+    stop = stops[0] if stops else None
+    segment_end = next_start
+    if stop is not None:
+        stop_end = (_ts_of(stop) or start_ts) + 0.001
+        segment_end = stop_end if segment_end is None else min(segment_end, stop_end)
     mode = str(data.get("mode") or "")
     if not mode:
         raise ReplayInputError("the start event names no mode")
@@ -445,9 +471,10 @@ def load_recorded_run(
         raise ReplayInputError(f"no '{mode}' ticks after {iso(start_ts)} in {db}: nothing to replay")
     tick_ts = [float(r["ts"]) for r in ticks]
     cutoff = tick_ts[-1]
-    stops = [e for e in events if e.get("kind") == "stop" and start_ts <= (_ts_of(e) or 0.0)
-             and (segment_end is None or (_ts_of(e) or 0.0) < segment_end)]
-    in_progress = segment_end is None and not stops
+    in_progress = next_start is None and stop is None
+
+    def inside(t: float) -> bool:
+        return start_ts - 0.001 <= t <= cutoff + 0.001 and (segment_end is None or t < segment_end)
 
     def split(records: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, int]:
         """(records of this segment up to the last tick, lines of other runs/segments, lines after it)"""
@@ -467,10 +494,9 @@ def load_recorded_run(
     orders, o_other, o_after = split(iter_family(log_path, "orders"))
     excluded = {"decision lines of other segments": d_other, "decision lines after the last tick": d_after,
                 "order lines of other segments": o_other, "order lines after the last tick": o_after}
-    balances = [(ts, snap) for ts, snap in load_balance_snapshots(db) if start_ts - 0.001 <= ts <= cutoff + 0.001]
-    fills = [f for f in load_recorded_fills(db) if start_ts - 0.001 <= f.ts <= cutoff + 0.001]
-    seg_events = [e for e in events if start_ts - 0.001 <= (_ts_of(e) or 0.0) <= cutoff + 0.001
-                  and (segment_end is None or (_ts_of(e) or 0.0) < segment_end)]
+    balances = [(ts, snap) for ts, snap in load_balance_snapshots(db) if inside(ts)]
+    fills = [f for f in load_recorded_fills(db) if inside(f.ts)]
+    seg_events = [e for e in events if inside(_ts_of(e) or 0.0)]
     return RecordedRun(
         log_dir=log_path,
         state_db=db,
@@ -491,7 +517,33 @@ def load_recorded_run(
         in_progress=in_progress,
         balances=balances,
         fills=fills,
+        stop=stop,
     )
+
+
+def partial_reasons(run: RecordedRun) -> list[str]:
+    """Why the recorded segment, as read, is not the whole run (empty: it is complete). A replay
+    of a prefix reproduces only that prefix: a stale or partial copy of the state DB, a DB copied
+    without its ``-wal`` file, a failed final flush, a run still being written and a crashed run
+    would otherwise pass on whatever ticks happen to be there."""
+    out: list[str] = []
+    after_d = run.excluded.get("decision lines after the last tick", 0)
+    after_o = run.excluded.get("order lines after the last tick", 0)
+    if run.stop is None:
+        what = ("has no stop event: the run is still being written (or it crashed)" if run.in_progress
+                else "has no stop event before the next start event: the process ended without a clean stop")
+        out.append(f"The recorded segment {what}; its ticks end at {iso(run.last_ts)}, and {after_d} decision "
+                   f"line(s) and {after_o} order line(s) after that tick are left out.")
+        return out
+    n = run.stop_ticks
+    if n is not None and n != len(run.ticks):
+        out.append(f"The state DB holds {len(run.ticks)} ticks of this segment but its stop event counts {n} "
+                   "(a stale or partial copy of the state DB, a DB copied without its -wal file, or a failed "
+                   "final flush).")
+    if after_d or after_o:
+        out.append(f"{after_d} decision line(s) and {after_o} order line(s) of the segment were written after its "
+                   f"last committed tick ({iso(run.last_ts)}) and are not replayed.")
+    return out
 
 
 # ---------------------------------------------------------------- the report
@@ -516,7 +568,18 @@ class ReplayRun(ReplayReport):
 
     @property
     def ok(self) -> bool:
-        return super().ok and not self.errors and self.network_calls == 0
+        """The verdict: the PRD field comparison, no error (a partial segment, a determinism failure,
+        a replayed crash the recorded run did not have, nothing to compare, ...), zero network, the
+        strict pass (every field: features with equity and balances, fees, fills, outcome PnL, time
+        stamps) and every recorded plan re-derived identically."""
+        return (
+            super().ok
+            and not self.errors
+            and self.network_calls == 0
+            and self.n_reference > 0
+            and bool(self.strict_check.get("ok"))
+            and all(p.get("reproduced") is not False for p in self.plans)
+        )
 
     def to_dict(self) -> dict[str, Any]:
         out = super().to_dict()
@@ -556,7 +619,8 @@ class ReplayRun(ReplayReport):
             f"Recorded run `{rec.get('log_dir')}` (mode `{rec.get('mode')}`, feed `{rec.get('feed')}`), "
             f"replayed over {window.get('ticks', 0)} ticks from {window.get('first', '?')} to "
             f"{window.get('last', '?')} ({window.get('hours', 0):.2f} h"
-            + (", run still being written: replayed up to its last committed tick" if rec.get("in_progress") else "")
+            + (", PARTIAL: only the ticks committed so far (allowed with --allow-partial)" if rec.get("partial")
+               else "")
             + ").",
             "",
         ]
@@ -567,15 +631,35 @@ class ReplayRun(ReplayReport):
         intro += [
             f"Network: {net.get('socket_attempts', 0)} socket attempts, {net.get('provider_calls', 0)} LLM "
             f"provider calls (both must be 0). LLM cache: {ai.get('cache_hits', 0)} hits, "
-            f"{ai.get('cache_misses', 0)} misses. Strict pass (every field but time stamps): "
-            f"{self.strict_check.get('summary', 'n/a')}.",
+            f"{ai.get('cache_misses', 0)} misses. Strict pass (every field, time stamps included; part of the "
+            f"verdict): {self.strict_check.get('summary', 'n/a')}.",
             "",
             f"Reproduce: `python scripts/replay_check.py --log-dir {rec.get('log_dir')}` (or `make replay`; "
             "`python -m wta replay`).",
         ]
         lines = base[:3] + intro + base[3:]
-        lines += self._inputs_md() + self._plans_md() + self._strict_md() + self._limits_md()
+        lines += self._inputs_md() + self._plans_md() + self._strict_md() + self._end_state_md() + self._limits_md()
         return "\n".join(lines).rstrip() + "\n"
+
+    def _end_state_md(self) -> list[str]:
+        end = self.run.get("end_state") or {}
+        out = ["", "## End state (informational, not part of the verdict)", ""]
+        if not end.get("compared"):
+            return out + [f"Not compared: {end.get('why') or 'no heartbeat'}."]
+        same = sum(1 for r in end.get("rows") or [] if r.get("equal"))
+        out += [
+            f"The recorded run's final heartbeat ({end.get('recorded_ts')}) against the replay's "
+            f"({end.get('replayed_ts')}): {same}/{len(end.get('rows') or [])} values equal. The S1 counters count "
+            "every fast tick on which S1 evaluated a coin and the ticks whose lock-in edge reached cost + margin, "
+            "so they check the ticks without a decision too.",
+            "",
+            "| value | recorded | replayed | equal |",
+            "|---|---|---|---|",
+        ]
+        for r in end.get("rows") or []:
+            out.append(f"| {r['field']} | {_md(_show(r['recorded']))} | {_md(_show(r['replayed']))} | "
+                       f"{'yes' if r['equal'] else '**no**'} |")
+        return out
 
     def _inputs_md(self) -> list[str]:
         r = self.run
@@ -589,6 +673,7 @@ class ReplayRun(ReplayReport):
             ("git commit (recorded)", f"`{rec.get('git_commit')}`" + (" (dirty)" if rec.get("git_dirty") else "")),
             ("data window", f"{window.get('first')} → {window.get('last')} = {window.get('hours', 0):.2f} h, "
                             f"{window.get('ticks')} ticks"),
+            ("segment complete", _segment_text(rec, window)),
             ("books put on the bus", str(inputs.get("books_published"))),
             ("candle arrivals fed", str(inputs.get("candles_fed"))),
             ("plans re-derived", f"{(r.get('ai') or {}).get('plans_replayed', 0)} of {len(self.plans)}"),
@@ -631,8 +716,11 @@ class ReplayRun(ReplayReport):
 
     def _strict_md(self) -> list[str]:
         s = self.strict_check
-        out = ["", "## Strict pass", "", f"{s.get('summary', 'n/a')} — every field of the merged records except "
-               "time stamps and durations; known differences by construction are not counted: "
+        out = ["", "## Strict pass (part of the verdict)", "",
+               f"{s.get('summary', 'n/a')} — every field of the merged records (features with equity and "
+               "balances, order answers, fees, fills, outcome PnL, time stamps and durations; only `mode`, "
+               "`git_commit`, `config_hash` and `plan_snapshot.cached` are left out); known differences by "
+               "construction are not counted: "
                + ", ".join(f"`{k}.{f}`" for k, f in sorted(BENIGN_STRICT)) + "."]
         rows = s.get("mismatches") or []
         if rows:
@@ -648,6 +736,18 @@ class ReplayRun(ReplayReport):
         out = ["", "## Limitations", ""]
         out += [f"- {n}" for n in self.notes] or ["- None beyond the ReplayExchange approximations."]
         return out + [""]
+
+
+def _segment_text(rec: Mapping[str, Any], window: Mapping[str, Any]) -> str:
+    """Whether the replayed ticks are the whole recorded segment (the stop event's tick count)."""
+    if not rec.get("stop"):
+        return "no stop event: " + ("PARTIAL replay (--allow-partial)" if rec.get("partial") else "FAIL (partial)")
+    n = rec.get("stop_ticks")
+    if n is None:
+        return "stop event without a tick count"
+    if n == window.get("ticks"):
+        return f"yes: the stop event counts {n} ticks = {window.get('ticks')} in the state DB"
+    return f"NO: the stop event counts {n} ticks, the state DB holds {window.get('ticks')}"
 
 
 def _bounds(p: Mapping[str, Any]) -> str:
@@ -729,10 +829,13 @@ class _BookFeed:
 
 
 class _CandleFeed:
-    """``engine_candles`` arrivals in seq order, read in seq windows."""
+    """``engine_candles`` arrivals in seq order, read in seq windows; bars that open after
+    ``max_ts`` (the segment's last tick) belong to a later run on the same state DB and are skipped
+    (an engine before the seq fix numbered a restart's first arrivals from 1 again)."""
 
-    def __init__(self, db: Path, mode: str) -> None:
-        self.db, self.mode = db, mode
+    def __init__(self, db: Path, mode: str, max_ts: float | None = None) -> None:
+        self.db, self.mode, self.max_ts = db, mode, max_ts
+        self.skipped = 0
         self.applied = 0
         self.buffer: list[tuple[int, Candle]] = []
         self.buffer_until = 0
@@ -748,6 +851,10 @@ class _CandleFeed:
             ).fetchall()
         finally:
             conn.close()
+        if self.max_ts is not None:
+            kept = [r for r in rows if float(r[3]) <= self.max_ts]
+            self.skipped += len(rows) - len(kept)
+            rows = kept
         self.buffer += [
             (int(seq), Candle(symbol=sym, resolution=res, ts=ts, o=Decimal(o), h=Decimal(h), l=Decimal(lo_),
                               c=Decimal(c), v=Decimal(v)))
@@ -997,11 +1104,13 @@ def _tools(cfg: Config, clock: SimClock) -> InternalTools:
 
 class _Runner:
     def __init__(self, cfg: Config, run: RecordedRun, out_dir: Path, *, strict: bool, settings: Settings,
-                 markets: Mapping[str, MarketInfo] | None, cache_dir: Path) -> None:
+                 markets: Mapping[str, MarketInfo] | None, cache_dir: Path, allow_partial: bool = False) -> None:
         self.given_cfg = cfg
         self.run = run
         self.out_dir = out_dir
         self.strict = strict
+        self.allow_partial = allow_partial
+        self.partial: list[str] = []  # partial_reasons(run), set by build()
         self.settings = settings
         self.cache_dir = cache_dir
         self.errors: list[str] = []
@@ -1039,10 +1148,14 @@ class _Runner:
                               f"{run.segment} is replayed, "
                               f"{run.excluded['decision lines of other segments']} decision lines of the others are "
                               "left out (a restart resumes state the replay cannot rebuild).")
-        if run.in_progress:
-            self.notes.append(f"The recorded run was still being written (no stop event): replayed up to its last "
-                              f"committed tick {iso(run.last_ts)}; "
-                              f"{run.excluded['decision lines after the last tick']} later decision lines are left out.")
+        self.partial = partial_reasons(run)
+        for reason in self.partial:
+            if self.allow_partial:
+                self.notes.append(f"PARTIAL replay (allowed with --allow-partial): {reason} Only the committed "
+                                  "prefix is replayed and compared.")
+            else:
+                self.errors.append(f"{reason} A replay of a prefix is not a reproduction of the run; pass "
+                                   "--allow-partial to replay the committed prefix anyway.")
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.kill_path = self.out_dir / "KILL"
         self.base = ReplayClock(run.start_ts)
@@ -1087,7 +1200,7 @@ class _Runner:
                               "API errors.")
         self.books = _BookFeed(run.state_db, run.mode, min(run.ticks[0]["book_ts"].values(), default=run.start_ts),
                                run.last_ts)
-        self.candles = _CandleFeed(run.state_db, run.mode)
+        self.candles = _CandleFeed(run.state_db, run.mode, max_ts=run.last_ts + 1.0)
         return engine
 
     def _publish(self, row: Mapping[str, Any]) -> None:
@@ -1167,6 +1280,8 @@ class _Runner:
             self._plan_failed(slot)
             return
         slot.reproduced, slot.error = self._same_plan(rec.get("plan_snapshot") or {}, plan)
+        if slot.reproduced is False:  # swapped in all the same (the decisions show what it changed)
+            self.errors.append(f"plan {slot.decision_id} re-derived differently from the record: {slot.error}")
 
     @staticmethod
     def _same_plan(recorded: Mapping[str, Any], plan: MarketPlan) -> tuple[bool, str]:
@@ -1208,7 +1323,6 @@ class _Runner:
         plans = sorted(self.plans, key=lambda s: s.index)
         configs = sorted(self.config_slots, key=lambda s: s.index)
         pi = ci = 0
-        recorded_crashes = sum(1 for e in run.events if e.get("kind") == "tick_error")
         for idx, row in enumerate(run.ticks):
             ts = float(row["ts"])
             self.base.set(ts)
@@ -1240,15 +1354,33 @@ class _Runner:
             ci += 1
         if self.counts["ticks"] < n and not self.fatal:
             self.errors.append(f"only {self.counts['ticks']} of {n} ticks replayed")
-        if self.counts["tick_crashes"] != recorded_crashes:
-            self.notes.append(f"{self.counts['tick_crashes']} replayed ticks crashed; the recorded run logged "
-                              f"{recorded_crashes} tick_error event(s).")
         if self.books.missing:
             self.errors.append(f"{len(self.books.missing)} books named by the ticks rows are missing from "
                                f"engine_books (first: {self.books.missing[0]})")
         if self.counts["candle_drift"]:
             self.notes.append(f"{self.counts['candle_drift']} recorded candle arrivals did not change the replay's "
                               "candle cache (its engine_candles numbering drifts from the recorded one).")
+
+    def check_crashes(self, replayed_events: Iterable[Mapping[str, Any]]) -> None:
+        """The replay must crash on exactly the ticks the recorded run crashed on: a crash skips the
+        rest of its tick (reconcile, equity, scheduled work) even when the decisions look the same.
+        Compared by tick index through the ``tick_error`` events of both runs (the engine logs the
+        first ``engine.exception_storm_count`` crashes of a window in both, so the cap cancels out)."""
+        run = self.run
+        replayed_n = self.counts["ticks"]
+
+        def ticks_of(events: Iterable[Mapping[str, Any]]) -> list[int]:
+            return sorted(run.tick_index(t) for e in events if e.get("kind") == "tick_error"
+                          and (t := _ts_of(e)) is not None and run.tick_index(t) < replayed_n)
+
+        recorded, replayed = ticks_of(run.events), ticks_of(replayed_events)
+        if recorded != replayed:
+            def show(xs: list[int]) -> str:
+                return ", ".join(f"#{i}" for i in xs[:10]) + (", ..." if len(xs) > 10 else "") if xs else "none"
+
+            self.errors.append(f"the replayed engine crashed on other ticks than the recorded one: replay tick_error "
+                               f"on {show(replayed)} ({self.counts['tick_crashes']} crashed ticks in all), recorded on "
+                               f"{show(recorded)}")
 
     def close(self, reason: str) -> None:
         engine, store = getattr(self, "engine", None), getattr(self, "store", None)
@@ -1260,6 +1392,92 @@ class _Runner:
                 store.close()
             if hasattr(self, "kill_path"):
                 self.kill_path.unlink(missing_ok=True)
+
+
+def report_day(run: RecordedRun) -> str:
+    """``YYYYMMDD`` (UTC) of the replayed window's last tick: ``replay_<day>.md`` is filed under the day
+    the recorded run ended, like its shadow report, so a run that crosses midnight UTC is not filed
+    under the day it started (a partial replay: the day of its last committed tick)."""
+    return utc_day(run.last_ts)
+
+
+def last_heartbeat(log_dir: Path, lo: float, hi: float | None = None) -> dict[str, Any] | None:
+    """The last ``health`` record of ``log_dir`` stamped in ``[lo, hi)`` (None: none)."""
+    last: dict[str, Any] | None = None
+    for rec in iter_family(log_dir, "health"):
+        t = _ts_of(rec)
+        if t is None or t < lo - 0.001 or (hi is not None and t >= hi):
+            continue
+        last = rec
+    return last
+
+
+def _end_values(hb: Mapping[str, Any]) -> dict[str, Any]:
+    """The deterministic end-of-run values of a heartbeat: portfolio, fees, the plan's freshness and
+    S1's per-coin counters (ticks evaluated, opportunity ticks, best excess, last opportunity)."""
+    extra = hb.get("extra") or {}
+    out: dict[str, Any] = {
+        "equity_tmn": hb.get("equity_tmn"),
+        "fees_paid_tmn": extra.get("fees_paid_tmn"),
+        "realized_pnl_tmn": extra.get("realized_pnl_tmn"),
+        "open_orders": hb.get("open_orders"),
+        "positions": hb.get("positions"),
+        "plan_stale": (extra.get("ai") or {}).get("plan_stale"),
+    }
+    coins = ((extra.get("strategies") or {}).get("S1") or {}).get("coins") or {}
+    for coin in sorted(coins):
+        stats = (coins[coin] or {}).get("stats")
+        if stats is not None:
+            out[f"S1 {coin} counters"] = stats
+    return out
+
+
+def end_state_check(recorded: Mapping[str, Any] | None, replayed: Mapping[str, Any] | None,
+                    last_tick_ts: float) -> dict[str, Any]:
+    """The recorded run's final heartbeat against the replay's (informational, not part of the
+    verdict): they are comparable only when the recorded one was written at or after the last
+    replayed tick (the shutdown heartbeat)."""
+    if recorded is None or replayed is None:
+        return {"compared": False, "why": "no recorded heartbeat" if recorded is None else "no replayed heartbeat",
+                "rows": []}
+    rec_ts = _ts_of(recorded) or 0.0
+    out: dict[str, Any] = {"recorded_ts": iso(rec_ts), "replayed_ts": iso(_ts_of(replayed) or 0.0)}
+    if rec_ts < last_tick_ts - 0.001:
+        return {**out, "compared": False, "rows": [],
+                "why": "the recorded run's last heartbeat precedes its last tick (no shutdown heartbeat)"}
+    a, b = _end_values(recorded), _end_values(replayed)
+    rows = [{"field": k, "recorded": a.get(k), "replayed": b.get(k),
+             "equal": canonical_json(a.get(k)) == canonical_json(b.get(k))} for k in [*a, *(k for k in b if k not in a)]]
+    return {**out, "compared": True, "equal": all(r["equal"] for r in rows), "rows": rows}
+
+
+def analyst_gaps_note(run: RecordedRun, hb: Mapping[str, Any] | None) -> str | None:
+    """A limitation line for the recorded analyst cycles that gave no plan (failed provider, invalid
+    answer): what the recorded run logged about them and why the replay has nothing to re-derive."""
+    by_kind: dict[str, list[str]] = {}
+    for e in run.events:
+        kind = str(e.get("kind") or "")
+        if kind in ("ai_degraded", "ai_recovered", "plan_stale"):
+            by_kind.setdefault(kind, []).append(iso(_ts_of(e) or 0.0))
+    stats = (((hb or {}).get("extra") or {}).get("ai") or {}).get("stats") or {}
+    failures = stats.get("failures")
+    if not by_kind and not failures:
+        return None
+    text = "The recorded analyst"
+    if isinstance(stats.get("cycles"), int):
+        text += f" ran {stats['cycles']} cycles and made {stats.get('plans')} plans"
+    if isinstance(failures, int):
+        text += f"; {failures} cycles gave no plan"
+    degraded, recovered, stale = (by_kind.get(k, []) for k in ("ai_degraded", "ai_recovered", "plan_stale"))
+    if degraded:
+        text += f" ({len(degraded)} failure streak(s) from {', '.join(degraded)}"
+        text += f"; recovered {', '.join(recovered)})" if recovered else "; not recovered before the end)"
+    text += (". A cycle without a plan writes no decision record, so there is nothing to re-derive for it; the "
+             "plan in force ages on the tick clock in the replay exactly as in the recorded engine "
+             "(Engine.current_plan, ai.plan_stale_s)")
+    if stale:
+        text += f", so after the recorded plan_stale event(s) ({', '.join(stale)}) both runs trade rules-only"
+    return text + ". The slow loop's own events (ai_degraded, ai_recovered, plan_stale) are not re-emitted."
 
 
 def _strict_check(reference: list[dict[str, Any]], replayed: Path) -> dict[str, Any]:
@@ -1295,9 +1513,13 @@ async def run_replay_async(
     cache_dir: str | Path | None = None,
     guard_network: bool = True,
     segment: int | None = None,
+    allow_partial: bool = False,
 ) -> ReplayRun:
     """Replay the recorded run in ``log_dir`` (see the module docstring); ``run_replay`` outside a loop.
 
+    ``allow_partial``: replay a segment that is not complete as read (no stop event, fewer ticks in
+    the state DB than its stop event counts, records after the last committed tick) as a noted
+    PARTIAL replay of its committed prefix; without it such a replay fails (``partial_reasons``).
     ``state_db``: the recorded engine's state DB (default: the one its start event names).
     ``out_dir``: a new or empty directory for the replay's logs and state DB (default: a temporary
     directory). ``reports_dir``: where ``replay_<YYYYMMDD>.md`` is written (None: not written).
@@ -1311,7 +1533,8 @@ async def run_replay_async(
     if out.exists() and any(out.iterdir()):
         raise ReplayInputError(f"replay output directory {out} is not empty: the replay needs a fresh state DB and logs")
     cache = _cache_dir(cfg, run, cache_dir)
-    runner = _Runner(cfg, run, out, strict=strict, settings=settings or Settings(), markets=markets, cache_dir=cache)
+    runner = _Runner(cfg, run, out, strict=strict, settings=settings or Settings(), markets=markets, cache_dir=cache,
+                     allow_partial=allow_partial)
     with network_guard() if guard_network else _no_guard() as attempts:
         reason = "replay complete"
         try:
@@ -1323,11 +1546,19 @@ async def run_replay_async(
         finally:
             runner.close(reason)
     rep_logs = out / "logs"
+    runner.check_crashes(iter_family(rep_logs, "events"))
     report = compare_decisions(run.decisions, rep_logs, fields=COMPARE_FIELDS,
                                divergences=runner.exchange.all_divergences())
     result = ReplayRun(**{f: getattr(report, f) for f in ReplayReport.__dataclass_fields__})
     result.errors, result.notes = runner.errors, runner.notes
     result.strict_check = _strict_check(run.decisions, rep_logs)
+    if not result.strict_check["ok"]:
+        s = result.strict_check
+        result.errors.append(f"strict pass failed: {s['summary']} ({len(s['mismatches'])} field mismatch(es), "
+                             f"{s['missing']} missing, {s['extra']} extra; see Strict pass)")
+    if not run.decisions:
+        result.errors.append("nothing to compare: the recorded window holds no decision record, so 0/0 says "
+                             "nothing about reproducing the run (replay a window with decisions)")
     result.plans = [_plan_info(run, s) for s in runner.plans]
     result.config_changes = [_config_info(run, s) for s in runner.config_slots]
     for s in runner.plans:
@@ -1346,9 +1577,11 @@ async def run_replay_async(
         "reconcile's balances row, and a balance refresh with no exchange-side change since the previous answer "
         f"gets that answer without using up a recorded row ({runner.exchange.unchanged_reads} such reads)."
     )
-    if not run.decisions:
-        result.notes.insert(0, "The recorded window holds no decision at all: the replay only shows that the engine "
-                               "made none either (0/0 is not evidence of reproducing trades).")
+    recorded_hb = last_heartbeat(run.log_dir, run.start_ts, run.segment_end)
+    gaps = analyst_gaps_note(run, recorded_hb)
+    if gaps:
+        result.notes.append(gaps)
+    end_state = end_state_check(recorded_hb, last_heartbeat(rep_logs, run.start_ts), run.last_ts)
     if run.synthetic:
         result.notes.insert(0, f"{SYNTHETIC_BANNER}: the recorded run used the offline synthetic feed.")
     result.run = {
@@ -1363,6 +1596,11 @@ async def run_replay_async(
             "segment": run.segment,
             "segments": run.segments,
             "in_progress": run.in_progress,
+            "stop": run.stop is not None,
+            "stop_ticks": run.stop_ticks,
+            "partial": bool(runner.partial),
+            "partial_reasons": list(runner.partial),
+            "allow_partial": allow_partial,
             "git_commit": run.data.get("git_commit"),
             "git_dirty": run.data.get("git_dirty"),
             "markets_source": run.data.get("markets_source"),
@@ -1397,9 +1635,10 @@ async def run_replay_async(
         "markets_source": runner.markets_source,
         "out_dir": str(out),
         "strict": strict,
+        "end_state": end_state,
     }
     (out / "replay_report.json").write_text(canonical_json(result.to_dict()).decode("utf-8") + "\n", encoding="utf-8")
-    date = utc_day(run.first_ts)
+    date = report_day(run)
     (out / "replay_report.md").write_text(result.to_markdown(date=date), encoding="utf-8")
     if reports_dir is not None:
         path = report_path(reports_dir, date)
@@ -1419,7 +1658,8 @@ def run_replay(
     strict: bool = True,
     **options: Any,
 ) -> ReplayRun:
-    """``run_replay_async`` for callers outside an event loop (``wta replay``, ``scripts/replay_check.py``)."""
+    """``run_replay_async`` for callers outside an event loop (``wta replay``, ``scripts/replay_check.py``);
+    ``options`` are its keyword arguments (``segment``, ``allow_partial``, ...)."""
     return asyncio.run(run_replay_async(cfg, log_dir=log_dir, state_db=state_db, out_dir=out_dir,
                                         reports_dir=reports_dir, strict=strict, **options))
 

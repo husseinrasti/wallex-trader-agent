@@ -1,0 +1,287 @@
+{
+  "ablation": null,
+  "ai": {
+    "avg_size_multiplier": null,
+    "models": [],
+    "n_plan_changes_of_enabled_strategies": 0,
+    "n_plans": 0,
+    "plans_cached": null,
+    "plans_clamped": null,
+    "regime_distribution": {},
+    "regime_flip_exits": 0.0,
+    "s3_entries_gated": 0.0,
+    "source": "none"
+  },
+  "counts": {
+    "decisions": 4,
+    "decisions_by_kind": {
+      "order": 4
+    },
+    "equity_points": 135,
+    "plans": 0,
+    "trades": 0
+  },
+  "fees": {
+    "budget_used_pct": 0.062418823750000005,
+    "budget_used_per_72h_pct": 1.9974023600000002,
+    "data_hours": 2.25,
+    "fee_budget_pct": 0.02,
+    "fee_budget_tmn": 100000.0,
+    "fees_paid_tmn": 6241.882375,
+    "fees_per_72h_tmn": 199740.236,
+    "initial_equity_tmn": 5000000.0,
+    "source": "given"
+  },
+  "files": [
+    "report.md",
+    "summary.json",
+    "trades.csv",
+    "equity.csv",
+    "equity.png",
+    "drawdown.png",
+    "vetoes.png",
+    "regimes.png"
+  ],
+  "insufficient_data": false,
+  "limitations": [
+    "Candle window = 2.2 h with 1-minute bars inside a requested window of 2.2 h; a minute without a candle inside a gap of at most 30 min is a flat bar at the previous close (the engine's CandleCache rule).",
+    "No candles before the window: S2/S3 indicators warm up inside it (EMA60 of 15-minute bars needs 15 h, S3's breakout 21 bars).",
+    "No end-of-window flatten: holdings at the end are valued at the bid (unrealized).",
+    "S3 ran with allow_rules_only=true: without a fresh plan its regime gate is the rules regime of each symbol (S2's rule_regime), not an AI call.",
+    "S1 not backtested on candles (candles carry no cross-book information); S1 evidence comes from the survey, the book-driven window and the live logs.",
+    "Candle-driven fills use a synthetic book: mid = close, spread = the median spread of recorded books (3,705 books, 2026-10-22T14:20:05.929Z → 2026-10-22T14:39:59.737Z, none after the window end) for every symbol, unlimited depth at the best level; queue position and depth are not modelled.",
+    "Fills come from the pessimistic candle fill model: an order acts one bar later; MARKET and crossing orders fill at close ± half the spread ± 0.02% slippage; the taker fee is paid on every fill of an order that crossed at placement (STOP orders always), the maker fee only by a LIMIT resting when placed; real queue position is not modelled.",
+    "AI disabled (ai=off): rules-only defaults; the AI's contribution shows only in the ablation.",
+    "Sharpe and Sortino are computed from 3 hourly returns over 2.2 h of data: reported, but not meaningful over so short a window.",
+    "No closed trades in the window: win rate, profit factor and average PnL are undefined.",
+    "2,501,469 TMN was still held outside TMN (unrealized) at the end of the window; the challenge counts realized TMN only, so this run was not flattened."
+  ],
+  "meta": {
+    "ai": "off",
+    "ai_source": "disabled",
+    "candles_ingested": 940,
+    "config_hash": "8fe0589adfb8",
+    "coverage_hours": 2.25,
+    "coverage_hours_by_symbol": {
+      "BTCTMN": 2.25,
+      "BTCUSDT": 2.25,
+      "ETHTMN": 2.25,
+      "ETHUSDT": 2.25,
+      "SOLTMN": 2.25,
+      "SOLUSDT": 2.25,
+      "USDTTMN": 2.25
+    },
+    "data_end": "2026-10-22T14:40:00.000Z",
+    "data_from": "2026-10-22T12:25:00.000Z",
+    "data_hours": 2.25,
+    "data_source": "recorded Wallex market data (wta.sqlite)",
+    "data_to": "2026-10-22T14:40:00.000Z",
+    "driver": "candles",
+    "fee_budget_pct": 0.02,
+    "fees_source": "configs/fees_snapshot.yaml",
+    "flatten_at_end": false,
+    "gap_filled_minutes": {
+      "BTCUSDT": 1,
+      "ETHTMN": 1,
+      "ETHUSDT": 1,
+      "SOLTMN": 1,
+      "SOLUSDT": 1
+    },
+    "git_commit": "e25b87b5248b1dddc40353ec1816acab378685d8",
+    "git_dirty": true,
+    "initial_balances": {
+      "TMN": "5000000"
+    },
+    "initial_equity_tmn": 5000000.0,
+    "market_db": "data/wta.sqlite",
+    "mode": "backtest",
+    "report_date": "2026-10-23",
+    "report_date_source": "commit date of e25b87b5248b + uncommitted changes",
+    "seed": 42,
+    "spreads": {
+      "BTCTMN": {
+        "books": 586,
+        "from": "2026-10-22T14:20:05.929Z",
+        "source": "observed",
+        "spread_pct": "0.001087016289667657808838240626",
+        "to": "2026-10-22T14:39:59.737Z"
+      },
+      "BTCUSDT": {
+        "books": 574,
+        "from": "2026-10-22T14:20:05.929Z",
+        "source": "observed",
+        "spread_pct": "0.001831377441217631864769299810",
+        "to": "2026-10-22T14:39:59.737Z"
+      },
+      "ETHTMN": {
+        "books": 589,
+        "from": "2026-10-22T14:20:05.929Z",
+        "source": "observed",
+        "spread_pct": "0.001901541701243068040350611516",
+        "to": "2026-10-22T14:39:59.737Z"
+      },
+      "ETHUSDT": {
+        "books": 517,
+        "from": "2026-10-22T14:20:05.929Z",
+        "source": "observed",
+        "spread_pct": "0.001474114752566724454733257897",
+        "to": "2026-10-22T14:39:59.737Z"
+      },
+      "SOLTMN": {
+        "books": 591,
+        "from": "2026-10-22T14:20:05.929Z",
+        "source": "observed",
+        "spread_pct": "0.003094558571274762528318755175",
+        "to": "2026-10-22T14:39:59.737Z"
+      },
+      "SOLUSDT": {
+        "books": 528,
+        "from": "2026-10-22T14:20:05.929Z",
+        "source": "observed",
+        "spread_pct": "0.002764010681077006970629218422",
+        "to": "2026-10-22T14:39:47.798Z"
+      },
+      "USDTTMN": {
+        "books": 320,
+        "from": "2026-10-22T14:20:05.929Z",
+        "source": "observed",
+        "spread_pct": "0.0000662867454130898897684897003",
+        "to": "2026-10-22T14:39:59.737Z"
+      }
+    },
+    "state_db": "state_bt_candles_recorded_ai_off.sqlite",
+    "step_s": 60.0,
+    "strategies": [
+      "S2",
+      "S3"
+    ],
+    "strategies_requested": [
+      "S2",
+      "S3"
+    ],
+    "symbols_without_data": [],
+    "synthetic": false,
+    "tick_crashes": 0,
+    "ticks": 135,
+    "warmup_candles": 0,
+    "watchlist": [
+      "BTCTMN",
+      "BTCUSDT",
+      "ETHTMN",
+      "ETHUSDT",
+      "SOLTMN",
+      "SOLUSDT",
+      "USDTTMN"
+    ],
+    "window_from": "2026-10-22T12:25:00.000Z",
+    "window_to": "2026-10-22T14:40:00.000Z"
+  },
+  "metrics": {
+    "avg_hold_s": null,
+    "avg_pnl_pct": null,
+    "avg_size_multiplier": null,
+    "closed_trades_pnl_tmn": 0.0,
+    "daily_returns": {
+      "2026-10-22": 0.000921128709999941
+    },
+    "days": 0.09305555555555556,
+    "drawdown_duration_max_s": 6480.0,
+    "end_iso": "2026-10-22T14:40:00.000Z",
+    "end_ts": 1792680000.0,
+    "exit_reasons": {},
+    "fees_paid_tmn": 6241.882375,
+    "fees_pct_of_equity": 0.001248376475,
+    "fees_source": "given",
+    "final_equity_tmn": 5004605.64355,
+    "gross_loss_tmn": 0.0,
+    "gross_profit_tmn": 0.0,
+    "initial_equity_tmn": 5000000.0,
+    "insufficient_data": false,
+    "label": "backtest candles S2,S3 ai=off",
+    "losses": 0,
+    "max_drawdown_pct": 0.0009127431199999526,
+    "n_equity_points": 135,
+    "n_hourly_returns": 3,
+    "n_orders": 4,
+    "n_plan_changes_of_enabled_strategies": 0,
+    "n_plans": 0,
+    "n_trades": 0,
+    "n_vetoes": 0,
+    "notes": [],
+    "per_day": {
+      "2026-10-22": {
+        "end_equity_tmn": 5004605.64355,
+        "fees_tmn": null,
+        "n_orders": 4,
+        "n_trades": 0,
+        "n_vetoes": 0,
+        "pnl_tmn": 0.0,
+        "return_pct": 0.000921128709999941,
+        "start_equity_tmn": 5000000.0,
+        "wins": 0
+      }
+    },
+    "per_strategy": {
+      "S2": {
+        "avg_hold_s": null,
+        "avg_pnl_pct": null,
+        "fees_tmn": null,
+        "gross_loss_tmn": 0.0,
+        "gross_profit_tmn": 0.0,
+        "losses": 0,
+        "n_orders": 4,
+        "n_trades": 0,
+        "n_vetoes": 0,
+        "pnl_tmn": 0.0,
+        "profit_factor": null,
+        "win_rate": null,
+        "wins": 0
+      }
+    },
+    "pnl_tmn": 4605.6435500001535,
+    "profit_factor": null,
+    "profit_factor_note": "",
+    "realized_vs_unrealized": {
+      "closed_trades_pnl_tmn": 0.0,
+      "coins_tmn_value": 0.0,
+      "equity_tmn": 5004605.64355,
+      "flat": false,
+      "realized_tmn": -2496863.59,
+      "source": "valuation",
+      "tmn": 2503136.41,
+      "unpriced_assets": [],
+      "unrealized_share": 0.49983343578208317,
+      "unrealized_tmn": 2501469.23355,
+      "usdt_tmn_value": 2501469.23355
+    },
+    "regime_distribution": {},
+    "regime_gated": {
+      "regime_flip_exits": 0,
+      "s3_entries_gated": 0
+    },
+    "return_pct": 0.000921128709999941,
+    "sharpe_annualized": 36.73996250334513,
+    "sharpe_note": "0.1 days of data (3 hourly returns) — do not over-interpret",
+    "sortino": 243.46474124787525,
+    "start_iso": "2026-10-22T12:26:00.000Z",
+    "start_ts": 1792671960.0,
+    "turnover_source": "none",
+    "turnover_tmn": null,
+    "veto_repeats_suppressed": 0,
+    "vetoes_by_code": {},
+    "win_rate": null,
+    "wins": 0
+  },
+  "report_date": "2026-10-23",
+  "synthetic": false,
+  "title": "Candle backtest on ALL recorded real Wallex 1-min candles (2026-10-22 12:25-14:40Z), S2+S3 (S3 rules-only), ai=off",
+  "vetoes_by_code": {},
+  "window": {
+    "data_from": "2026-10-22T12:25:00Z",
+    "data_hours": 2.25,
+    "data_to": "2026-10-22T14:40:00Z",
+    "requested_from": "2026-10-22T12:25:00Z",
+    "requested_hours": 2.25,
+    "requested_to": "2026-10-22T14:40:00Z"
+  }
+}

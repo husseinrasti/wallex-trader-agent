@@ -883,6 +883,7 @@ def cmd_backtest(args: argparse.Namespace, cfg: Config, settings: Settings) -> i
             "flatten_at_end": args.flatten_at_end,
             "settings": settings,
             "title": args.title,
+            "report_date": args.report_date,
         }
         if args.state_db:
             common["state_db"] = args.state_db
@@ -924,6 +925,7 @@ def cmd_report(args: argparse.Namespace, cfg: Config, settings: Settings) -> int
         res = bt.report_from_logs(
             source=source, out_dir=out, state_db=args.state_db, compare=args.compare,
             compare_state_db=args.compare_state_db, title=args.title, from_ts=a, to_ts=b,
+            report_date=args.report_date,
         )
     except (ValueError, FileNotFoundError, OSError) as exc:
         _err(_one_line(exc))
@@ -965,7 +967,8 @@ def cmd_export(args: argparse.Namespace, cfg: Config, settings: Settings) -> int
 
 def cmd_replay(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
     """``wta replay`` (PRD-05 §6): ``wta.replay.runner.run_replay`` over a run's logs + state DB;
-    exit 0 when every decision is reproduced, 1 on a mismatch."""
+    exit 0 when every decision is reproduced (PRD fields and the strict pass), 1 on a mismatch or a
+    partial recording, 2 when there is nothing to replay or compare."""
     import inspect
 
     try:
@@ -982,7 +985,7 @@ def cmd_replay(args: argparse.Namespace, cfg: Config, settings: Settings) -> int
     try:
         result = run_replay(
             cfg, log_dir=log_dir, state_db=state_db, out_dir=Path(args.out) if args.out else None,
-            reports_dir=args.reports_dir or None, strict=not args.no_strict,
+            reports_dir=args.reports_dir or None, strict=not args.lenient, allow_partial=args.allow_partial,
         )
         if inspect.isawaitable(result):
             result = asyncio.run(result)
@@ -993,6 +996,10 @@ def cmd_replay(args: argparse.Namespace, cfg: Config, settings: Settings) -> int
     summary = summary() if callable(summary) else summary
     ok = bool(getattr(result, "ok", False))
     print(f"replay: {summary or result} ({'PASS' if ok else 'FAIL'})")
+    for err in getattr(result, "errors", None) or []:
+        print(f"replay error: {err}")
+    if not ok and getattr(result, "n_reference", None) == 0:
+        return EXIT_CANNOT_RUN  # nothing to compare: a window without decisions proves nothing
     return EXIT_OK if ok else EXIT_FAILED
 
 
@@ -1220,6 +1227,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--flatten-at-end", action=argparse.BooleanOptionalAction, default=None,
                    help="run the deadline flatten in the window's last 2 h (default: on for windows >= 8 h)")
     p.add_argument("--title", default=None, help="report title")
+    p.add_argument("--report-date", default=None, metavar="YYYY-MM-DD",
+                   help="the report's date (default: the commit date of the code; never the data's end)")
     p.add_argument("--state-db", default=None, metavar="PATH",
                    help="engine state DB of the run (default <out>/state.sqlite; ~4 MB per simulated day)")
     p.add_argument("--verbose", action="store_true", help="engine log lines during the run (default: errors only)")
@@ -1235,6 +1244,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from", dest="from_ts", default=None, metavar="ISO", help="cut the window (start)")
     p.add_argument("--to", dest="to_ts", default=None, metavar="ISO", help="cut the window (end)")
     p.add_argument("--title", default=None, help="report title")
+    p.add_argument("--report-date", default=None, metavar="YYYY-MM-DD",
+                   help="the report's date (default: the commit date of the code; never the data's end)")
     p.add_argument("--update-index", action="store_true", help="regenerate README.md of the --out folder's parent")
 
     p = add("export", cmd_export, "market tables (books, candles, trades) to Parquet (CSV without pyarrow)")
@@ -1248,7 +1259,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default=None, metavar="DIR", help="where the replayed logs go")
     p.add_argument("--reports-dir", default="docs/REPORTS", metavar="DIR",
                    help="where replay_<date>.md goes ('' = nowhere)")
-    p.add_argument("--no-strict", action="store_true", help="compare the PRD field list only (not every field)")
+    p.add_argument("--lenient", action="store_true",
+                   help="keep going after an LLM cache miss / unmatched config hash (the verdict still FAILs on "
+                        "any mismatch; every field is always compared)")
+    p.add_argument("--allow-partial", action="store_true",
+                   help="replay the committed prefix of a run still being written, crashed or with an incomplete "
+                        "state DB copy (a PARTIAL replay; without it that is a failure)")
 
     for name, (prd, help_text) in PLACEHOLDERS.items():
         add(name, _placeholder(name), f"{help_text} ({prd}, not implemented yet)")

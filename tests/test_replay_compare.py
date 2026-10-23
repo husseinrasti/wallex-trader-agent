@@ -179,6 +179,7 @@ def write_run(
     mode: str = "shadow",
     git: str = GIT,
     mutate: Callable[[list[Spec]], None] | None = None,
+    latency_ms: int | None = 3,
 ) -> Path:
     start = T0 + offset
     clock = SimClock(start)
@@ -187,7 +188,9 @@ def write_run(
     if mode == "replay":  # served by the LLM cache
         for s in items:
             if s.get("plan_snapshot"):
-                s["plan_snapshot"] = {**s["plan_snapshot"], "cached": True, "latency_ms": 3}
+                s["plan_snapshot"] = {**s["plan_snapshot"], "cached": True}
+                if latency_ms is not None:
+                    s["plan_snapshot"]["latency_ms"] = latency_ms
     if mutate is not None:
         mutate(items)
     for s in items:
@@ -219,7 +222,7 @@ def rows(report: ReplayReport) -> list[tuple[str, str, Any, Any]]:
 
 
 def test_identical_runs_reproduce_every_decision_and_ignore_time_mode_and_cache(tmp_path: Path) -> None:
-    report = compare(tmp_path)
+    report = compare(tmp_path)  # the replay runs 0.5 s later: the PRD field list has no time stamp
     assert report.ok and rows(report) == []
     assert (report.n_reference, report.n_replayed, report.n_matched) == (3, 3, 3)
     assert report.summary == "3/3 decisions reproduced"
@@ -227,8 +230,16 @@ def test_identical_runs_reproduce_every_decision_and_ignore_time_mode_and_cache(
     assert report.provenance["git_commit"] == {"reference": [GIT], "replayed": [GIT], "equal": True}
     assert report.provenance["config_hash"]["equal"] is True
     assert report.provenance["mode"] == {"reference": ["shadow"], "replayed": ["replay"], "equal": False}
-    strict = compare(tmp_path / "strict", strict=True)
-    assert strict.ok, rows(strict)  # ts, intent.ts, created_ts, done_ts, seen_ts, latency, cached
+    # the strict pass compares time stamps and durations too: the replay clock is set to the recorded
+    # tick times, so a decision, fill or close at another time is a difference
+    ref = write_run(tmp_path / "s_ref")
+    same = write_run(tmp_path / "s_same", mode="replay", latency_ms=None)  # only mode + cached differ
+    assert compare_decisions(ref, same, strict=True).ok
+    shifted = compare_decisions(ref, write_run(tmp_path / "s_late", offset=0.5, mode="replay"), strict=True)
+    fields = {m.field for m in shifted.mismatches}
+    assert not shifted.ok
+    assert {"ts", "intent.ts", "outcome.done_ts", "plan_snapshot.latency_ms"} <= fields, sorted(fields)
+    assert not any(f in ("mode", "plan_snapshot.cached") for f in fields)
 
 
 def test_inputs_may_be_a_directory_raw_records_or_merged_records(tmp_path: Path) -> None:
@@ -347,7 +358,9 @@ def test_strict_mode_compares_every_other_field(tmp_path: Path) -> None:
         spec["intent"]["features"]["atr_pct"] = "0.005"
 
     assert compare(tmp_path / "default", mutate).ok  # features are not a PRD-05 field
-    strict = compare(tmp_path / "strict", mutate, strict=True)
+    ref = write_run(tmp_path / "strict" / "ref")  # same clock: only the mutated fields differ
+    strict = compare_decisions(ref, write_run(tmp_path / "strict" / "rep", mode="replay", mutate=mutate,
+                                              latency_ms=None), strict=True)
     assert rows(strict) == [
         (ORDER_ID, "features.atr_pct", "0.004", "0.005"),
         (ORDER_ID, "intent.features.atr_pct", "0.004", "0.005"),

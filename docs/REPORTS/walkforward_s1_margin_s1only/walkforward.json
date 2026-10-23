@@ -1,0 +1,108 @@
+{
+  "accepted": false,
+  "chosen": {
+    "strategies.s1_crossbook.margin_min_pct": 0.0008
+  },
+  "chosen_is_default": false,
+  "default": {
+    "strategies.s1_crossbook.margin_min_pct": "0.0015"
+  },
+  "final_params": {
+    "strategies.s1_crossbook.margin_min_pct": "0.0015"
+  },
+  "flatten_at_end": false,
+  "grid": {
+    "strategies.s1_crossbook.margin_min_pct": [
+      0.0008,
+      0.0012,
+      0.0015,
+      0.0025
+    ]
+  },
+  "in_sample": [
+    "2026-10-01T00:00:00.000Z",
+    "2026-10-01T16:47:58.000Z"
+  ],
+  "out_of_sample": [
+    "2026-10-01T16:48:00.000Z",
+    "2026-10-02T00:00:00.000Z"
+  ],
+  "reason": "out-of-sample return per day +0.0000% degrades 100% vs in-sample +0.0163% (> 50%); the pre-grid default is kept",
+  "rows": [
+    {
+      "default": false,
+      "is_days": 0.7,
+      "is_max_drawdown_pct": 0.0021777128729119897,
+      "is_orders": 20,
+      "is_return_pct": 0.00011378462711753023,
+      "is_return_per_day": 0.00016254946731075748,
+      "is_trades": 1,
+      "oos_days": 0.3000231481481481,
+      "oos_max_drawdown_pct": 0.0,
+      "oos_orders": 3,
+      "oos_return_pct": 0.0,
+      "oos_return_per_day": 0.0,
+      "oos_trades": 0,
+      "params": {
+        "strategies.s1_crossbook.margin_min_pct": 0.0008
+      }
+    },
+    {
+      "default": false,
+      "is_days": 0.7,
+      "is_max_drawdown_pct": 0.0,
+      "is_orders": 12,
+      "is_return_pct": 0.0,
+      "is_return_per_day": 0.0,
+      "is_trades": 0,
+      "oos_days": 0.3000231481481481,
+      "oos_max_drawdown_pct": 0.0,
+      "oos_orders": 3,
+      "oos_return_pct": 0.0,
+      "oos_return_per_day": 0.0,
+      "oos_trades": 0,
+      "params": {
+        "strategies.s1_crossbook.margin_min_pct": 0.0012
+      }
+    },
+    {
+      "default": true,
+      "is_days": 0.7,
+      "is_max_drawdown_pct": 0.0,
+      "is_orders": 11,
+      "is_return_pct": 0.0,
+      "is_return_per_day": 0.0,
+      "is_trades": 0,
+      "oos_days": 0.3000231481481481,
+      "oos_max_drawdown_pct": 0.0,
+      "oos_orders": 2,
+      "oos_return_pct": 0.0,
+      "oos_return_per_day": 0.0,
+      "oos_trades": 0,
+      "params": {
+        "strategies.s1_crossbook.margin_min_pct": 0.0015
+      }
+    },
+    {
+      "default": false,
+      "is_days": 0.7,
+      "is_max_drawdown_pct": 0.0,
+      "is_orders": 3,
+      "is_return_pct": 0.0,
+      "is_return_per_day": 0.0,
+      "is_trades": 0,
+      "oos_days": 0.3000231481481481,
+      "oos_max_drawdown_pct": 0.0,
+      "oos_orders": 1,
+      "oos_return_pct": 0.0,
+      "oos_return_per_day": 0.0,
+      "oos_trades": 0,
+      "params": {
+        "strategies.s1_crossbook.margin_min_pct": 0.0025
+      }
+    }
+  ],
+  "rule": "returns per day of data: accept only if IS > 0, OOS >= 0 and (IS - OOS) / IS <= 50%; else keep the pre-grid default",
+  "split": "2026-10-01T16:48:00.000Z",
+  "synthetic": true
+}

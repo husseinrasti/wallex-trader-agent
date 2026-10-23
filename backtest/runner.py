@@ -16,11 +16,15 @@ reconcile, flatten and decision log — and swaps only what PRD-05 §3.1 says ma
     one recorded snapshot (gaps between recording windows are skipped, never invented). At each
     tick every watchlist symbol shows its latest snapshot as of the tick time, and only while it is
     at most ``engine.stale_data_s`` old (an older one is removed from the bus: the engine sees a
-    missing book, as it would live). Recorded trades are published the same way.
+    missing book, as it would live). Recorded trades are published the same way. An order still
+    open when its symbol's snapshots stop for more than ``engine.stale_data_s`` (a recording gap)
+    is never filled on a snapshot after the gap (``BacktestExchange(max_gap_s=...)``): live, the
+    OrderManager would have re-priced or canceled it within seconds.
   - ``driver="candles"``: one tick per 1-minute bar close (60 s) that has a candle of at least one
     watchlist symbol. Each symbol's book is ``BacktestExchange.make_synthetic_book`` of its bar
-    (mid = close, spread = the median spread observed in the stored books, else the reference
-    spread of ``configs/markets_snapshot.yaml``; unlimited depth at best) and the bar is also the
+    (mid = close, spread = the median spread of the stored books recorded up to the window's end,
+    never after it, else the reference spread of ``configs/markets_snapshot.yaml``; unlimited depth
+    at best; ``meta.spreads`` names the source and the sample per symbol) and the bar is also the
     exchange's matching bar. A minute without a candle (no trades) inside a gap of at most
     ``MAX_GAP_FILL_S`` becomes a flat bar at the previous close (the rule the engine's
     ``CandleCache`` applies); after a longer gap the symbol's book goes stale.
@@ -375,20 +379,25 @@ class MarketDB:
         ).fetchone()
         return int(row[0])
 
-    def observed_spreads(self, symbols: Sequence[str]) -> dict[str, Decimal]:
-        """Median spread of the last ``SPREAD_SAMPLE`` two-sided recorded books per symbol."""
+    def observed_spreads(self, symbols: Sequence[str], to_ts: float | None = None) -> dict[str, dict[str, Any]]:
+        """Median spread of the last ``SPREAD_SAMPLE`` two-sided recorded books per symbol stamped at or
+        before ``to_ts`` (the backtest window's end: never books recorded after it):
+        ``{symbol: {"spread": Decimal, "books": n, "from": first ts, "to": last ts}}``; a symbol
+        without such books is left out (the caller falls back to the reference spread)."""
         from backtest.fills import median_spread
 
-        out: dict[str, Decimal] = {}
+        out: dict[str, dict[str, Any]] = {}
         for sym in sorted(set(symbols)):
             rows = self._conn.execute(
-                "SELECT ts, symbol, source, bids_json, asks_json FROM books WHERE symbol = ?"
+                "SELECT ts, symbol, source, bids_json, asks_json FROM books WHERE symbol = ? AND ts <= ?"
                 " ORDER BY ts DESC LIMIT ?",
-                (sym, SPREAD_SAMPLE),
+                (sym, math.inf if to_ts is None else float(to_ts), SPREAD_SAMPLE),
             ).fetchall()
-            spread = median_spread(Store._row_to_book(r) for r in rows)
+            books = [Store._row_to_book(r) for r in rows]
+            spread = median_spread(books)
             if spread is not None:
-                out[sym] = spread
+                out[sym] = {"spread": spread, "books": sum(1 for b in books if b.spread_pct is not None),
+                            "from": min(b.ts for b in books), "to": max(b.ts for b in books)}
         return out
 
     def iter_books(self, symbols: Sequence[str], from_ts: float, to_ts: float) -> Iterator[BookSnapshot]:
@@ -660,8 +669,10 @@ async def arun_backtest(
     state_db: str | Path | None = None,
     quiet: bool = True,
     write: bool = True,
+    report_date: str | None = None,
 ) -> BacktestResult:
-    """One backtest (see the module docstring). Raises ``ValueError`` on bad arguments and
+    """One backtest (see the module docstring). ``report_date`` (``YYYY-MM-DD``): the report's
+    date (default: the commit date of the code, ``report_date_of``). Raises ``ValueError`` on bad arguments and
     ``FileNotFoundError`` when the market DB is missing; an empty window still writes a report
     (``INSUFFICIENT DATA``). ``state_db``: where the engine's state DB goes (default
     ``<out_dir>/state.sqlite``; a 30-day candle run writes ~130 MB of replay inputs, which do not
@@ -715,7 +726,7 @@ async def arun_backtest(
                        heartbeat_every_s, strats, state_path)
             await run.execute()
     return _finish(run, cfg=run_cfg, requested=requested, strats=strats, flatten=flatten, notes=notes,
-                   title=title, write=write, db_path=db_path)
+                   title=title, write=write, db_path=db_path, report_date=report_date)
 
 
 class _Run:
@@ -774,22 +785,27 @@ class _Run:
         self.clock = SimClock(self.plan.steps[0] if self.plan.steps else self.from_ts)
         self.tick_clock = TickClock(self.clock)
         self.bus = MarketDataBus()
-        observed = self.db.observed_spreads(self.watch) if self.driver == "candles" else {}
+        observed = self.db.observed_spreads(self.watch, to_ts=self.to_ts) if self.driver == "candles" else {}
         self.exchange = BacktestExchange(
             self.markets,
             self.tick_clock,
             driver=self.driver,  # type: ignore[arg-type]
             books=self.bus.snapshot if self.driver == "books" else None,
-            spreads=observed,
+            spreads={s: v["spread"] for s, v in observed.items()},
+            max_gap_s=self.stale_s if self.driver == "books" else None,
             initial_balances=dict(self.balances0),
             initial_equity_tmn=self.cfg.engine.initial_equity_tmn,
             use_fee_snapshot=False,  # the markets above already carry the fee snapshot
         )
         if self.driver == "candles":
-            self.spreads = {
-                s: {"spread_pct": str(self.exchange.spread_for(s)), "source": self.exchange.spread_source(s)}
-                for s in self.watch
-            }
+            self.spreads = {}
+            for s in self.watch:
+                info: dict[str, Any] = {"spread_pct": str(self.exchange.spread_for(s)),
+                                        "source": self.exchange.spread_source(s)}
+                if info["source"] == "observed":
+                    obs = observed[s]
+                    info.update(books=obs["books"], **{"from": iso(obs["from"]), "to": iso(obs["to"])})
+                self.spreads[s] = info
         self.lock = acquire_engine_lock(str(self.state_path))
         self.store = Store(
             self.state_path,
@@ -1014,6 +1030,7 @@ def _finish(
     title: str | None,
     write: bool,
     db_path: Path,
+    report_date: str | None = None,
 ) -> BacktestResult:
     engine = run.engine
     assert engine is not None
@@ -1085,13 +1102,15 @@ def _finish(
         "tick_crashes": engine.tick_crashes,
         "fee_budget_pct": float(cfg.risk.fee_budget_pct),
         "fees_source": "configs/fees_snapshot.yaml",
-        "generated_at": iso(run.to_ts),
+        "data_end": iso(run.to_ts),  # the window's end (the data's time, not when the report was made)
+        **report_date_of(report_date),
         "candles_ingested": run.candles_ingested,
         "warmup_candles": run.warmup_candles,
     }
     if run.driver == "books":
         meta.update(snapshots=run.snapshots, trades_published=run.trades_published,
-                    s1_coverage_hours=round(run.s1_ticks * run.plan.step_s / 3600.0, 4))
+                    s1_coverage_hours=round(run.s1_ticks * run.plan.step_s / 3600.0, 4),
+                    orders_stopped_by_gaps=engine_gap_orders(run))
     else:
         meta.update(spreads=run.spreads, gap_filled_minutes=dict(sorted(run.filled_minutes.items())))
     if run.ai != "off":
@@ -1134,6 +1153,32 @@ def _finish(
             regimes_png=out / REGIMES_PNG,
         )
     return BacktestResult(metrics=metrics, paths=paths, meta=meta, limitations=limits)
+
+
+def engine_gap_orders(run: _Run) -> int:
+    """Orders the BacktestExchange kept from filling across a recording gap (books driver)."""
+    return int(getattr(run.exchange, "gap_blocked", 0) or 0)
+
+
+def report_date_of(given: str | None = None) -> dict[str, Any]:
+    """``report_date`` (``YYYY-MM-DD``) and ``report_date_source`` for a report's meta: ``given``
+    (``--report-date``), else the commit date of the code that made the report (deterministic: a
+    rerun of the same commit gives the same report), never the data's end."""
+    from wta.utils import gitinfo
+
+    if given:
+        try:
+            day = parse_iso(str(given).strip())
+        except ValueError:
+            day = None
+        if day is None:
+            raise ValueError(f"report date: not a date: {given!r} (YYYY-MM-DD)")
+        return {"report_date": iso(day)[:10], "report_date_source": "given with --report-date"}
+    day_text = gitinfo.commit_date()
+    commit = gitinfo.short_commit()
+    dirty = " + uncommitted changes" if gitinfo.get().get("dirty") else ""
+    return {"report_date": day_text,
+            "report_date_source": f"commit date of {commit}{dirty}" if day_text else "unknown (no git)"}
 
 
 def _synthetic_text(info: Mapping[str, Any] | None) -> str:
@@ -1180,9 +1225,13 @@ def _limitations(run: _Run, cfg: Config, meta: Mapping[str, Any], flatten: bool,
             f"minute without a candle inside a gap of at most {MAX_GAP_FILL_S / 60:g} min is a flat bar at the "
             "previous close (the engine's CandleCache rule)."
         )
-        sources = sorted({str(v.get("source")) for v in run.spreads.values()})
-        if sources:
-            out.append(f"Synthetic-book spreads per symbol from: {', '.join(sources)} (see summary.json meta.spreads).")
+    if run.driver == "books" and meta.get("orders_stopped_by_gaps"):
+        out.append(
+            f"{meta['orders_stopped_by_gaps']} order(s) were open across a recording gap (no snapshot of the symbol "
+            f"for more than engine.stale_data_s = {run.stale_s:g} s): they were never filled on a snapshot after "
+            "the gap (live, the OrderManager would have re-priced or canceled them within seconds); the engine "
+            "then re-priced, crossed or gave them up on the post-gap books."
+        )
     if run.plan.missing_symbols:
         out.append(f"No data in the window for: {', '.join(run.plan.missing_symbols)} (left out of the watchlist).")
     if run.warmup_candles:
@@ -1663,6 +1712,155 @@ def update_summary(summary_json: Path, key: str, value: Any) -> None:
                             encoding="utf-8")
 
 
+def _per_process(health: Sequence[Mapping[str, Any]], get: Any, restart_key: str) -> list[dict[str, Any]]:
+    """The last value ``get(heartbeat)`` of every engine process in ``health`` (counters restart with
+    every process: ``restart_key`` going down marks a new one); None values are skipped."""
+    out: list[dict[str, Any]] = []
+    prev: dict[str, Any] | None = None
+    for hb in health:
+        value = get(hb)
+        if not isinstance(value, Mapping):
+            continue
+        cur = dict(value)
+        if prev is not None and int(cur.get(restart_key) or 0) < int(prev.get(restart_key) or 0):
+            out.append(prev)
+        prev = cur
+    if prev is not None:
+        out.append(prev)
+    return out
+
+
+def s1_opportunity_ticks(health: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per S1 coin: fast ticks evaluated, opportunity ticks (lock-in edge >= cost + margin in force on
+    either side), the best excess (edge - cost - margin) and the last opportunity time, from the
+    engine's own counters in the heartbeats (``extra.strategies.S1.coins.<coin>.stats``), summed over
+    engine processes; plus the last ``why_no_trade``."""
+    def coins(hb: Mapping[str, Any]) -> Mapping[str, Any]:
+        return (((hb.get("extra") or {}).get("strategies") or {}).get("S1") or {}).get("coins") or {}
+
+    names = sorted({c for hb in health for c in coins(hb)})
+    out: dict[str, dict[str, Any]] = {}
+    for coin in names:
+        runs = _per_process(health, lambda hb, c=coin: (coins(hb).get(c) or {}).get("stats"), "evaluated")
+        if not runs:
+            continue
+        bests = [D(r["best_excess_pct"]) for r in runs if r.get("best_excess_pct") is not None]
+        lasts = [float(r["last_opportunity_ts"]) for r in runs if r.get("last_opportunity_ts") is not None]
+        why = next((str((coins(hb).get(coin) or {}).get("why_no_trade")) for hb in reversed(health)
+                    if (coins(hb).get(coin) or {}).get("why_no_trade")), None)
+        out[coin] = {
+            "evaluated": sum(int(r.get("evaluated") or 0) for r in runs),
+            "opportunity_ticks": sum(int(r.get("opportunity_ticks") or 0) for r in runs),
+            "best_excess_pct": str(max(bests)) if bests else None,
+            "last_opportunity": iso(max(lasts)) if lasts else None,
+            "why_no_trade": why,
+        }
+    return out
+
+
+def s1_opportunity_markdown(totals: Mapping[str, Mapping[str, Any]],
+                            merged: Sequence[Mapping[str, Any]]) -> list[str]:
+    lines = ["## S1 opportunity ticks", ""]
+    if not totals:
+        return [*lines, "_No S1 counters in the heartbeats (S1 not run, or no heartbeat)._", ""]
+    lines += [
+        "An opportunity tick is a fast tick on which a coin's lock-in edge reached cost + the margin in force "
+        "(the plan's `s1_margin_min_pct`, else the config's) on either side, TMN-cheap or USDT-cheap. These are "
+        "the engine's own counters, read from the heartbeats; best excess = the largest edge − cost − margin seen "
+        "(negative: no tick reached the threshold).",
+        "",
+        "| coin | ticks evaluated | opportunity ticks | best excess | last opportunity (UTC) | last why-no-trade |",
+        "|---|---:|---:|---:|---|---|",
+    ]
+    for coin, t in sorted(totals.items()):
+        best = f"{float(t['best_excess_pct']) * 100:+.3f}%" if t.get("best_excess_pct") is not None else "n/a"
+        why = str(t.get("why_no_trade") or "-").split("; ")[0]  # the lock-in clause (the revert one follows)
+        why = (why if len(why) <= 160 else why[:159] + "…").replace("|", "\\|")
+        lines.append(f"| {coin} | {t['evaluated']:,} | {t['opportunity_ticks']:,} | {best} | "
+                     f"{t.get('last_opportunity') or '-'} | {why} |")
+    total = sum(int(t["opportunity_ticks"]) for t in totals.values())
+    evaluated = sum(int(t["evaluated"]) for t in totals.values())
+    entries = [r for r in merged if r.get("strategy") == "S1" and (r.get("intent") or {}).get("purpose") == "entry"]
+    placed = [r for r in entries if r.get("kind") == "order" and (r.get("order") or {}).get("accepted")]
+    plans = [r for r in merged if r.get("kind") == "plan" and isinstance(r.get("plan_snapshot"), Mapping)]
+    off = sum(1 for r in plans if "S1" not in (r["plan_snapshot"].get("enabled_strategies") or []))
+    lines += ["", f"Total: {total:,} opportunity ticks in {evaluated:,} coin-ticks evaluated. S1 entries: "
+              f"{len(entries)} decided, {len(placed)} placed."
+              + (f" The analyst left S1 out of `enabled_strategies` in {off} of {len(plans)} plans (no new S1 "
+                 "entries while such a plan is fresh)." if plans else ""), ""]
+    return lines
+
+
+def ai_availability(run: LogRun) -> dict[str, Any] | None:
+    """The analyst's cycles, failures and plan freshness over a run, from the heartbeats' AI stats
+    (summed over engine processes) and the ``ai_degraded`` / ``ai_recovered`` / ``plan_stale`` events.
+    A rules-only stretch runs from a ``plan_stale`` event to the next plan (or the window's end)."""
+    stats = _per_process(run.health, lambda hb: (((hb.get("extra") or {}).get("ai") or {}).get("stats")), "cycles")
+    events = [e for e in run.events if e.get("kind") in ("ai_degraded", "ai_recovered", "plan_stale")]
+    if not stats and not events:
+        return None
+    totals = {k: sum(int(s.get(k) or 0) for s in stats)
+              for k in ("cycles", "plans", "failures", "model_calls", "cached_calls", "reviews", "tokens")}
+    if not totals["cycles"] and not events:
+        return None  # AI off (or it never ran a cycle)
+    streaks = []
+    for e in events:
+        if e.get("kind") != "ai_degraded":
+            continue
+        reason = str(e.get("reason") or "")
+        cause = ("llm_invalid: an invalid answer" if "llm_invalid" in reason
+                 else "llm unavailable: provider unreachable" if "llm unavailable" in reason else "other failure")
+        streaks.append({"ts": str(e.get("ts")), "cause": cause})
+    plan_ts = sorted(t for t in (_rec_ts(r) for r in run.merged if r.get("kind") == "plan") if t is not None)
+    end = run.window[1]
+    stretches = []
+    for e in events:
+        t = _rec_ts(e)
+        if e.get("kind") != "plan_stale" or t is None:
+            continue
+        nxt = next((p for p in plan_ts if p > t), None)
+        stop = nxt if nxt is not None else end
+        stretches.append({"from": iso(t), "to": iso(stop) if stop is not None else None,
+                          "until": "the next plan" if nxt is not None else "the end of the window",
+                          "hours": round((stop - t) / 3600.0, 3) if stop is not None else None})
+    return {**totals, "failure_streaks": streaks,
+            "recovered": [str(e.get("ts")) for e in events if e.get("kind") == "ai_recovered"],
+            "rules_only_stretches": stretches}
+
+
+def ai_availability_text(av: Mapping[str, Any]) -> str | None:
+    """One limitation line when the analyst failed or a plan went stale (None: neither happened)."""
+    if not av.get("failures") and not av.get("rules_only_stretches"):
+        return None
+    text = f"The LLM analyst gave no plan in {av['failures']} of {av['cycles']} cycles"
+    if av.get("failure_streaks"):
+        text += " (" + "; ".join(f"{s['cause']} from {s['ts']}" for s in av["failure_streaks"]) + ")"
+    for s in av.get("rules_only_stretches") or []:
+        text += (f"; the plan went stale at {s['from']} and the strategies ran rules-only until {s['until']} "
+                 f"({s['to']}, {s['hours']:.2f} h)")
+    return text + "."
+
+
+def ai_availability_markdown(av: Mapping[str, Any]) -> list[str]:
+    rows = [("analyst cycles", av.get("cycles")), ("plans", av.get("plans")),
+            ("cycles without a plan", av.get("failures")), ("model calls", av.get("model_calls")),
+            ("model calls served from the cache", av.get("cached_calls")), ("tokens", av.get("tokens")),
+            ("post-trade reviews", av.get("reviews"))]
+    lines = ["### Analyst availability", "", "| | value |", "|---|---:|"]
+    lines += [f"| {k} | {int(v or 0):,} |" for k, v in rows]
+    lines.append("")
+    for s in av.get("failure_streaks") or []:
+        lines.append(f"- failure streak from {s['ts']}: {s['cause']}")
+    for t in av.get("recovered") or []:
+        lines.append(f"- recovered (new plan) at {t}")
+    for s in av.get("rules_only_stretches") or []:
+        lines.append(f"- plan stale at {s['from']}: rules-only until {s['until']} ({s['to']}, {s['hours']:.2f} h)")
+    lines += ["", "_From the heartbeats' AI counters (last value of each engine process) and the run's "
+              "`ai_degraded` / `ai_recovered` / `plan_stale` events. A failure streak is logged once, at its "
+              "first failed cycle._", ""]
+    return lines
+
+
 @dataclass
 class LogReport:
     report: Path
@@ -1681,6 +1879,7 @@ def report_from_logs(
     title: str | None = None,
     from_ts: float | None = None,
     to_ts: float | None = None,
+    report_date: str | None = None,
 ) -> LogReport:
     """``wta report``: the report of a shadow/live (or backtest) run from its log dir (+ state DB),
     via ``backtest.metrics`` + ``backtest.report``; with ``compare`` (the other run's log dir, e.g.
@@ -1718,7 +1917,8 @@ def report_from_logs(
         "state_db": display_path(db) if db is not None else None,
         "equity_source": eq_source,
         "engine_starts": start.get("runs", 0),
-        "generated_at": iso(hi) if hi is not None else None,
+        "data_end": iso(hi) if hi is not None else None,
+        **report_date_of(report_date),
     }
     limits: list[str] = []
     if eq_source == "heartbeats":
@@ -1729,6 +1929,9 @@ def report_from_logs(
         limits.append(f"The config changed during the run (config hashes {', '.join(hashes)}).")
     if ai_source == "offline-rules":
         limits.append("Plans came from the offline rules provider, NOT an LLM.")
+    availability = ai_availability(run)
+    if availability is not None and ai_availability_text(availability):
+        limits.append(str(ai_availability_text(availability)))
     whole = from_ts is None and to_ts is None
     # the engine's fee total covers the whole run, so it is used only for an uncut window
     fees_total = state_fees_tmn(db) if whole else None
@@ -1741,6 +1944,13 @@ def report_from_logs(
     heading = title or f"{mode.capitalize()} run report: {run.log_dir.name}" + (" — SYNTHETIC" if synthetic else "")
     report = write_report(out, heading, meta, metrics, equity, trades, decisions=run.merged, plans=None,
                           limitations=limits)
+    if "S1" in (meta["strategies"] or []):
+        s1 = s1_opportunity_ticks(run.health)
+        insert_section(report, s1_opportunity_markdown(s1, run.merged), before="## AI (Regime Analyst)")
+        update_summary(out / SUMMARY_JSON, "s1_opportunities", s1)
+    if availability is not None:
+        insert_section(report, ai_availability_markdown(availability), before="### Ablation (ai=on vs ai=off)")
+        update_summary(out / SUMMARY_JSON, "ai_availability", availability)
     div: dict[str, Any] | None = None
     if compare is not None:
         other = load_log_run(compare, from_ts, to_ts)

@@ -1,0 +1,3 @@
+{"data":{"day_start_equity_tmn":"4777056.975282687600"},"kind":"day_start","reason":"new UTC day 2026-10-31: daily PnL and the daily-loss limit restart","ts":"2026-10-31T00:00:00.000Z"}
+{"data":{"end_utc":"2026-10-31T00:00:00.000Z","kind":"challenge_end","orders_canceled":0,"phase":3,"trigger":"deadline"},"kind":"flatten","reason":"challenge end: every open order canceled; no orders from now on","ts":"2026-10-31T00:00:00.000Z"}
+{"data":{"heartbeats":721,"ticks":43200,"uptime_s":2591940.0},"kind":"stop","reason":"backtest complete: 43200 ticks","ts":"2026-10-31T00:00:00.000Z"}
