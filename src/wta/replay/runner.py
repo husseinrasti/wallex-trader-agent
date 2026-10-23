@@ -71,6 +71,13 @@ heartbeats, Telegram commands and ``wta reset-kill`` are not replayed; markets c
 snapshot); REST error counters of a live run are not recorded (the replay sees 0 errors); a run still
 being written fails as partial unless ``allow_partial`` replays its committed prefix. The
 ``ReplayExchange`` approximations are in its module docstring.
+
+Replay bundles (``deliverables/replay/<run>/``, ``scripts/replay_check.py --bundle``): ``logs/`` and
+``data/`` are not in git, so a recorded run ships as three files: ``logs.tar.xz`` (the log directory),
+``state.sqlite.xz`` (a consistent copy of its state DB, ``snapshot_sqlite``) and ``SHA256SUMS``.
+``make_replay_bundle`` writes them; ``extract_replay_bundle`` checks every checksum
+(``verify_replay_bundle``), refuses unsafe archive members and unpacks the run into a directory, from
+which it is replayed exactly like a run under ``logs/``.
 """
 
 from __future__ import annotations
@@ -78,17 +85,22 @@ from __future__ import annotations
 import asyncio
 import bisect
 import errno
+import hashlib
 import json
 import logging
+import lzma
+import os
+import re
 import shutil
 import socket
 import sqlite3
+import tarfile
 import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -1767,3 +1779,235 @@ def pick_run_dir(root: str | Path) -> dict[str, Any] | None:
     runs = find_run_dirs(root)
     live = [r for r in runs if r["mode"] == "live"]
     return (live or runs or [None])[0]
+
+
+# ---------------------------------------------------------------- replay bundles
+
+BUNDLE_LOGS = "logs.tar.xz"
+BUNDLE_STATE = "state.sqlite.xz"
+BUNDLE_SUMS = "SHA256SUMS"
+BUNDLE_FILES: tuple[str, ...] = (BUNDLE_LOGS, BUNDLE_STATE)  # what SHA256SUMS must cover
+XZ_PRESET = 9  # the preset of ``xz -9``
+_CHUNK = 1 << 20
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+_SUM_LINE = re.compile(r"([0-9a-fA-F]{64}) [ *](\S.*)")
+
+
+class BundleError(ReplayInputError):
+    """A replay bundle that is incomplete, does not match its SHA256SUMS or is unsafe to unpack."""
+
+
+def sha256_file(path: str | Path) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(_CHUNK), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sqlite_digest(path: str | Path) -> dict[str, tuple[int, str]]:
+    """``{table: (rows, sha256 of every row with its rowid, in rowid order)}`` of a SQLite file, read
+    through a read-only connection. Two files with equal digests hold the same rows under the same rowids
+    (the replay breaks ties by rowid)."""
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+        out: dict[str, tuple[int, str]] = {}
+        for name in tables:
+            quoted = '"' + name.replace('"', '""') + '"'
+            h, n = hashlib.sha256(), 0
+            try:
+                rows: Iterable[tuple[Any, ...]] = conn.execute(f"SELECT rowid, * FROM {quoted} ORDER BY rowid")
+            except sqlite3.OperationalError:  # a WITHOUT ROWID table: its rows in a canonical order
+                rows = sorted(conn.execute(f"SELECT * FROM {quoted}"), key=repr)
+            for row in rows:
+                h.update(repr(row).encode("utf-8") + b"\n")
+                n += 1
+            out[name] = (n, h.hexdigest())
+        return out
+    finally:
+        conn.close()
+
+
+def snapshot_sqlite(src: str | Path, dst: str | Path, *, verify: bool = True) -> Path:
+    """A consistent single-file copy of the SQLite DB ``src`` at ``dst`` (which must not exist): an online
+    backup (``sqlite3.Connection.backup``) from a read-only connection, so a writer is neither blocked
+    nor changed, then ``journal_mode=DELETE`` (no ``-wal``/``-shm`` side files) and ``VACUUM`` on the
+    copy only. ``verify``: the copy's ``sqlite_digest`` must equal the source's (same rows, same rowids)."""
+    source, target = Path(src), Path(dst)
+    if not source.is_file():
+        raise BundleError(f"state DB not found: {source}")
+    if target.exists():
+        raise BundleError(f"{target} exists: the snapshot needs a new file")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    reader = sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)
+    writer = sqlite3.connect(target, isolation_level=None)
+    try:
+        reader.backup(writer)
+        writer.execute("PRAGMA journal_mode=DELETE")
+        writer.execute("VACUUM")
+    finally:
+        writer.close()
+        reader.close()
+    if verify:
+        want, got = sqlite_digest(source), sqlite_digest(target)
+        if want != got:
+            differ = sorted(t for t in set(want) | set(got) if want.get(t) != got.get(t))
+            raise BundleError(f"snapshot of {source} differs from the source in table(s) {', '.join(differ)}")
+    return target
+
+
+def _safe_link(target: str) -> bool:
+    """A symlink target that stays in its own directory tree (relative, no ``..``)."""
+    path = PurePosixPath(target.replace(os.sep, "/"))
+    return bool(path.parts) and not path.is_absolute() and ".." not in path.parts
+
+
+def _owner_free(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    return info
+
+
+def _pack_logs(src: Path, dst: Path, preset: int) -> int:
+    """``src`` as ``<src.name>/...`` in the tar.xz ``dst``, sorted, symlinks kept; returns the member count."""
+    paths = sorted(src.rglob("*"), key=lambda p: p.relative_to(src).as_posix())
+    for p in paths:
+        if p.is_symlink():
+            if not _safe_link(os.readlink(p)):
+                raise BundleError(f"{p}: symlink leaves the log directory ({os.readlink(p)})")
+        elif not (p.is_file() or p.is_dir()):
+            raise BundleError(f"{p}: not a regular file, directory or symlink")
+    with tarfile.open(dst, "w:xz", preset=preset, format=tarfile.PAX_FORMAT) as tf:
+        tf.add(src, arcname=src.name, recursive=False, filter=_owner_free)
+        for p in paths:
+            tf.add(p, arcname=f"{src.name}/{p.relative_to(src).as_posix()}", recursive=False, filter=_owner_free)
+    return len(paths) + 1
+
+
+def _xz(src: Path, dst: Path, preset: int) -> None:
+    with src.open("rb") as fin, lzma.open(dst, "wb", preset=preset) as fout:
+        shutil.copyfileobj(fin, fout, _CHUNK)
+
+
+def make_replay_bundle(log_dir: str | Path, state_db: str | Path, out_dir: str | Path, *,
+                       preset: int = XZ_PRESET) -> dict[str, dict[str, Any]]:
+    """Pack a recorded run for ``scripts/replay_check.py --bundle``: ``out_dir/logs.tar.xz`` (the log
+    directory under its own name: sorted members, symlinks kept, owners cleared), ``out_dir/state.sqlite.xz``
+    (``snapshot_sqlite`` of ``state_db``, xz at ``preset``, 9 = ``xz -9``) and ``out_dir/SHA256SUMS``
+    (``sha256sum`` format: ``sha256sum -c SHA256SUMS`` checks it). None of the three may exist yet.
+    Returns ``{file: {"bytes": size, "sha256": hex, ...}}`` for the two data files."""
+    src, db, out = Path(log_dir), Path(state_db), Path(out_dir)
+    if not src.is_dir():
+        raise BundleError(f"log directory not found: {src}")
+    if not db.is_file():
+        raise BundleError(f"state DB not found: {db}")
+    out.mkdir(parents=True, exist_ok=True)
+    taken = [n for n in (*BUNDLE_FILES, BUNDLE_SUMS) if (out / n).exists()]
+    if taken:
+        raise BundleError(f"{out} already holds {', '.join(taken)}: write a bundle into a new directory")
+    members = _pack_logs(src, out / BUNDLE_LOGS, preset)
+    with tempfile.TemporaryDirectory(prefix="wta-bundle-") as tmp:
+        copy = snapshot_sqlite(db, Path(tmp) / "state.sqlite")
+        raw_bytes = copy.stat().st_size
+        _xz(copy, out / BUNDLE_STATE, preset)
+    info: dict[str, dict[str, Any]] = {
+        n: {"bytes": (out / n).stat().st_size, "sha256": sha256_file(out / n)} for n in BUNDLE_FILES
+    }
+    info[BUNDLE_LOGS]["members"] = members
+    info[BUNDLE_STATE]["sqlite_bytes"] = raw_bytes
+    (out / BUNDLE_SUMS).write_text("".join(f"{info[n]['sha256']}  {n}\n" for n in BUNDLE_FILES), encoding="utf-8")
+    return info
+
+
+def read_sha256sums(path: str | Path) -> dict[str, str]:
+    """``{file name: sha256}`` from a ``sha256sum``-format file (``<hex>  <name>`` or ``<hex> *<name>``)."""
+    out: dict[str, str] = {}
+    for n, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        m = _SUM_LINE.fullmatch(line.rstrip("\r"))
+        if m is None:
+            raise BundleError(f"{path}:{n}: not a sha256sum line")
+        name = m.group(2)
+        if name in out:
+            raise BundleError(f"{path}:{n}: {name} is listed twice")
+        out[name] = m.group(1).lower()
+    return out
+
+
+def verify_replay_bundle(bundle_dir: str | Path) -> dict[str, str]:
+    """Check a bundle against its SHA256SUMS: the file exists, lists both data files, names only files
+    of the bundle directory itself, and every listed file has that checksum. Returns the checksums;
+    raises ``BundleError`` naming every file that is missing or differs."""
+    b = Path(bundle_dir)
+    if not b.is_dir():
+        raise BundleError(f"no replay bundle directory {b}")
+    sums_path = b / BUNDLE_SUMS
+    if not sums_path.is_file():
+        raise BundleError(f"{sums_path} not found: not a replay bundle")
+    sums = read_sha256sums(sums_path)
+    unsafe = [n for n in sums if n in (".", "..") or "/" in n or "\\" in n]
+    if unsafe:
+        raise BundleError(f"{BUNDLE_SUMS} names files outside the bundle directory: {', '.join(unsafe)}")
+    absent = [n for n in BUNDLE_FILES if n not in sums]
+    if absent:
+        raise BundleError(f"{BUNDLE_SUMS} has no checksum for {', '.join(absent)}")
+    bad: list[str] = []
+    for name, want in sorted(sums.items()):
+        p = b / name
+        if not p.is_file():
+            bad.append(f"{name}: missing")
+            continue
+        got = sha256_file(p)
+        if got != want:
+            bad.append(f"{name}: sha256 {got} but SHA256SUMS says {want}")
+    if bad:
+        raise BundleError("the bundle does not match its SHA256SUMS: " + "; ".join(bad))
+    return sums
+
+
+def _check_members(members: Iterable[tarfile.TarInfo]) -> None:
+    for m in members:
+        parts = PurePosixPath(m.name).parts
+        if not parts or m.name.startswith(("/", "\\")) or ".." in parts:
+            raise BundleError(f"{BUNDLE_LOGS}: unsafe member name {m.name!r}")
+        if not (m.isfile() or m.isdir() or m.issym()):
+            raise BundleError(f"{BUNDLE_LOGS}: {m.name!r} is not a file, directory or symlink")
+        if m.issym() and not _safe_link(m.linkname):
+            raise BundleError(f"{BUNDLE_LOGS}: symlink {m.name!r} points outside its directory")
+
+
+def extract_replay_bundle(bundle_dir: str | Path, dest: str | Path) -> tuple[Path, Path]:
+    """Verify the bundle (``verify_replay_bundle``) and unpack it into ``dest`` (new or empty):
+    ``dest/logs/<run>/`` and ``dest/state.sqlite``. Returns ``(log_dir, state_db)`` for ``run_replay``.
+    Archive members that are absolute, contain ``..``, are links leaving the tree or special files are
+    refused before anything is written (and Python's ``data`` extraction filter applies on top)."""
+    b = Path(bundle_dir)
+    verify_replay_bundle(b)
+    d = Path(dest)
+    d.mkdir(parents=True, exist_ok=True)
+    if any(d.iterdir()):
+        raise BundleError(f"{d} is not empty: the bundle needs a new or empty directory")
+    logs_root = d / "logs"
+    logs_root.mkdir()
+    state = d / "state.sqlite"
+    try:
+        with tarfile.open(b / BUNDLE_LOGS, "r:xz") as tf:
+            members = tf.getmembers()
+            _check_members(members)
+            if hasattr(tarfile, "data_filter"):  # Python >= 3.12, 3.11.4
+                tf.extractall(logs_root, members=members, filter="data")
+            else:  # pragma: no cover - older Pythons; the members were checked above
+                tf.extractall(logs_root, members=members)
+        with lzma.open(b / BUNDLE_STATE, "rb") as fin, state.open("wb") as fout:
+            shutil.copyfileobj(fin, fout, _CHUNK)
+    except (tarfile.TarError, lzma.LZMAError, EOFError, OSError) as exc:
+        raise BundleError(f"cannot unpack {b}: {type(exc).__name__}: {exc}") from None
+    tops = sorted(logs_root.iterdir())
+    if len(tops) != 1 or not tops[0].is_dir() or tops[0].is_symlink():
+        raise BundleError(f"{BUNDLE_LOGS} must hold exactly one log directory (found {len(tops)} entries)")
+    with state.open("rb") as fh:
+        if fh.read(len(_SQLITE_MAGIC)) != _SQLITE_MAGIC:
+            raise BundleError(f"{BUNDLE_STATE} does not hold a SQLite database")
+    return tops[0], state

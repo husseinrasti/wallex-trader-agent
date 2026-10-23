@@ -3,6 +3,7 @@
     python scripts/replay_check.py                         # newest live run under logs/, else newest shadow run
     python scripts/replay_check.py --decisions logs/decisions.jsonl     # the run whose decisions these are
     python scripts/replay_check.py --log-dir logs/shadow_synth_4h --out /tmp/replay1 --json
+    python scripts/replay_check.py --bundle deliverables/replay/shadow_synth_4h   # make replay-deliverable
 
 The engine is rebuilt as the recorded run had it (config hash checked; runtime overlay as recorded;
 AI as recorded with the strict LLM cache) and driven over the recorded inputs: the ticks, books and
@@ -11,6 +12,13 @@ cached analyst plans. Every internet connection attempt is refused and counted d
 The decision log it writes is compared with the recorded one (``wta.replay.runner``), the result is
 printed and written to ``docs/REPORTS/replay_<YYYYMMDD>.md`` (the UTC day of the last replayed tick).
 
+``--bundle DIR`` replays a committed replay bundle instead of a run under ``logs/`` (``logs/`` and
+``data/`` are not in git): ``DIR/SHA256SUMS`` is checked against ``logs.tar.xz`` and ``state.sqlite.xz``
+first, both are unpacked into a temporary directory, the same replay runs on them, and the temporary
+directory is removed afterwards (also on failure). With ``--bundle`` no report is written unless
+``--reports-dir`` is given, so the repo's ``docs/REPORTS`` stay as committed; the replay output is
+removed too unless ``--out`` is given.
+
 Exit codes: 0 = every decision reproduced on the PRD-05 fields AND in the strict pass (every field,
 time stamps, fees, fills and outcome PnL included), every plan re-derived identically, zero network
 calls; 1 = a mismatch, a missing or extra decision, a plan re-derived differently, an exchange
@@ -18,7 +26,8 @@ divergence, a replayed crash the recorded run did not have, a determinism failur
 a partial recording (no stop event, fewer ticks in the state DB than the stop event counts, records
 after the last committed tick; ``--allow-partial`` replays the committed prefix instead) or a network
 call; 2 = nothing to replay or compare, or bad arguments (no recorded run, no state DB, output
-directory not empty, a recorded window without any decision).
+directory not empty, a recorded window without any decision, a bundle that is incomplete, does not match
+its SHA256SUMS or holds an unsafe archive member).
 """
 
 from __future__ import annotations
@@ -26,12 +35,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 
 from wta.config import ROOT, Config, load_config, parse_overrides
-from wta.replay.runner import ReplayInputError, pick_run_dir, run_replay
+from wta.replay.runner import BundleError, ReplayInputError, extract_replay_bundle, pick_run_dir, run_replay
 
 
 def _config(sets: list[str], overlays: list[str]) -> Config:
@@ -63,8 +73,18 @@ def _log_dir(args: argparse.Namespace) -> tuple[Path | None, str]:
     return Path(found["path"]), f"{reason}; {kind} under {root}"
 
 
+def _bundle_dir(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() and not path.exists() and (ROOT / path).exists():
+        path = ROOT / path
+    return path
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="replay_check.py", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--bundle", default=None, metavar="DIR",
+                    help="a replay bundle (logs.tar.xz, state.sqlite.xz, SHA256SUMS): checksums verified, unpacked "
+                         "into a temporary directory, replayed, removed")
     ap.add_argument("--decisions", default=None, help="a recorded decisions file; its directory is the run")
     ap.add_argument("--log-dir", default=None, help="the recorded run's log directory")
     ap.add_argument("--logs-root", default="logs", help="where to look for runs when none is given (default logs)")
@@ -73,7 +93,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="process segment of the log dir, 1-based (default: the latest fresh start)")
     ap.add_argument("--out", default=None, help="new or empty directory for the replay's logs + state DB "
                                                  "(default: a temporary directory)")
-    ap.add_argument("--reports-dir", default="docs/REPORTS", help="where replay_<date>.md goes ('' = nowhere)")
+    ap.add_argument("--reports-dir", default=None,
+                    help="where replay_<date>.md goes ('' = nowhere; default docs/REPORTS, with --bundle nowhere)")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="the recorded run's config overrides, if its config cannot be recovered (repeatable)")
     ap.add_argument("--overlay", action="append", default=[], metavar="FILE", help="the recorded run's overlays")
@@ -89,7 +110,35 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO if args.verbose else logging.ERROR, stream=sys.stderr,
                         format="%(levelname)s %(name)s: %(message)s")
 
-    log_dir, why = _log_dir(args)
+    if args.bundle is None:
+        return _check(args)
+    if args.log_dir or args.decisions or args.state_db:
+        print("replay: --bundle replays the bundle's own run: drop --log-dir / --decisions / --state-db",
+              file=sys.stderr)
+        return 2
+    bundle = _bundle_dir(args.bundle)
+    work = Path(tempfile.mkdtemp(prefix="wta-bundle-"))
+    try:
+        try:
+            log_dir, state_db = extract_replay_bundle(bundle, work / "in")
+        except BundleError as exc:
+            print(f"replay: bundle {args.bundle}: {exc}", file=sys.stderr)
+            return 2
+        print(f"bundle:   {args.bundle}: SHA256SUMS verified (logs.tar.xz, state.sqlite.xz); "
+              f"unpacked into a temporary directory")
+        return _check(args, log_dir=log_dir, state_db=state_db, out=Path(args.out) if args.out else work / "out",
+                      why=f"from bundle {args.bundle}", keep_out=bool(args.out))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _check(args: argparse.Namespace, *, log_dir: Path | None = None, state_db: Path | None = None,
+           out: Path | None = None, why: str = "", keep_out: bool = True) -> int:
+    """The replay of one recorded run: a run found from the arguments, or ``log_dir`` + ``state_db``
+    (an unpacked bundle; ``keep_out=False``: its output directory is removed by the caller)."""
+    bundled = log_dir is not None
+    if log_dir is None:
+        log_dir, why = _log_dir(args)
     if log_dir is None:
         print(f"replay: nothing to replay: {why}", file=sys.stderr)
         return 2
@@ -98,12 +147,18 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError) as exc:
         print(f"replay: bad --set/--overlay: {exc}", file=sys.stderr)
         return 2
-    out = Path(args.out) if args.out else Path(tempfile.mkdtemp(prefix="wta-replay-"))
-    reports = args.reports_dir or None
-    print(f"replay: {log_dir} ({why})")
+    if out is None:
+        out = Path(args.out) if args.out else Path(tempfile.mkdtemp(prefix="wta-replay-"))
+    if args.reports_dir is None:
+        reports = None if bundled else "docs/REPORTS"
+    else:
+        reports = args.reports_dir or None
+    shown = f"{log_dir.name} (unpacked, {why})" if bundled else f"{log_dir} ({why})"
+    print(f"replay: {shown}")
     try:
-        result = run_replay(cfg, log_dir=log_dir, state_db=args.state_db, out_dir=out, reports_dir=reports,
-                            strict=not args.lenient, segment=args.segment, allow_partial=args.allow_partial)
+        result = run_replay(cfg, log_dir=log_dir, state_db=state_db or args.state_db, out_dir=out,
+                            reports_dir=reports, strict=not args.lenient, segment=args.segment,
+                            allow_partial=args.allow_partial)
     except ReplayInputError as exc:
         print(f"replay: cannot replay {log_dir}: {exc}", file=sys.stderr)
         return 2
@@ -152,7 +207,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"end:      {sum(1 for x in rows if x['equal'])}/{len(rows)} final-heartbeat values equal "
               "(equity, fees, plan freshness, S1 tick counters; informational)")
     print(f"result:   {result.summary} -> {'PASS' if result.ok else 'FAIL'}")
-    print(f"report:   {result.report_file or out / 'replay_report.md'}  (replay output: {out})")
+    if keep_out:
+        print(f"report:   {result.report_file or out / 'replay_report.md'}  (replay output: {out})")
+    else:
+        print(f"report:   {result.report_file or 'not written (--bundle without --reports-dir)'}  "
+              "(replay output removed with the temporary directory; --out DIR keeps it)")
     return code
 
 

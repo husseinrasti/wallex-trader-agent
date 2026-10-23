@@ -1,0 +1,1 @@
+{"content":"{\"atr14_pct\":null,\"bars\":3,\"ema20\":null,\"ema60\":null,\"ema_gap_pct\":null,\"high\":\"106.48\",\"last_close\":\"106.10\",\"low\":\"104.93\",\"resolution\":\"15\",\"ret_1_bar\":\"0.005210800568450971103742302\",\"ret_4_bars\":null,\"ret_all\":\"0.009130682898991820429902986\",\"symbol\":\"SOLUSDT\",\"volume_ratio_last\":null}","tool":"get_candle_stats"}

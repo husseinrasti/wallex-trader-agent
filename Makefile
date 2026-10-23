@@ -9,8 +9,9 @@ AI     ?= off
 REPORT_SOURCE ?= logs/shadow
 REPORT_OUT    ?= docs/REPORTS/shadow_report
 REPLAY_ARGS   ?= --decisions logs/decisions.jsonl
+DELIVER_RUN   ?= logs/shadow_synth_4h
 
-.PHONY: install test lint record survey shadow shadow-synth live backtest backtest-books backtest-synth replay report export flatten flatten-live status tui ps docker
+.PHONY: install test lint record survey shadow shadow-synth live backtest backtest-books backtest-synth replay replay-deliverable deliverables report export flatten flatten-live status tui ps docker
 
 install:
 	$(PYTHON) -m venv $(VENV) && $(VENV)/bin/pip install -U pip && $(VENV)/bin/pip install -e ".[dev]"
@@ -47,6 +48,12 @@ backtest-synth:     # SYNTHETIC data (never evidence of performance): exercises 
 
 replay:             # judges' one-liner: re-run the recorded run, compare every decision (exit 1 on mismatch)
 	$(PY) scripts/replay_check.py $(REPLAY_ARGS)
+
+replay-deliverable: # the same replay from the committed bundle (no logs/ or data/ needed): SHA256SUMS checked, unpacked to a temp dir, replayed, removed
+	$(PY) scripts/replay_check.py --bundle deliverables/replay/shadow_synth_4h
+
+deliverables:       # copy a recorded run into deliverables/<name>/ + its replay bundle, secrets-scanned (needs logs/ and data/)
+	$(PY) scripts/make_deliverables.py --run-dir $(DELIVER_RUN) --bundle --replay
 
 report:             # shadow/live run report from its logs + state DB (add --compare logs for paper-vs-live)
 	$(PY) -m wta report --source $(REPORT_SOURCE) --out $(REPORT_OUT)

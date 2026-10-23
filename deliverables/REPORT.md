@@ -2,6 +2,35 @@
 
 Assembled by `backtest/report.py` (`assemble_final_report`) from `../docs/REPORTS`; edit the source reports, not this file. Order: survey → backtests (candles, order books, AI ablation, walk-forward) → shadow → live → replay proof.
 
+<!-- deliverables-index:start -->
+## Deliverables index
+
+Every folder and file under `deliverables/`, one line each (written by `scripts/make_deliverables.py`; rerun `python scripts/make_deliverables.py --index-only` after `backtest/report.py` rewrites this file). No live trading has happened yet, so there is no live decision log here. The decision trail below comes from runs on the SYNTHETIC feed (generated market data, not evidence of performance).
+
+| path | what it is |
+| --- | --- |
+| [`REPORT.md`](REPORT.md) | this report: survey, backtests, AI ablation, walk-forward, shadow run, live run (none yet), replay proof |
+| [`VIDEO.md`](VIDEO.md) | link to the demo video (PRD-06 §5) |
+| [`TAGS.md`](TAGS.md) | git tags with their commits and time ranges: the engineering phases, `live-*` per live start, `final` |
+| [`shadow_synth_4h/`](shadow_synth_4h/README.md) | Shadow run `shadow_synth_4h` — SYNTHETIC feed, real LLM |
+| [`shadow_synth_4h/README.md`](shadow_synth_4h/README.md) | what the run is, commit, config hash, window, how to replay |
+| [`shadow_synth_4h/decisions-20261022.jsonl`](shadow_synth_4h/decisions-20261022.jsonl) | decision records of 2026-10-22 (UTC): 18 lines (2 order, 2 outcome, 14 plan) |
+| [`shadow_synth_4h/decisions-20261023.jsonl`](shadow_synth_4h/decisions-20261023.jsonl) | decision records of 2026-10-23 (UTC): 24 lines (24 plan) |
+| [`shadow_synth_4h/orders-20261022.jsonl`](shadow_synth_4h/orders-20261022.jsonl) | order log of 2026-10-22 (UTC): 14 lines (2 cancel, 2 fill, 4 place, 4 response, 2 status) |
+| [`shadow_synth_4h/events-20261022.jsonl`](shadow_synth_4h/events-20261022.jsonl) | engine events of 2026-10-22 (UTC): 1 start |
+| [`shadow_synth_4h/events-20261023.jsonl`](shadow_synth_4h/events-20261023.jsonl) | engine events of 2026-10-23 (UTC): 2 ai_degraded, 1 ai_recovered, 1 day_start, 1 plan_stale, 1 stop |
+| [`shadow_synth_4h/health.jsonl`](shadow_synth_4h/health.jsonl) | 6 heartbeats: the first of each UTC hour + the first and the last (all heartbeats are in the replay bundle) |
+| [`shadow_synth_4h/journal.md`](shadow_synth_4h/journal.md) | Post-trade Reviewer journal: 4 hourly reviews |
+| [`shadow_synth_4h/llm_cache/`](shadow_synth_4h/llm_cache/) | 86 cached LLM answers + 135 MCP/tool tape entries (`mcp_tape/`); the replay reads every plan from here |
+| [`replay/`](replay/) | replay bundles: a recorded run + its state DB, checksummed, for `make replay-deliverable` without `logs/` or `data/` |
+| [`replay/shadow_synth_4h/`](replay/shadow_synth_4h/README.md) | Replay bundle `shadow_synth_4h` — SYNTHETIC feed, real LLM |
+| [`replay/shadow_synth_4h/README.md`](replay/shadow_synth_4h/README.md) | what the bundle holds, the checksums, how to replay by hand, and the replay output (PASS/FAIL) |
+| [`replay/shadow_synth_4h/SHA256SUMS`](replay/shadow_synth_4h/SHA256SUMS) | sha256 of the two data files; `replay_check.py --bundle` refuses a bundle that does not match |
+| [`replay/shadow_synth_4h/logs.tar.xz`](replay/shadow_synth_4h/logs.tar.xz) | the whole recorded log directory (decisions, orders, events, all heartbeats, journal, LLM cache, run.out), tar + xz |
+| [`replay/shadow_synth_4h/state.sqlite.xz`](replay/shadow_synth_4h/state.sqlite.xz) | the run's state DB (ticks, books, candles, balances, fills the replay feeds back), SQLite online backup + VACUUM, xz -9 |
+
+<!-- deliverables-index:end -->
+
 > **Some sections below are built on SYNTHETIC DATA — not evidence of performance.** They are marked in the table and carry their own banner.
 
 | # | section | status | source |

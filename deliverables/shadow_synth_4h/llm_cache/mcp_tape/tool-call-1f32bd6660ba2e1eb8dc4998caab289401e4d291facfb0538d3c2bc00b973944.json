@@ -1,0 +1,1 @@
+{"content":"{\"atr14_pct\":null,\"bars\":3,\"ema20\":null,\"ema60\":null,\"ema_gap_pct\":null,\"high\":\"266939\",\"last_close\":\"266277\",\"low\":\"266152\",\"resolution\":\"15\",\"ret_1_bar\":\"-0.0008255252404342262764684030\",\"ret_4_bars\":null,\"ret_all\":\"-0.0017619692067764585918492054\",\"symbol\":\"USDTTMN\",\"volume_ratio_last\":null}","tool":"get_candle_stats"}

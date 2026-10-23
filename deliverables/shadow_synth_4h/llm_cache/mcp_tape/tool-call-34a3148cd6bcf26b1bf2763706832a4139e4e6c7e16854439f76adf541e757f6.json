@@ -1,0 +1,1 @@
+{"content":"{\"atr14_pct\":null,\"bars\":4,\"ema20\":null,\"ema60\":null,\"ema_gap_pct\":null,\"high\":\"2453.43\",\"last_close\":\"2430.88\",\"low\":\"2424.43\",\"resolution\":\"15\",\"ret_1_bar\":\"0.001454260819412116093682411\",\"ret_4_bars\":null,\"ret_all\":\"-0.0074273091418375138317810434\",\"symbol\":\"ETHUSDT\",\"volume_ratio_last\":null}","tool":"get_candle_stats"}
