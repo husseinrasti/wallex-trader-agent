@@ -229,13 +229,16 @@ function renderPositions(p) {
   $("positions").innerHTML = html;
 }
 
+let decisionsHtml = "";
 function renderDecisions(rows) {
-  if (!rows.length) { $("decisions").innerHTML = `<div class="empty">no trade decisions logged yet</div>`; return; }
-  $("decisions").innerHTML = `<table><tr><th>Time</th><th>Kind</th><th>Strat</th><th>Symbol</th><th>Side</th><th class="r">Qty</th><th>Risk</th><th>Reason</th><th>Outcome</th></tr>` +
+  if (!rows.length) { $("decisions").innerHTML = `<div class="empty">no trade decisions logged yet</div>`; decisionsHtml = ""; return; }
+  const html = `<table><tr><th>Time</th><th>Kind</th><th>Strat</th><th>Symbol</th><th>Side</th><th class="r">Qty</th><th>Risk</th><th>Reason</th><th>Outcome</th></tr>` +
     rows.map((d) => {
       const risk = d.risk.approved === true ? `<span class="good">✓ ${d.risk.n_checks} checks</span>` : d.risk.approved === false ? `<span class="bad">✗ ${esc(d.risk.failed.join(",") || "veto")}</span>` : `<span class="dim">—</span>`;
       return `<tr class="click" data-id="${esc(d.id)}"><td class="dim">${esc(d.time)}</td><td>${esc(d.kind)}</td><td><b>${esc(d.strategy)}</b></td><td>${esc(d.symbol)}</td><td class="${d.side === "BUY" ? "good" : d.side === "SELL" ? "bad" : ""}">${esc(d.side)}</td><td class="r">${esc(d.qty)}</td><td>${risk}</td><td class="reason" title="${esc(d.reason)}">${esc(d.reason)}</td><td class="${cls(d.outcome.level)}">${esc(d.outcome.text)}</td></tr>`;
     }).join("") + `</table>`;
+  if (html === decisionsHtml) return;  // unchanged: keep the rows, so a click in flight is not lost
+  $("decisions").innerHTML = decisionsHtml = html;
   document.querySelectorAll("tr.click").forEach((tr) => tr.onclick = () => openDecision(tr.dataset.id));
 }
 
@@ -275,13 +278,15 @@ function renderChart(points) {
 }
 
 // ---------------------------------------------------------------- Kill / Reset-kill (live starts only from the terminal)
-let killPendingUntil = 0;
+let killPendingUntil = 0, controlsHtml = "";
 function renderControls(c, h) {
-  if (!c || !c.enabled) { $("controls").innerHTML = badge("read-only", ""); return; }
-  if (!c.db_found) { $("controls").innerHTML = `<button class="ctl kill" disabled title="no engine state database yet">KILL</button>`; return; }
-  if (h.killed) { killPendingUntil = 0; $("controls").innerHTML = `<button class="ctl reset" onclick="openControl('reset')">RESET KILL</button>`; }
-  else if (Date.now() < killPendingUntil) $("controls").innerHTML = `<button class="ctl kill" disabled>KILL REQUESTED…</button>`;
-  else $("controls").innerHTML = `<button class="ctl kill" onclick="openControl('kill')" title="kill-switch: cancel entries, flatten to TMN">KILL</button>`;
+  let html;
+  if (!c || !c.enabled) html = badge("read-only", "");
+  else if (!c.db_found) html = `<button class="ctl kill" disabled title="no engine state database yet">KILL</button>`;
+  else if (h.killed) { killPendingUntil = 0; html = `<button class="ctl reset" onclick="openControl('reset')">RESET KILL</button>`; }
+  else if (Date.now() < killPendingUntil) html = `<button class="ctl kill" disabled>KILL REQUESTED…</button>`;
+  else html = `<button class="ctl kill" onclick="openControl('kill')" title="kill-switch: cancel entries, flatten to TMN">KILL</button>`;
+  if (html !== controlsHtml) { $("controls").innerHTML = html; controlsHtml = html; }  // a rebuilt button would eat a click
 }
 function openControl(kind) {
   const h = lastSnap.header, c = lastSnap.controls, live = h.mode === "live";
