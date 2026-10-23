@@ -17,7 +17,7 @@ the repo root. `python` means the venv's interpreter: run `source .venv/bin/acti
 
 | Claim | Command | Needs | Time | Expected |
 |---|---|---|---|---|
-| Code and tests are sound | `make test` | install only | ~2 min | `All checks passed!` (ruff), then pytest dots, exit 0 (1,913 passed, 1 skipped) |
+| Code and tests are sound | `make test` | install only | ~2 min | `All checks passed!` (ruff), then pytest dots and `1939 passed, 1 skipped`, exit 0 |
 | The 4-h shadow run is reproducible | `make replay-deliverable` | nothing | ~2–3 min | `result:   40/40 decisions reproduced -> PASS`, exit 0 (§3.1) |
 | Backtest path, offline | `make backtest-synth` | nothing | ~30 s | `return -0.236%  max drawdown +0.770%  trades 2  orders 19  vetoes 18  fees 16,063 TMN` (§4.1) |
 | Engine, risk, AI plumbing, offline | `make shadow-synth` | nothing | until Ctrl-C | heartbeats with `fresh_books=21/21`, an S2 order, `logs check` OK (§5.1) |
@@ -45,7 +45,7 @@ the repo root. `python` means the venv's interpreter: run `source .venv/bin/acti
   one-off commands with `--no-deps`, or compose also starts the recorder, which `agent` depends on:
 
   ```bash
-  docker compose run --rm --no-deps agent python -m pytest -q          # ~100 s, exit 0
+  docker compose run --rm --no-deps agent python -m pytest             # ~100 s, exit 0
   docker compose run --rm --no-deps agent python -m wta config hash
   ```
   Only `./data`, `./logs` and `./configs/runtime` are mounted, so give `--out logs/...` to anything

@@ -10,7 +10,7 @@
 1. یک عامل معامله‌گر خودکار و قابل‌توضیح برای بازار اسپات صرافی والکس، ساخته‌شده برای «چالش معاملات الگوریتمی والکس» استارکوچ. در یک جمله: **هوش مصنوعی برنامه می‌ریزد، قواعد معامله می‌کنند، مدیریت ریسک نگهبانی می‌دهد.**
 2. یک مسیر کد برای چهار حالت: `backtest`، `shadow` (معاملهٔ کاغذی روی دفتر سفارش زنده)، `live` و `replay`. فقط شیء صرافی، منبع داده و ساعت عوض می‌شوند.
 3. هر تصمیم یک خط JSON است. این خط سیگنال، برنامهٔ هوش مصنوعیِ جاری، نتیجهٔ هر ۲۳ کنترل ریسک، سفارش و نتیجهٔ آن را دارد، به‌همراه `git_commit` و `config_hash`.
-4. آنچه به‌صورت آفلاین اثبات شده: ۱٬۹۱۳ تست سبز است. یک اجرای shadow چهارساعته با LLM واقعی (روی دادهٔ مصنوعی) هر ۴۰ تصمیمش را بدون هیچ تماس شبکه‌ای دوباره تولید می‌کند (`make replay-deliverable`).
+4. آنچه به‌صورت آفلاین اثبات شده: ۱٬۹۳۹ تست سبز است. یک اجرای shadow چهارساعته با LLM واقعی (روی دادهٔ مصنوعی) هر ۴۰ تصمیمش را بدون هیچ تماس شبکه‌ای دوباره تولید می‌کند (`make replay-deliverable`).
 5. آنچه هنوز اثبات نشده: سودآوری، و رفتار روی دادهٔ واقعی والکس. `api.wallex.ir` از ماشین توسعه فقط گاهی در دسترس است، پس فقط حدود ۲۰ دقیقه دفتر سفارش واقعی ضبط شده است. هیچ معاملهٔ واقعی (live) انجام نشده است.
 
 ## ایده
@@ -26,7 +26,7 @@
 ## وضعیت (۲۰۲۶-۱۰-۲۳، تگ `v0.5-backtest`)
 
 * **اثبات‌شده:**
-  * ۱٬۹۱۳ تست سبز است و CI (ruff، pytest روی پایتون 3.11، ساخت Docker) هم سبز است.
+  * ۱٬۹۳۹ تست سبز است و CI (ruff، pytest روی پایتون 3.11، ساخت Docker) هم سبز است.
   * همان `Engine` در حالت‌های backtest، shadow و replay اجرا می‌شود و قواعد ریسک طبق مشخصات عمل می‌کنند.
   * در یک اجرای shadow ‏۴٫۰۸ ساعته روی **دادهٔ مصنوعی**، ‏۳۸ برنامه از `openai/gpt-5.4-mini` (از طریق OpenRouter) گرفته شد. وقتی ارائه‌دهنده از دسترس خارج شد، موتور طبق طراحی فقط با قواعد ادامه داد.
   * replay همان اجرا: ۴۰ از ۴۰ تصمیم یکسان بود، با ۰ تلاش اتصال و ۰ فراخوانی LLM.
@@ -84,7 +84,7 @@ python -m wta tui    --log-dir logs/shadow_synth --set data.sqlite_path=data/sha
 ```bash
 cp .env.example .env
 docker compose build
-docker compose run --rm --no-deps agent python -m pytest -q
+docker compose run --rm --no-deps agent python -m pytest
 docker compose run --rm --no-deps agent python scripts/replay_check.py --bundle deliverables/replay/shadow_synth_4h
 docker compose up -d recorder agent      # recorder + shadow agent on the real feed
 docker compose down

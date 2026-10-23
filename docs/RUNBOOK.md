@@ -50,7 +50,7 @@ failed, 2 cannot run (bad arguments, a guard, the account lock), 130 interrupted
 | Target | Runs |
 |---|---|
 | `make install` | venv + `pip install -e ".[dev]"` |
-| `make test` | `ruff check src tests backtest scripts`, then `pytest -q` |
+| `make test` | `ruff check src tests backtest scripts`, then `pytest` (quiet through `addopts` in `pyproject.toml`) |
 | `make record` | `wta record --symbols-from configs/markets.yaml` (foreground) |
 | `make shadow` | `wta run --mode shadow --log-dir logs/shadow` (real feed, paper account `shadow`) |
 | `make shadow-synth` | `wta run --mode shadow --feed synthetic --log-dir logs/shadow_synth --set data.sqlite_path=data/shadow_synth.sqlite` (state DB `data/shadow_synth.state_shadow_synthetic.sqlite`); never evidence |

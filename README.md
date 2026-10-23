@@ -6,7 +6,7 @@
 1. An autonomous, explainable spot-trading agent for the Wallex exchange, built for the Starcoach "Wallex Algorithmic Trading Challenge". In one line: **AI plans, rules trade, risk guards.**
 2. One code path for four modes: `backtest`, `shadow` (paper trading on live books), `live` and `replay`. Only the exchange object, the data source and the clock change.
 3. Every decision is one JSON line holding the signal, the AI plan in force, all 23 risk checks, the order and its outcome, plus `git_commit` and `config_hash`.
-4. Proven offline: 1,913 tests pass. A 4-hour shadow run with a real LLM, on the synthetic feed, replays 40 of 40 decisions with zero network calls (`make replay-deliverable`).
+4. Proven offline: 1,939 tests pass. A 4-hour shadow run with a real LLM, on the synthetic feed, replays 40 of 40 decisions with zero network calls (`make replay-deliverable`).
 5. Not proven yet: profitability, and behaviour on real Wallex data. `api.wallex.ir` answers the development machine only now and then, so only about 20 minutes of real order books exist. No live trading has happened.
 
 [فارسی (Persian summary and quick start)](README.fa.md)
@@ -43,7 +43,7 @@ request, so `replay` re-runs a recorded session without any network access.
 
 > | | What | Evidence |
 > |---|---|---|
-> | **Proven** | 1,913 tests pass (1 skipped); CI runs ruff, pytest on Python 3.11 and a Docker build | badge above, `make test` |
+> | **Proven** | 1,939 tests pass on `main` (1,913 at `v0.5-backtest`), 1 skipped; CI runs ruff, pytest on Python 3.11 and a Docker build | badge above, `make test` |
 > | **Proven** | The same `Engine` runs backtest, shadow and replay; risk rules fire as specified (kill-switch at −5 % drawdown, then flatten; fee budget; rate caps) | [phase2_acceptance](docs/REPORTS/phase2_acceptance.md), [REPORT.md](deliverables/REPORT.md) |
 > | **Proven** | A real LLM is in the loop: a 4.08-h shadow run on the **synthetic feed** got 38 plans from `openai/gpt-5.4-mini` via OpenRouter. When the provider failed, the engine ran rules-only, as designed | [shadow report](docs/REPORTS/shadow_20261023_synth4h/report.md) |
 > | **Proven** | Replay of that run: 40/40 decisions identical (strict pass, time stamps included), 0 socket attempts, 0 LLM calls | [replay proof](docs/REPORTS/replay_20261023.md), `make replay-deliverable` |
@@ -68,7 +68,7 @@ cd wallex-trader-agent
 cp .env.example .env          # all keys are optional, see below
 make install                  # creates .venv (uses python3; pick another with: make install PYTHON=python3.12)
 source .venv/bin/activate     # so that `python` below is the venv's (make targets use .venv on their own)
-make test                     # ruff ("All checks passed!") + pytest (1,913 passed, 1 skipped), about 2 min, exit 0
+make test                     # ruff ("All checks passed!") + pytest (`1939 passed, 1 skipped`), about 2 min, exit 0
 ```
 
 **Keys.** Without any key everything below works. The AI layer then uses the offline rules provider
@@ -102,7 +102,7 @@ made in step 1. It rewrites `docs/REPORTS/replay_<day>.md` and the reports index
 ```bash
 cp .env.example .env                                  # compose reads it (env_file)
 docker compose build
-docker compose run --rm --no-deps agent python -m pytest -q
+docker compose run --rm --no-deps agent python -m pytest
 docker compose run --rm --no-deps agent python scripts/replay_check.py --bundle deliverables/replay/shadow_synth_4h
 docker compose run --rm --no-deps agent python -m wta backtest --driver books \
   --synthetic-db data/synthetic_books.sqlite --synthetic-hours 6 --strategies S1,S2 --out logs/bt_synth_books

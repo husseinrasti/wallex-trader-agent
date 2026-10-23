@@ -16,8 +16,8 @@ DELIVER_RUN   ?= logs/shadow_synth_4h
 install:
 	$(PYTHON) -m venv $(VENV) && $(VENV)/bin/pip install -U pip && $(VENV)/bin/pip install -e ".[dev]"
 
-test: lint
-	$(PY) -m pytest -q
+test: lint         # pyproject addopts already has -q; a second -q would hide the 'N passed' summary line
+	$(PY) -m pytest
 
 lint:
 	$(VENV)/bin/ruff check src tests backtest scripts
