@@ -387,10 +387,11 @@ def test_synthetic_banner_present_only_when_synthetic(tmp_path: Path, inputs: di
 def test_limitations_auto_filled_and_custom_first(tmp_path: Path, inputs: dict[str, Any]) -> None:
     books = _write(tmp_path / "books", inputs, limitations=["Recorder was down 10:40-10:55."]).read_text()
     lim = _section(books, "## Limitations")
-    assert "S1 backtest window limited to recorded 3.0 h of order books." in lim
+    # the inputs are synthetic: the S1 window is "generated", never called "recorded"
+    assert "S1 backtest window limited to generated (synthetic) 3.0 h of order books." in lim
     assert "synthetic" in lim.lower() and "not evidence" in lim
     assert "pessimistic fill model" in lim
-    assert "Sharpe and Sortino are computed from 3 h" in lim
+    assert "Sharpe and Sortino are computed from" in lim and "over 3.0 h of data" in lim
     assert "was still held outside TMN (unrealized)" in lim and "not flattened" in lim
     assert lim.index("Recorder was down") < lim.index("S1 backtest window")
     assert "offline rules provider" not in lim

@@ -293,6 +293,9 @@ KV_KILL_RESET = "kill_reset"  # the last manual kill reset (written by ``wta res
 KILL_FILE = ROOT / "KILL"  # create it to kill the running engine
 VETO_REPEAT_S = 60.0  # identical vetoes of the same intent are logged at most this often
 FEEDS = ("live", "synthetic")
+# feeds whose books are published by the process itself (heartbeat: freshness of that source, not REST);
+# "backtest" is the backtest runner (backtest/runner.py), which builds the Engine itself
+OFFLINE_FEEDS = ("synthetic", "backtest")
 SYNTHETIC_NOTE = "synthetic market data: an offline exercise of the engine, never evidence of performance"
 KV_STRATEGY = "strategy_state"  # StrategyRouter.state(): router + every strategy (replay / restart)
 KV_FEATURES = "feature_state"  # FeatureEngine.state(): the rolling cross-book deviation history
@@ -3046,9 +3049,9 @@ class Engine:
         rest_ok = self.bus.source_ok("rest", now, stale_s)
         rest_health = self.rest.health() if callable(getattr(self.rest, "health", None)) else {}
         reasons: list[str] = []
-        if self.feed == "synthetic":
-            if not self.bus.source_ok("synthetic", now, stale_s):
-                reasons.append("synthetic feed: no fresh data")
+        if self.feed in OFFLINE_FEEDS:  # fed by the synthetic feed or a backtest runner, never REST
+            if not self.bus.source_ok(self.feed, now, stale_s):
+                reasons.append(f"{self.feed} feed: no fresh data")
         elif not rest_ok:
             last_error = str(rest_health.get("last_error") or "")[:200]
             reasons.append("rest: no fresh data" + (f" (last error: {last_error})" if last_error else ""))

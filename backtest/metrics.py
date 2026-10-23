@@ -432,7 +432,12 @@ def trade_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
         "profit_factor": gross_profit / gross_loss if gross_loss > 0 else None,
         "avg_pnl_pct": _mean([t["pnl_pct"] for t in trades if t["pnl_pct"] is not None]),
         "avg_hold_s": _mean([t["hold_s"] for t in trades if t["hold_s"] is not None]),
-        "fees_tmn": sum((t["fees_tmn"] for t in trades if t["fees_tmn"] is not None), 0.0),
+        # None (shown as n/a) when no trade carries its fees: a 0 would read as "paid no fees"
+        "fees_tmn": (
+            sum((t["fees_tmn"] for t in trades if t["fees_tmn"] is not None), 0.0)
+            if any(t["fees_tmn"] is not None for t in trades)
+            else None
+        ),
     }
 
 

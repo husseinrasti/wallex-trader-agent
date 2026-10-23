@@ -128,4 +128,4 @@ def test_run_passes_the_overlay_options(settings: Any, monkeypatch: pytest.Monke
 
 def test_placeholders_are_gone_for_the_new_commands() -> None:
     assert {"status", "tui"}.isdisjoint(cli.PLACEHOLDERS)
-    assert {"replay", "backtest"} <= set(cli.PLACEHOLDERS)
+    assert {"replay", "backtest"}.isdisjoint(cli.PLACEHOLDERS)  # real commands since PRD-05

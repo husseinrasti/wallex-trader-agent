@@ -35,7 +35,14 @@ Commands::
                               alerts.telegram_enabled)
     logs check                validate logs/*.jsonl against their schemas
     db vacuum                 compact the SQLite database
-    backtest, replay, report, export     later PRDs (exit 3)
+    backtest                  PRD-05 §3: the engine over stored data (backtest/runner.py)
+        --driver candles|books --from ISO --to ISO --ai off|on|offline --strategies S2,S3 --out DIR
+        [--db PATH] [--param-grid KEY=V1,V2 (walk-forward 70/30, backtest/walkforward.py)]
+        [--ai-max-calls N] [--synthetic-db PATH --synthetic-hours H (SYNTHETIC data, never evidence)]
+    report --source LOGDIR [--state-db PATH] --out DIR [--compare LOGDIR]   a shadow/live run's
+                              report (metrics, PNGs; paper-vs-live divergence with --compare)
+    export --parquet DIR [--db PATH]   books, candles, trades to Parquet (CSV without pyarrow)
+    replay [--log-dir DIR] [--state-db PATH]   wta.replay.runner.run_replay: N/N decisions reproduced
 
 Options such as ``--set key=value`` go after the command: ``wta run --mode shadow --set a.b=1``.
 
@@ -103,13 +110,9 @@ from wta.utils.timeutil import SystemClock, iso
 
 EXIT_OK, EXIT_FAILED, EXIT_CANNOT_RUN, EXIT_NOT_IMPLEMENTED = 0, 1, 2, 3
 
-# command -> (PRD that delivers it, help text)
-PLACEHOLDERS: dict[str, tuple[str, str]] = {
-    "backtest": ("PRD-05", "backtest over recorded/historical data"),
-    "replay": ("PRD-05", "re-run recorded inputs and cached LLM answers"),
-    "report": ("PRD-05", "backtest and shadow reports"),
-    "export": ("PRD-06", "copy logs and reports into deliverables/"),
-}
+# command -> (PRD that delivers it, help text): commands announced but not built yet (exit 3).
+# Empty since PRD-05: backtest, report, export and replay are real commands now.
+PLACEHOLDERS: dict[str, tuple[str, str]] = {}
 
 Handler = Callable[[argparse.Namespace, Config, Settings], int]
 
@@ -800,6 +803,199 @@ def cmd_db_vacuum(args: argparse.Namespace, cfg: Config, settings: Settings) -> 
     return EXIT_OK
 
 
+# ---------------------------------------------------------------- PRD-05: backtest / report / export / replay
+
+SYNTHETIC_DEFAULT_HOURS = {"books": 6.0, "candles": 72.0}  # --synthetic-db without --synthetic-hours
+SYNTHETIC_STEP_S = {"books": 2.0, "candles": 10.0}
+
+
+def _pct_text(value: float | None, places: int = 3) -> str:
+    return "n/a" if value is None else f"{value * 100:+.{places}f}%"
+
+
+def _default_bt_out(driver: str, from_ts: float, to_ts: float) -> str:
+    return f"docs/REPORTS/bt_{driver}_{iso(from_ts)[:10].replace('-', '')}_{iso(to_ts)[:10].replace('-', '')}"
+
+
+def _print_backtest(res: Any) -> None:
+    m, meta = res.metrics, res.meta
+    if meta.get("synthetic"):
+        print("SYNTHETIC — not evidence of performance (generated market data)")
+    if m.insufficient_data:
+        print("INSUFFICIENT DATA: fewer than two equity points in the window (see Limitations in the report)")
+    print(
+        f"backtest {meta.get('driver')} {','.join(meta.get('strategies') or [])} ai={meta.get('ai')}"
+        f" ({meta.get('ai_source')}): {meta.get('window_from')} -> {meta.get('window_to')},"
+        f" data {meta.get('coverage_hours')} h, {meta.get('ticks')} ticks"
+    )
+    print(
+        f"  return {_pct_text(m.return_pct)}  max drawdown {_pct_text(m.max_drawdown_pct)}  trades {m.n_trades}"
+        f"  orders {m.n_orders}  vetoes {m.n_vetoes}  fees {m.fees_paid_tmn:,.0f} TMN"
+    )
+    if meta.get("ai") != "off":
+        print(f"  analyst cycles {meta.get('analyst_cycles')} (cap {meta.get('ai_max_calls')}), plans"
+              f" {meta.get('analyst_plans')}, model calls {meta.get('model_calls')} ({meta.get('cached_calls')} cached)")
+    report = res.paths.get("report")
+    if report is not None:
+        print(f"  report: {report}")
+
+
+def cmd_backtest(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
+    """``wta backtest`` (PRD-05 §3.3): ``backtest.runner.run_backtest``, or the walk-forward of
+    ``backtest.walkforward`` with ``--param-grid``. ``--synthetic-db`` generates (or reuses) an
+    explicitly synthetic market DB first and runs on it (every report says SYNTHETIC)."""
+    from backtest import runner as bt  # lazy: pandas/matplotlib are heavy for the other commands
+
+    driver = args.driver
+    db = args.db
+    try:
+        a = bt.parse_ts(args.from_ts, "--from") if args.from_ts else None
+        b = bt.parse_ts(args.to_ts, "--to") if args.to_ts else None
+        if args.synthetic_db:
+            hours = args.synthetic_hours or SYNTHETIC_DEFAULT_HOURS[driver]
+            seed = args.seed if args.seed is not None else cfg.engine.rng_seed
+            info = bt.make_synthetic_market_db(
+                args.synthetic_db, hours, seed, step_s=SYNTHETIC_STEP_S[driver], with_books=driver == "books",
+            )
+            print(f"synthetic market DB {info['path']} ({'reused' if info.get('reused') else 'generated'}): "
+                  f"{info['from']} -> {info['to']}, {info.get('books', 0)} books, {info.get('candles', 0)} candles "
+                  "(SYNTHETIC — not evidence of performance)")
+            db = info["path"]
+            a = info["from_ts"] if a is None else a
+            b = info["to_ts"] if b is None else b
+        elif args.synthetic_hours is not None:
+            raise ValueError("--synthetic-hours needs --synthetic-db PATH")
+        if a is None or b is None:
+            raise ValueError("--from and --to are required (or --synthetic-db PATH)")
+        balances = parse_paper_balances(args.balances) if args.balances else None
+        common: dict[str, Any] = {
+            "driver": driver,
+            "from_ts": a,
+            "to_ts": b,
+            "strategies": args.strategies,
+            "ai": args.ai,
+            "ai_max_calls": args.ai_max_calls,
+            "market_db": db,
+            "seed": args.seed,
+            "step_s": args.step_s,
+            "initial_equity_tmn": args.initial_equity,
+            "initial_balances": balances,
+            "flatten_at_end": args.flatten_at_end,
+            "settings": settings,
+            "title": args.title,
+        }
+        if args.state_db:
+            common["state_db"] = args.state_db
+        if args.verbose:
+            common["quiet"] = False
+        out = args.out or _default_bt_out(driver, a, b)
+        if args.param_grid:
+            from backtest import walkforward as wf
+
+            grid = wf.parse_param_grid(args.param_grid, cfg)
+            result = wf.run_walkforward(cfg, grid=grid, out_dir=out, **common)
+            print(f"walk-forward: chosen {wf.label(result.chosen.params)}; {result.reason}; final "
+                  f"{wf.label(result.final_params)} ({result.paths.get('markdown')})")
+            res = result.final
+        else:
+            res = bt.run_backtest(cfg, out_dir=out, **common)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        _err(_one_line(exc))
+        return EXIT_CANNOT_RUN
+    except EngineLockError as exc:
+        _err(f"{exc} (another backtest writes into the same --out)")
+        return EXIT_CANNOT_RUN
+    if res is not None:
+        _print_backtest(res)
+    return EXIT_OK
+
+
+def cmd_report(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
+    """``wta report --source LOGDIR --out DIR`` (PRD-05 §5, §7): metrics + report of a shadow/live
+    run from its logs and state DB; ``--compare OTHER_LOGDIR`` adds the paper-vs-live divergence."""
+    from backtest import runner as bt
+    from backtest.report import update_index
+
+    source = Path(args.source)
+    out = Path(args.out) if args.out else Path("docs/REPORTS") / f"report_{source.name or 'logs'}"
+    try:
+        a = bt.parse_ts(args.from_ts, "--from") if args.from_ts else None
+        b = bt.parse_ts(args.to_ts, "--to") if args.to_ts else None
+        res = bt.report_from_logs(
+            source=source, out_dir=out, state_db=args.state_db, compare=args.compare,
+            compare_state_db=args.compare_state_db, title=args.title, from_ts=a, to_ts=b,
+        )
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        _err(_one_line(exc))
+        return EXIT_FAILED if "no log records" in str(exc) else EXIT_CANNOT_RUN
+    m, meta = res.metrics, res.meta
+    if meta.get("synthetic"):
+        print("SYNTHETIC — not evidence of performance (the run used the synthetic feed)")
+    print(f"report {meta.get('mode')} {meta.get('window_from')} -> {meta.get('window_to')}: return "
+          f"{_pct_text(m.return_pct)}, max drawdown {_pct_text(m.max_drawdown_pct)}, trades {m.n_trades}, "
+          f"orders {m.n_orders} (equity from {meta.get('equity_source')})")
+    if res.divergence is not None:
+        d = res.divergence
+        print(f"divergence: {d['matched']} matched, {d['only_a']} only in {args.source}, {d['only_b']} only in "
+              f"{args.compare}")
+    print(f"  report: {res.report}")
+    if args.update_index:
+        print(f"  index: {update_index(out.parent)}")
+    return EXIT_OK
+
+
+def cmd_export(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
+    """``wta export --parquet DIR [--db PATH]``: books, candles and trades of the market DB as
+    Parquet (CSV with a note when pyarrow is not installed)."""
+    from backtest import runner as bt
+
+    db = Path(args.db or cfg.data.sqlite_path)
+    try:
+        manifest = bt.export_tables(db, args.parquet)
+    except (FileNotFoundError, OSError, sqlite3.Error, ValueError) as exc:
+        _err(_one_line(exc))
+        return EXIT_FAILED
+    if manifest.get("note"):
+        print(f"note: {manifest['note']}")
+    for table, info in sorted(manifest["tables"].items()):
+        print(f"  {table}: {info['rows']} rows -> {info.get('file') or info.get('note')}")
+    print(f"exported {db} to {args.parquet} ({manifest['format']})")
+    return EXIT_OK
+
+
+def cmd_replay(args: argparse.Namespace, cfg: Config, settings: Settings) -> int:
+    """``wta replay`` (PRD-05 §6): ``wta.replay.runner.run_replay`` over a run's logs + state DB;
+    exit 0 when every decision is reproduced, 1 on a mismatch."""
+    import inspect
+
+    try:
+        from wta.replay.runner import run_replay
+    except ImportError as exc:
+        print(f"wta replay: the replay runner (wta.replay.runner) is not available: {_one_line(exc)}")
+        return EXIT_NOT_IMPLEMENTED
+    log_dir = Path(args.log_dir)
+    if not log_dir.is_dir():
+        _err(f"no log directory {log_dir}")
+        return EXIT_CANNOT_RUN
+    # without --state-db the replay runner takes the one its start event names
+    state_db = Path(args.state_db) if args.state_db else None
+    try:
+        result = run_replay(
+            cfg, log_dir=log_dir, state_db=state_db, out_dir=Path(args.out) if args.out else None,
+            reports_dir=args.reports_dir or None, strict=not args.no_strict,
+        )
+        if inspect.isawaitable(result):
+            result = asyncio.run(result)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        _err(_one_line(exc))
+        return EXIT_CANNOT_RUN
+    summary = getattr(result, "summary", None)
+    summary = summary() if callable(summary) else summary
+    ok = bool(getattr(result, "ok", False))
+    print(f"replay: {summary or result} ({'PASS' if ok else 'FAIL'})")
+    return EXIT_OK if ok else EXIT_FAILED
+
+
 def _placeholder(name: str) -> Handler:
     prd = PLACEHOLDERS[name][0]
 
@@ -996,6 +1192,63 @@ def build_parser() -> argparse.ArgumentParser:
     vacuum = db_sub.add_parser("vacuum", parents=[common], help="compact the SQLite database", allow_abbrev=False)
     vacuum.add_argument("--path", default=None, help="database file (default data.sqlite_path)")
     vacuum.set_defaults(handler=cmd_db_vacuum)
+
+    p = add("backtest", cmd_backtest, "backtest the engine over stored books or candles (PRD-05 §3)")
+    p.add_argument("--driver", choices=("candles", "books"), default="candles",
+                   help="candles: 1-minute bars, S2/S3 (default); books: recorded order books, S1/S2")
+    p.add_argument("--from", dest="from_ts", default=None, metavar="ISO", help="window start, e.g. 2026-09-22")
+    p.add_argument("--to", dest="to_ts", default=None, metavar="ISO", help="window end, e.g. 2026-10-22T10:00Z")
+    p.add_argument("--ai", choices=("off", "on", "offline"), default="off",
+                   help="off: rules only (default); on: the configured LLM (cached, capped); offline: rules provider")
+    p.add_argument("--strategies", default=None, metavar="S2,S3",
+                   help="strategies to run (others disabled; default S2,S3 for candles, S1,S2 for books)")
+    p.add_argument("--out", default=None, metavar="DIR",
+                   help="output folder (default docs/REPORTS/bt_<driver>_<from>_<to>)")
+    p.add_argument("--db", default=None, metavar="PATH", help="market DB, read-only (default data.sqlite_path)")
+    p.add_argument("--param-grid", action="append", default=[], metavar="KEY=V1,V2",
+                   help="walk-forward grid (<= 2 keys, <= 8 values each; 70/30 split), repeatable")
+    p.add_argument("--ai-max-calls", type=int, default=150, metavar="N",
+                   help="at most N analyst cycles per run with --ai on/offline (default 150)")
+    p.add_argument("--synthetic-db", default=None, metavar="PATH",
+                   help="generate (or reuse) a SYNTHETIC market DB at PATH and run on it (never evidence)")
+    p.add_argument("--synthetic-hours", type=float, default=None, metavar="H",
+                   help="hours of synthetic data (default 6 for books, 72 for candles)")
+    p.add_argument("--seed", type=int, default=None, help="engine.rng_seed (and the synthetic generator's seed)")
+    p.add_argument("--step-s", type=float, default=None, help="books driver tick grid (default engine.fast_loop_interval_s)")
+    p.add_argument("--initial-equity", default=None, metavar="TMN", help="starting equity in TMN (default engine.initial_equity_tmn)")
+    p.add_argument("--balances", default=None, metavar="JSON", help='starting balances, e.g. \'{"TMN": 2500000, "USDT": 9.4}\'')
+    p.add_argument("--flatten-at-end", action=argparse.BooleanOptionalAction, default=None,
+                   help="run the deadline flatten in the window's last 2 h (default: on for windows >= 8 h)")
+    p.add_argument("--title", default=None, help="report title")
+    p.add_argument("--state-db", default=None, metavar="PATH",
+                   help="engine state DB of the run (default <out>/state.sqlite; ~4 MB per simulated day)")
+    p.add_argument("--verbose", action="store_true", help="engine log lines during the run (default: errors only)")
+
+    p = add("report", cmd_report, "report of a shadow/live run from its logs (+ state DB) (PRD-05 §5, §7)")
+    p.add_argument("--source", default="logs/shadow", metavar="LOGDIR", help="the run's log directory (default logs/shadow)")
+    p.add_argument("--state-db", default=None, metavar="PATH",
+                   help="the run's state DB for the equity curve (default: the start event's; else heartbeats)")
+    p.add_argument("--out", default=None, metavar="DIR", help="output folder (default docs/REPORTS/report_<logdir>)")
+    p.add_argument("--compare", default=None, metavar="LOGDIR",
+                   help="another run's log dir (e.g. live next to shadow): adds the paper-vs-live divergence")
+    p.add_argument("--compare-state-db", default=None, metavar="PATH", help=argparse.SUPPRESS)
+    p.add_argument("--from", dest="from_ts", default=None, metavar="ISO", help="cut the window (start)")
+    p.add_argument("--to", dest="to_ts", default=None, metavar="ISO", help="cut the window (end)")
+    p.add_argument("--title", default=None, help="report title")
+    p.add_argument("--update-index", action="store_true", help="regenerate README.md of the --out folder's parent")
+
+    p = add("export", cmd_export, "market tables (books, candles, trades) to Parquet (CSV without pyarrow)")
+    p.add_argument("--parquet", default="data/export", metavar="DIR", help="output folder (default data/export)")
+    p.add_argument("--db", default=None, metavar="PATH", help="database (default data.sqlite_path)")
+
+    p = add("replay", cmd_replay, "re-run a recorded run and compare the decisions (PRD-05 §6)")
+    p.add_argument("--log-dir", default="logs", metavar="DIR", help="the run's log directory (default logs)")
+    p.add_argument("--state-db", default=None, metavar="PATH",
+                   help="the run's state DB (default: the one its start event names)")
+    p.add_argument("--out", default=None, metavar="DIR", help="where the replayed logs go")
+    p.add_argument("--reports-dir", default="docs/REPORTS", metavar="DIR",
+                   help="where replay_<date>.md goes ('' = nowhere)")
+    p.add_argument("--no-strict", action="store_true", help="compare the PRD field list only (not every field)")
 
     for name, (prd, help_text) in PLACEHOLDERS.items():
         add(name, _placeholder(name), f"{help_text} ({prd}, not implemented yet)")

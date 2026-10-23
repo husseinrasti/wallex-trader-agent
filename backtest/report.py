@@ -1275,10 +1275,11 @@ def _limitations(
             f"The requested window is {req_h:,.1f} h but the data present covers only {data_h:,.1f} h."
         )
     if driver == "books" and "S1" in strategies:
+        source = "generated (synthetic)" if synthetic else "recorded"
         if data_h is not None:
-            auto.append(f"S1 backtest window limited to recorded {data_h:,.1f} h of order books.")
+            auto.append(f"S1 backtest window limited to {source} {data_h:,.1f} h of order books.")
         else:
-            auto.append("S1 backtest window limited to the recorded order-book hours.")
+            auto.append(f"S1 backtest window limited to the {source} order-book hours.")
     if driver == "candles":
         auto.append(
             "S1 not backtested on candles (candles carry no cross-book information); S1 evidence comes from "
@@ -1312,8 +1313,11 @@ def _limitations(
         )
     has_ratio = _num(metrics.get("sharpe_annualized")) is not None or _num(metrics.get("sortino")) is not None
     if has_ratio and data_h is not None and data_h < 30 * 24:
+        n_hourly = _num(metrics.get("n_hourly_returns"))
+        sample = f"{int(n_hourly):,} hourly returns over " if n_hourly is not None else "hourly returns over "
+        hours = f"{data_h:,.1f}" if data_h < 10 else f"{data_h:,.0f}"
         auto.append(
-            f"Sharpe and Sortino are computed from {data_h:,.0f} h of hourly returns: reported, but not "
+            f"Sharpe and Sortino are computed from {sample}{hours} h of data: reported, but not "
             "meaningful over so short a window."
         )
     n_trades = _num(metrics.get("n_trades"))
@@ -1322,10 +1326,17 @@ def _limitations(
     rvu = metrics.get("realized_vs_unrealized")
     unreal = _num(rvu.get("unrealized_tmn")) if isinstance(rvu, Mapping) else None
     if unreal is not None and abs(unreal) >= 1:
-        auto.append(
-            f"{unreal:,.0f} TMN was still held outside TMN (unrealized) at the end of the window; the "
-            "challenge counts realized TMN only, so this run was not flattened."
-        )
+        if _flag(meta.get("flatten_at_end")):
+            auto.append(
+                f"{unreal:,.0f} TMN was still held outside TMN (unrealized) at the end of the window although "
+                "the deadline flatten ran (dust below a market's minimum order, or an exit still open); the "
+                "challenge counts realized TMN only."
+            )
+        else:
+            auto.append(
+                f"{unreal:,.0f} TMN was still held outside TMN (unrealized) at the end of the window; the "
+                "challenge counts realized TMN only, so this run was not flattened."
+            )
     if isinstance(rvu, Mapping) and rvu.get("unpriced_assets"):
         assets = ", ".join(str(a) for a in rvu["unpriced_assets"])
         auto.append(f"End-state valuation left out assets without a TMN price: {assets}.")

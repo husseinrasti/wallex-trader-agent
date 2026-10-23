@@ -1,0 +1,145 @@
+"""Replay check for judges (PRD-05 §6; ``make replay``): re-run a recorded run, compare every decision.
+
+    python scripts/replay_check.py                         # newest live run under logs/, else newest shadow run
+    python scripts/replay_check.py --decisions logs/decisions.jsonl     # the run whose decisions these are
+    python scripts/replay_check.py --log-dir logs/shadow_synth_4h --out /tmp/replay1 --json
+
+The engine is rebuilt as the recorded run had it (config hash checked; runtime overlay as recorded;
+AI as recorded with the strict LLM cache) and driven over the recorded inputs: the ticks, books and
+candles the engine stored in its state DB, the recorded exchange answers (``ReplayExchange``) and the
+cached analyst plans. Every internet connection attempt is refused and counted during the replay.
+The decision log it writes is compared with the recorded one (``wta.replay.runner``), the result is
+printed and written to ``docs/REPORTS/replay_<YYYYMMDD>.md``.
+
+Exit codes: 0 = every compared decision reproduced, zero network calls; 1 = a mismatch, a missing or
+extra decision, an exchange divergence, a determinism failure (LLM cache miss) or a network call;
+2 = nothing to replay or bad arguments (no recorded run, no state DB, output directory not empty).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+import tempfile
+from pathlib import Path
+
+from wta.config import ROOT, Config, load_config, parse_overrides
+from wta.replay.runner import ReplayInputError, pick_run_dir, run_replay
+
+
+def _config(sets: list[str], overlays: list[str]) -> Config:
+    if overlays:
+        from wta.cli import load_cli_config  # the CLI's own merge of --overlay files and --set
+
+        return load_cli_config(sets, overlays)
+    return load_config(parse_overrides(sets))
+
+
+def _log_dir(args: argparse.Namespace) -> tuple[Path | None, str]:
+    """(recorded log dir, why it was chosen)."""
+    if args.log_dir:
+        return Path(args.log_dir), "given with --log-dir"
+    if args.decisions:
+        path = Path(args.decisions)
+        if path.exists():  # a decisions file (or its current-day symlink): its directory is the run
+            return path.parent, f"directory of {path}"
+        reason = f"{path} does not exist (no live run recorded there)"
+    else:
+        reason = "no --log-dir / --decisions given"
+    root = Path(args.logs_root)
+    if not root.is_absolute() and not root.exists():
+        root = ROOT / root
+    found = pick_run_dir(root)
+    if found is None:
+        return None, f"{reason}; no engine run under {root}"
+    kind = "newest live run" if found["mode"] == "live" else f"no live run; newest {found['mode']} run"
+    return Path(found["path"]), f"{reason}; {kind} under {root}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="replay_check.py", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--decisions", default=None, help="a recorded decisions file; its directory is the run")
+    ap.add_argument("--log-dir", default=None, help="the recorded run's log directory")
+    ap.add_argument("--logs-root", default="logs", help="where to look for runs when none is given (default logs)")
+    ap.add_argument("--state-db", default=None, help="the recorded engine state DB (default: from its start event)")
+    ap.add_argument("--segment", type=int, default=None,
+                    help="process segment of the log dir, 1-based (default: the latest fresh start)")
+    ap.add_argument("--out", default=None, help="new or empty directory for the replay's logs + state DB "
+                                                 "(default: a temporary directory)")
+    ap.add_argument("--reports-dir", default="docs/REPORTS", help="where replay_<date>.md goes ('' = nowhere)")
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="the recorded run's config overrides, if its config cannot be recovered (repeatable)")
+    ap.add_argument("--overlay", action="append", default=[], metavar="FILE", help="the recorded run's overlays")
+    ap.add_argument("--lenient", action="store_true",
+                    help="keep going after an LLM cache miss / unmatched config (still exits 1 on a mismatch)")
+    ap.add_argument("--no-index", action="store_true", help="do not regenerate docs/REPORTS/README.md")
+    ap.add_argument("--json", action="store_true", help="print the full result as JSON")
+    ap.add_argument("-v", "--verbose", action="store_true", help="engine log lines on stderr")
+    args = ap.parse_args(argv)
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.ERROR, stream=sys.stderr,
+                        format="%(levelname)s %(name)s: %(message)s")
+
+    log_dir, why = _log_dir(args)
+    if log_dir is None:
+        print(f"replay: nothing to replay: {why}", file=sys.stderr)
+        return 2
+    try:
+        cfg = _config(args.set, args.overlay)
+    except (ValueError, OSError) as exc:
+        print(f"replay: bad --set/--overlay: {exc}", file=sys.stderr)
+        return 2
+    out = Path(args.out) if args.out else Path(tempfile.mkdtemp(prefix="wta-replay-"))
+    reports = args.reports_dir or None
+    print(f"replay: {log_dir} ({why})")
+    try:
+        result = run_replay(cfg, log_dir=log_dir, state_db=args.state_db, out_dir=out, reports_dir=reports,
+                            strict=not args.lenient, segment=args.segment)
+    except ReplayInputError as exc:
+        print(f"replay: cannot replay {log_dir}: {exc}", file=sys.stderr)
+        return 2
+    if reports and not args.no_index:
+        try:
+            sys.path.insert(0, str(ROOT))
+            from backtest.report import update_index
+
+            update_index(reports)
+        except Exception as exc:  # noqa: BLE001 - the index is a convenience, the verdict stands
+            print(f"replay: reports index not updated: {exc}", file=sys.stderr)
+
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2, sort_keys=True, default=str))
+        return 0 if result.ok else 1
+    r = result.run
+    rec, win, net, ai = r["recorded"], r["window"], r["network"], r["ai"]
+    label = " — SYNTHETIC, not evidence of performance" if rec["synthetic"] else ""
+    print(f"recorded: mode {rec['mode']}, feed {rec['feed']}{label}; segment {rec['segment']} of {rec['segments']}"
+          + ("; run still being written (replayed up to its last committed tick)" if rec["in_progress"] else ""))
+    conf = r["config"]
+    same = "= recorded" if conf["equal"] else f"DIFFERS from recorded {conf['recorded_hash']}"
+    print(f"window:   {win['first']} -> {win['last']} ({win['hours']:.2f} h, {win['ticks']} ticks); "
+          f"plans {ai['plans_reproduced']}/{ai['plans_recorded']} re-derived identically; "
+          f"config {conf['replay_hash']} ({same})")
+    print(f"network:  {net['socket_attempts']} socket attempts, {net['provider_calls']} LLM provider calls; "
+          f"LLM cache {ai['cache_hits']} hits / {ai['cache_misses']} misses")
+    print(f"exchange: {', '.join(f'{k} {v}' for k, v in sorted(r['exchange']['answers'].items())) or 'no calls'}; "
+          f"divergences {len(result.divergences)}")
+    for e in result.errors:
+        print(f"ERROR:    {e}")
+    for m in result.mismatches[:10]:
+        print(f"mismatch: {m.decision_id} {m.field}: recorded {m.reference!r} replayed {m.replayed!r}")
+    if len(result.mismatches) > 10:
+        print(f"mismatch: ... {len(result.mismatches) - 10} more (see the report)")
+    for d in result.missing[:5]:
+        print(f"missing:  {d['decision_id']} ({d['kind']} {d['strategy']} {d['symbol']})")
+    for d in result.extra[:5]:
+        print(f"extra:    {d['decision_id']} ({d['kind']} {d['strategy']} {d['symbol']})")
+    print(f"strict:   {result.strict_check.get('summary')} (every field but time stamps)")
+    print(f"result:   {result.summary} -> {'PASS' if result.ok else 'FAIL'}")
+    print(f"report:   {result.report_file or out / 'replay_report.md'}  (replay output: {out})")
+    return 0 if result.ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
