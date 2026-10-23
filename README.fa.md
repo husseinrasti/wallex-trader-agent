@@ -111,7 +111,7 @@ docker compose down
 
 ## ویدئو و تماس
 
-* **ویدئوی نمایشی** (حدود ۵ دقیقه، ضبط توسط اپراتور): هنوز ضبط نشده است. پیوند آن در [`deliverables/VIDEO.md`](deliverables/VIDEO.md) قرار می‌گیرد. فهرست صحنه‌ها و متن روایت در [`docs/VIDEO_SHOTLIST.md`](docs/VIDEO_SHOTLIST.md) است.
+* **ویدئوی نمایشی** (حدود ۵ دقیقه، ضبط توسط اپراتور): هنوز ضبط نشده است. پیوند آن در [`deliverables/VIDEO.md`](deliverables/VIDEO.md) قرار می‌گیرد. فهرست صحنه‌ها و متن روایت در [`docs/VIDEO_SHOTLIST.md`](docs/VIDEO_SHOTLIST.md) است. متن فارسی روایت: [`docs/VIDEO_SCRIPT_FA.md`](docs/VIDEO_SCRIPT_FA.md).
 * **سازنده:** حسین راستی (توسعه‌دهندهٔ تنها)، گیت‌هاب [@husseinrasti](https://github.com/husseinrasti).
 
 </div>

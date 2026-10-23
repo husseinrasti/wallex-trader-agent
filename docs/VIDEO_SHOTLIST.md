@@ -7,6 +7,8 @@
 4. The narration states the facts as they are. `api.wallex.ir` was reachable only now and then. The real data is about 20 minutes of order books. No live trade has happened. The 4-hour shadow run replays 40/40 decisions with 0 network calls.
 5. The operator records and uploads the video, then puts the link into `deliverables/VIDEO.md` and the README (§6).
 
+Persian narration of the same scenes and numbers: [`VIDEO_SCRIPT_FA.md`](VIDEO_SCRIPT_FA.md).
+
 Related: [`scripts/demo.sh`](../scripts/demo.sh) (the helper), [`deliverables/VIDEO.md`](../deliverables/VIDEO.md)
 (the link), [`ARCHITECTURE.md`](ARCHITECTURE.md) (the diagram), [`REPORTS/`](REPORTS/README.md) (the evidence).
 
