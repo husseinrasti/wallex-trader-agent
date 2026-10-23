@@ -4,8 +4,8 @@
 
 | run | value |
 | --- | --- |
-| Config hash | `6a0a21f50a4b` |
-| Git commit | `e25b87b5248b1dddc40353ec1816acab378685d8` |
+| Config hash | `378bb7996786` |
+| Git commit | `34d5419073364f911376247ce165bf18ddd0a834` |
 | Mode | backtest |
 | Driver | books |
 | Requested window (UTC) | 2026-10-01T00:00:00Z → 2026-10-02T00:00:00Z (24.0 h) |
@@ -14,20 +14,20 @@
 | AI | offline |
 | Strategies | S1, S2 |
 | Data end (UTC) | 2026-10-02T00:00:00Z |
-| Report date | 2026-10-23 (commit date of e25b87b5248b + uncommitted changes) |
+| Report date | 2026-10-23 (commit date of 34d541907336) |
 | ai_capped_at | n/a |
 | ai_max_calls | 400 |
 | ai_source | offline-rules |
 | analyst_cycles | 289 |
 | analyst_failures | 0 |
 | analyst_plans | 289 |
-| cached_calls | 578 |
+| cached_calls | 0 |
 | candles_ingested | 10,080 |
 | coverage_hours | 24.00 |
 | fee_budget_pct | 2.00% |
 | fees_source | configs/fees_snapshot.yaml |
 | flatten_at_end | yes |
-| git_dirty | yes |
+| git_dirty | no |
 | initial_equity_tmn | 5,000,000 |
 | llm_cache | llm_cache_offline |
 | market_db | synth_books_24h.sqlite |
@@ -155,8 +155,9 @@ Decision records (2 daily files, together the whole run: [decisions-20261001.jso
 | --- | ---: |
 | Plans produced | 289 |
 | Average size multiplier | 1.00 |
-| Plans that changed the enabled strategies | 0 |
-| Plans served from the LLM cache | 289 |
+| Plan-to-plan changes of enabled_strategies | 0 |
+| Plans that narrowed the configured strategies | 0 of 289 |
+| Plans served from the LLM cache | 0 |
 | Plans with clamped fields | 0 |
 | S3 entries gated by regime | 0 |
 | Exits on a regime flip | 0 |

@@ -537,6 +537,52 @@ USDT share 65% (rules table for trend_up) vs current 0.0% -> gap +65.0 pp >= thr
 at 266,721 (bid 266,720 / ask 266,758); the RiskManager caps one order at 25% of equity (1,250,000 TMN), the rest of the
 gap waits for the next rebalance." `MAX_ORDER_PCT` then shrinks the order from 12.18 to 4.68 USDT.
 
+### 8.1 A recorded S1 cycle of the real engine (SYNTHETIC books)
+
+> **SYNTHETIC DATA — not evidence of performance.** These lines are verbatim from
+> `docs/REPORTS/bt_books_synth24h_ai_off/decisions-20261001.jsonl` (the 24-h book backtest, AI off, regenerated on tag
+> `v0.6-ops`, `config_hash 2aaaebec0508`): the real FeatureEngine, S1, RiskManager, OrderManager and the pessimistic
+> book fill model, on generated books. It is the run's first S1 cycle, and it shows the unhappy path, which the
+> illustrative record above does not: leg 2 never fills, the lock-in degrades to a stopped revert position, and the
+> revert exit closes it at a small loss.
+
+| line | time (simulated) | decision | what happened |
+|---:|---|---|---|
+| 5 | 01:41:48 | `d_1790818908000_S1_ETHUSDT_1` order, entry | leg 1: BUY 0.00151 ETH on ETHUSDT at 2,457.32 as taker, all 23 checks passed |
+| 6, 8 | 01:41:50 → 01:42:06 | `d_1790818910000_S1_ETHTMN_1` order, leg 2 | SELL 0.00150 ETH on ETHTMN at the bid; outcome `EXPIRED_UNFILLED` (the synthetic gap had closed by the next snapshot). Three more leg-2 attempts expire the same way (lines 9–15) |
+| 16 | 01:42:54 | `d_1790818974000_S1_ETHUSDT_1` order, stop | leg 2 would now lose 0.319 % ≥ the 0.30 % limit: the lock-in is kept as a revert position with an exchange STOP_LIMIT |
+| 18 | 01:42:56 | `d_1790818976000_S1_ETHUSDT_1` order, exit | the deviation reached the revert target: the stop is canceled (line 17), SELL 0.00150 ETH back on ETHUSDT as maker; filled after 2 re-prices (line 20) |
+| 19 | 01:43:38 | outcome of the entry | the position closes: −1,359 TMN (−0.14 %) after 108 s |
+
+Line 5, `intent.reason` (the 23 risk checks, `features` and the order follow in the record):
+
+```text
+ETH: ETHUSDT ask 2,457.32 USDT x USDTTMN ask 268,518 = 659,834,652 TMN vs ETHTMN bid 664,120,087 -> USDT book 0.649% cheap;
+cost 0.430% (0.130% taker ETHUSDT + 0.300% taker ETHTMN); edge - cost = 0.219% >= margin min 0.150% (config; no fresh
+plan); unhedged remainder: buying 0.00151 ETH leaves 0.001508037 after the 0.130% leg-1 fee (paid in ETH) and leg 2 on
+ETHTMN (step 0.00001) can sell 0.00150: the unhedged 0.000008037 ETH (0.532% of the cycle) x a 3% adverse move = 0.016%,
+so edge 0.649% >= need 0.596%; lock-in: buy 0.00151 ETH on ETHUSDT at 2,457.32 (3.71 USDT) as taker, then sell the
+0.00150 ETH left after the leg-1 fee on ETHTMN at its bid 664,120,087 (leg 2); size 0.00151 ETH limited by budget
+(budget 0.00151, free_quote 0.00377, leg1_liquidity 0.01181, leg2_liquidity 0.00557); no fresh plan (rules-only, size
+mult 1).
+```
+
+Line 16, `intent.reason`: "ETH: lockin_degraded_to_revert: leg 2 on ETHTMN would realise -0.319% after fees, a loss >=
+the 0.30% limit, so the 0.00150 ETH bought on ETHUSDT at 2,457.17 are kept as a revert position: STOP_LIMIT SELL stop
+2,432.60 (entry -1.0%), limit 2,422.87, time stop 1200 s, revert exit when the mid deviation (entry 0.697%) has closed to
+0.272%."
+
+Line 19, the position outcome:
+
+```json
+{"closed_ts": 1790819018.0, "dust_qty": "0.000008037", "exit_reason": "target", "hold_s": 108.0,
+ "pnl_pct": "-0.001364482053335518413357221297", "pnl_tmn": "-1359.23183032270",
+ "position_id": "p_S1_ETHUSDT_1790818910000_1", "strategy": "S1", "symbol": "ETHUSDT"}
+```
+
+`python -m wta logs check --dir docs/REPORTS/bt_books_synth24h_ai_off` validates these lines and their links.
+`docs/DECISION_LOG_FORMAT.md` §3.3 annotates a lock-in cycle whose leg 2 does fill, field by field.
+
 ---
 
 ## 9. Expected behaviour
@@ -597,9 +643,11 @@ Every number here comes from a report under `docs/REPORTS/` that a command regen
 * **real**: recorded Wallex data, which so far is 0.33 h of aligned books and 2.2 h of candles.
 * **SYNTHETIC**: generated data. It exercises the mechanics only and is **never evidence of performance**.
 
-Offline-rules-provider runs never count as LLM evidence. The survey, the backtests, the shadow report and the replay
-were last regenerated on `e25b87b` plus the uncommitted Phase-5 review fixes (`phase5_acceptance.md` §8), so
-their reports say `git_dirty: yes`; the 4-h shadow run itself ran on the clean commit `7e8f2f5`.
+Offline-rules-provider runs never count as LLM evidence. The survey, the backtests, the walk-forward, the shadow report
+and the replay proof were regenerated on the clean tag `v0.6-ops` (`34d5419`; `git_dirty: no` in every report) with
+the commands of `phase5_acceptance.md` §2. Every number is the same as in their first runs on `e25b87b` plus the then
+uncommitted review fixes. The real-data runs read the shipped market DB (`deliverables/market/`, `make market-db`). The
+4-h shadow run itself ran on the clean commit `7e8f2f5`.
 
 | # | Evidence | Data | Result | Source |
 |---|---|---|---|---|

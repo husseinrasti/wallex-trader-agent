@@ -92,10 +92,19 @@ def _git(*args: str) -> str:
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
-def _git_state() -> str:
+_GIT_STATE_AT_START: str | None = None  # set by make(): the tree before this script wrote anything
+
+
+def _git_state_now() -> str:
     commit = _git("rev-parse", "--short=12", "HEAD") or "unknown"
     dirty = _git("status", "--porcelain", "--untracked-files=no")
     return f"`{commit}`" + (" (working tree with uncommitted changes)" if dirty else " (clean working tree)")
+
+
+def _git_state() -> str:
+    """The commit and tree state this run started from. Taken once, before anything is written: this
+    script's own output (the README files, REPORT.md's index) would otherwise mark every tree dirty."""
+    return _GIT_STATE_AT_START if _GIT_STATE_AT_START is not None else _git_state_now()
 
 
 def secret_fields(settings: Settings) -> dict[str, str]:
@@ -740,6 +749,8 @@ def _scan(paths: Sequence[Path], settings: Settings) -> list[str]:
 
 
 def make(args: argparse.Namespace) -> int:
+    global _GIT_STATE_AT_START
+    _GIT_STATE_AT_START = _git_state_now()
     deliverables = _resolve(args.out)
     report = deliverables / "REPORT.md"
     settings = Settings()

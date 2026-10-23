@@ -3,7 +3,7 @@
 | run | value |
 | --- | --- |
 | Config hash | `8fe0589adfb8` |
-| Git commit | `e25b87b5248b1dddc40353ec1816acab378685d8` |
+| Git commit | `34d5419073364f911376247ce165bf18ddd0a834` |
 | Mode | backtest |
 | Driver | candles |
 | Requested window (UTC) | 2026-10-22T12:25:00Z → 2026-10-22T14:40:00Z (2.2 h) |
@@ -12,14 +12,14 @@
 | AI | off |
 | Strategies | S2, S3 |
 | Data end (UTC) | 2026-10-22T14:40:00Z |
-| Report date | 2026-10-23 (commit date of e25b87b5248b + uncommitted changes) |
+| Report date | 2026-10-23 (commit date of 34d541907336) |
 | ai_source | disabled |
 | candles_ingested | 940 |
 | coverage_hours | 2.25 |
 | fee_budget_pct | 2.00% |
 | fees_source | configs/fees_snapshot.yaml |
 | flatten_at_end | no |
-| git_dirty | yes |
+| git_dirty | no |
 | initial_equity_tmn | 5,000,000 |
 | market_db | data/wta.sqlite |
 | seed | 42 |
@@ -126,7 +126,7 @@ AI was **off** in this run (rules-only defaults); no plans were produced.
 | --- | ---: |
 | Plans produced | 0 |
 | Average size multiplier | n/a |
-| Plans that changed the enabled strategies | 0 |
+| Plan-to-plan changes of enabled_strategies | 0 |
 | S3 entries gated by regime | 0 |
 | Exits on a regime flip | 0 |
 

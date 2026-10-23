@@ -1748,9 +1748,9 @@
     "steps": 288
   },
   "excluded_sources": {},
-  "generated": "2026-10-23T06:37:22.749Z",
-  "git_commit": "e25b87b5248b1dddc40353ec1816acab378685d8",
-  "git_dirty": true,
+  "generated": "2026-10-23T09:30:22.222Z",
+  "git_commit": "34d5419073364f911376247ce165bf18ddd0a834",
+  "git_dirty": false,
   "markets": [
     {
       "depth_ask_tmn_median": 1404993883.4,

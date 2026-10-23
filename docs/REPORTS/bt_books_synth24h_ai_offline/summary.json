@@ -56,8 +56,12 @@
     ],
     "n_plan_changes_of_enabled_strategies": 0,
     "n_plans": 289,
-    "plans_cached": 289,
+    "plans_cached": 0,
     "plans_clamped": 0,
+    "plans_narrowing_configured": {
+      "left_out": {},
+      "n": 0
+    },
     "regime_distribution": {
       "BTCUSDT": {
         "range": 289
@@ -137,9 +141,9 @@
     "analyst_cycles": 289,
     "analyst_failures": 0,
     "analyst_plans": 289,
-    "cached_calls": 578,
+    "cached_calls": 0,
     "candles_ingested": 10080,
-    "config_hash": "6a0a21f50a4b",
+    "config_hash": "378bb7996786",
     "coverage_hours": 24.0006,
     "coverage_hours_by_symbol": {
       "BTCTMN": 24.0006,
@@ -159,8 +163,8 @@
     "fee_budget_pct": 0.02,
     "fees_source": "configs/fees_snapshot.yaml",
     "flatten_at_end": true,
-    "git_commit": "e25b87b5248b1dddc40353ec1816acab378685d8",
-    "git_dirty": true,
+    "git_commit": "34d5419073364f911376247ce165bf18ddd0a834",
+    "git_dirty": false,
     "initial_balances": {
       "TMN": "5000000"
     },
@@ -171,7 +175,7 @@
     "model_calls": 578,
     "orders_stopped_by_gaps": 0,
     "report_date": "2026-10-23",
-    "report_date_source": "commit date of e25b87b5248b + uncommitted changes",
+    "report_date_source": "commit date of 34d541907336",
     "s1_coverage_hours": 24.0006,
     "seed": 42,
     "snapshots": 302407,

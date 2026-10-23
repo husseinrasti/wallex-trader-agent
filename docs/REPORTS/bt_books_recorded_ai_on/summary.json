@@ -42,6 +42,12 @@
     "n_plans": 6,
     "plans_cached": 6,
     "plans_clamped": 0,
+    "plans_narrowing_configured": {
+      "left_out": {
+        "S1": 6
+      },
+      "n": 6
+    },
     "regime_distribution": {
       "BTCUSDT": {
         "range": 6
@@ -157,8 +163,8 @@
     "fee_budget_pct": 0.02,
     "fees_source": "configs/fees_snapshot.yaml",
     "flatten_at_end": false,
-    "git_commit": "e25b87b5248b1dddc40353ec1816acab378685d8",
-    "git_dirty": true,
+    "git_commit": "34d5419073364f911376247ce165bf18ddd0a834",
+    "git_dirty": false,
     "initial_balances": {
       "TMN": "5000000"
     },
@@ -169,7 +175,7 @@
     "model_calls": 11,
     "orders_stopped_by_gaps": 0,
     "report_date": "2026-10-23",
-    "report_date_source": "commit date of e25b87b5248b + uncommitted changes",
+    "report_date_source": "commit date of 34d541907336",
     "s1_coverage_hours": 0.3239,
     "seed": 42,
     "snapshots": 6131,

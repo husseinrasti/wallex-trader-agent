@@ -452,6 +452,27 @@ def test_make_deliverables_copies_the_run_writes_the_bundle_and_the_index(
     assert "not written by this script" in capsys.readouterr().err
 
 
+def test_make_deliverables_records_the_tree_state_from_before_it_wrote(
+        tiny: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Its own output (tracked README files) must not turn a clean tree into "uncommitted changes"."""
+    mod = _deliverables_script(monkeypatch)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(*args: str) -> str:
+        calls.append(args)
+        if args[0] == "rev-parse":
+            return "abcdef012345"
+        return "" if len([c for c in calls if c[0] == "status"]) == 1 else " M deliverables/x/README.md"
+
+    monkeypatch.setattr(mod, "_git", fake_git)
+    out = tmp_path / "deliverables"
+    _report(out)
+    assert mod.main(["--run-dir", str(tiny["logs"]), "--name", "tiny_run", "--out", str(out)]) == 0
+    readme = (out / "tiny_run" / "README.md").read_text()
+    assert "at commit `abcdef012345` (clean working tree)" in readme
+    assert len([c for c in calls if c[0] == "status"]) == 1  # asked once, at the start
+
+
 def test_a_broken_link_in_report_md_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     mod = _deliverables_script(monkeypatch)
     report = _report(tmp_path / "deliverables")

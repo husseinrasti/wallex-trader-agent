@@ -5,7 +5,7 @@
 | run | value |
 | --- | --- |
 | Config hash | `37bf18e4ba22` |
-| Git commit | `e25b87b5248b1dddc40353ec1816acab378685d8` |
+| Git commit | `34d5419073364f911376247ce165bf18ddd0a834` |
 | Mode | backtest |
 | Driver | books |
 | Requested window (UTC) | 2026-10-01T12:00:00Z → 2026-10-01T18:00:00Z (6.0 h) |
@@ -14,7 +14,7 @@
 | AI | on |
 | Strategies | S1, S2 |
 | Data end (UTC) | 2026-10-01T18:00:00Z |
-| Report date | 2026-10-23 (commit date of e25b87b5248b + uncommitted changes) |
+| Report date | 2026-10-23 (commit date of 34d541907336) |
 | ai_capped_at | n/a |
 | ai_max_calls | 150 |
 | ai_source | llm |
@@ -27,7 +27,7 @@
 | fee_budget_pct | 2.00% |
 | fees_source | configs/fees_snapshot.yaml |
 | flatten_at_end | no |
-| git_dirty | yes |
+| git_dirty | no |
 | initial_equity_tmn | 5,000,000 |
 | llm_cache | docs/REPORTS/bt_books_synth24h_6h_ai_on/llm_cache |
 | market_db | synth_books_24h.sqlite |
@@ -140,7 +140,8 @@ Decision records ([decisions-20261001.jsonl](decisions-20261001.jsonl)): order 6
 | --- | ---: |
 | Plans produced | 73 |
 | Average size multiplier | 0.87 |
-| Plans that changed the enabled strategies | 0 |
+| Plan-to-plan changes of enabled_strategies | 0 |
+| Plans that narrowed the configured strategies | 0 of 73 |
 | Plans served from the LLM cache | 73 |
 | Plans with clamped fields | 0 |
 | S3 entries gated by regime | 0 |
